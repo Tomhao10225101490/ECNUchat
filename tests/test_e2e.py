@@ -47,6 +47,9 @@ async def _e2e(tmp_path: Path) -> None:
         await alice.connect(uri)
         await bob.connect(uri)
         await carol.connect(uri)
+        await asyncio.sleep(0.15)
+        assert "bob" in alice.online_users
+        assert "alice" in bob.online_users
 
         users = await alice.list_users()
         assert set(users["users"]) >= {"alice", "bob", "carol"}
