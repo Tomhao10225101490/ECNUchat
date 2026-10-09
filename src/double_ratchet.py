@@ -294,8 +294,6 @@ def _decrypt_mutating(
     if len(message.ciphertext) < 16:
         raise GCMError("GCM 失败：密文缺少认证标签")
     key = skipped_key(header.dh_pub, header.n)
-    if header.dh_pub in state.retired_dh:
-        raise ReplayError()
     if key in state.seen:
         raise ReplayError()
     if key in state.skipped:
@@ -303,6 +301,10 @@ def _decrypt_mutating(
         plaintext = _open(state, message, mk)
         _mark_seen(state, key)
         return plaintext, mk
+    # 旧链只有在 PN 处理阶段明确缓存过的消息密钥仍可接收；除此之外，
+    # 退休公钥下的报文都是过期或重放。
+    if header.dh_pub in state.retired_dh:
+        raise ReplayError()
 
     if state.dhr_pub is None or header.dh_pub != state.dhr_pub:
         if state.ckr is not None and state.dhr_pub is not None:

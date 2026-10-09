@@ -177,6 +177,15 @@ class ClientStore:
                 k TEXT PRIMARY KEY,
                 v TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS message_status (
+                local_id TEXT PRIMARY KEY,
+                conv TEXT NOT NULL,
+                body TEXT NOT NULL,
+                state TEXT NOT NULL,
+                ts REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_history_conv_id ON history(conv, id);
+            CREATE INDEX IF NOT EXISTS idx_history_body ON history(body);
             """
         )
         self.conn.commit()
@@ -284,6 +293,10 @@ class ClientStore:
         with self.conn:
             self.conn.execute("DELETE FROM outbox WHERE peer=?", (peer,))
 
+    def list_outbox_peers(self) -> list[str]:
+        rows = self.conn.execute("SELECT peer FROM outbox ORDER BY peer").fetchall()
+        return [str(row[0]) for row in rows]
+
     def load_session(self, peer: str) -> RatchetState | None:
         row = self.conn.execute(
             "SELECT blob FROM sessions WHERE peer=?", (peer,)
@@ -322,6 +335,68 @@ class ClientStore:
             """
         ).fetchall()
         return [(r[0], r[1], r[2], float(r[3])) for r in rows]
+
+    def search_history(
+        self, query: str, conv: str | None = None, limit: int = 50
+    ) -> list[tuple[int, str, str, str, float]]:
+        query = query.strip()
+        if not query:
+            return []
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        if conv:
+            rows = self.conn.execute(
+                """
+                SELECT id, conv, sender, body, ts FROM history
+                WHERE conv=? AND body LIKE ? ESCAPE '\\'
+                ORDER BY id DESC LIMIT ?
+                """,
+                (conv, pattern, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """
+                SELECT id, conv, sender, body, ts FROM history
+                WHERE body LIKE ? ESCAPE '\\'
+                ORDER BY id DESC LIMIT ?
+                """,
+                (pattern, limit),
+            ).fetchall()
+        return [
+            (int(row[0]), row[1], row[2], row[3], float(row[4])) for row in rows
+        ]
+
+    def save_message_status(
+        self, local_id: str, conv: str, body: str, state: str
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO message_status(local_id, conv, body, state, ts)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(local_id) DO UPDATE SET state=excluded.state
+                """,
+                (local_id, conv, body, state, time.time()),
+            )
+
+    def update_message_status(self, local_id: str, state: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE message_status SET state=? WHERE local_id=?",
+                (state, local_id),
+            )
+
+    def pending_message_statuses(
+        self,
+    ) -> list[tuple[str, str, str, str, float]]:
+        rows = self.conn.execute(
+            """
+            SELECT local_id, conv, body, state, ts FROM message_status
+            WHERE state IN ('sending', 'failed')
+            ORDER BY ts
+            """
+        ).fetchall()
+        return [(r[0], r[1], r[2], r[3], float(r[4])) for r in rows]
 
     def save_group(self, name: str, members: list[str]) -> None:
         self.conn.execute(
@@ -368,6 +443,19 @@ class ClientStore:
         if not isinstance(value, dict):
             return {}
         return {str(key): int(count) for key, count in value.items()}
+
+    def save_ui_value(self, key: str, value: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO ui_state(k, v) VALUES(?, ?)",
+                (key, value),
+            )
+
+    def load_ui_value(self, key: str, default: str = "") -> str:
+        row = self.conn.execute(
+            "SELECT v FROM ui_state WHERE k=?", (key,)
+        ).fetchone()
+        return str(row[0]) if row else default
 
     def close(self) -> None:
         self.conn.close()

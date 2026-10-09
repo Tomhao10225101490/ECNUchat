@@ -102,6 +102,19 @@ def test_out_of_order_still_decrypts() -> None:
     assert decrypt(b, messages[1])[0] == b"m1"
 
 
+def test_late_old_chain_message_uses_pn_cache_after_dh_ratchet() -> None:
+    a, b = _bootstrap()
+    old_late, _ = encrypt(a, b"old-chain-late")
+
+    reply, _ = encrypt(b, b"reply-starts-new-chain")
+    assert decrypt(a, reply)[0] == b"reply-starts-new-chain"
+
+    new_chain, _ = encrypt(a, b"new-chain-first")
+    assert decrypt(b, new_chain)[0] == b"new-chain-first"
+    assert old_late.header.dh_pub in b.retired_dh
+    assert decrypt(b, old_late)[0] == b"old-chain-late"
+
+
 def test_replay_rejected() -> None:
     a, b = _bootstrap()
     msg, _ = encrypt(a, b"once")
