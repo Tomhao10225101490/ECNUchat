@@ -48,14 +48,14 @@ def stylesheet(theme: str = "telegram") -> str:
         color: #45d366;
         font-size: 12px;
     }}
-    QLineEdit, QTextEdit {{
+    QLineEdit, QTextEdit, QSpinBox {{
         background: #202b36;
         border: 1px solid #314252;
         border-radius: 12px;
         padding: 9px 12px;
         selection-background-color: {p["accent"]};
     }}
-    QLineEdit:focus, QTextEdit:focus {{
+    QLineEdit:focus, QTextEdit:focus, QSpinBox:focus {{
         border: 1px solid {p["accent"]};
     }}
     QListWidget {{
@@ -124,8 +124,12 @@ def stylesheet(theme: str = "telegram") -> str:
         border: 1px solid #ff6b6b;
         border-radius: 12px;
     }}
-    QScrollArea {{
+    QScrollArea#message_scroll {{
         border: none;
+        background: #0e1621;
+    }}
+    QScrollArea#message_scroll > QWidget > QWidget,
+    QWidget#message_host {{
         background: #0e1621;
     }}
     QScrollBar:vertical {{
@@ -141,6 +145,31 @@ def stylesheet(theme: str = "telegram") -> str:
         background: #253444;
         border: 1px solid #43576b;
         padding: 6px;
+    }}
+    QMenu {{
+        background: #202b36;
+        border: 1px solid #3a4b5d;
+        border-radius: 8px;
+        padding: 6px;
+    }}
+    QMenu::item {{
+        background: transparent;
+        border-radius: 6px;
+        padding: 8px 28px 8px 12px;
+    }}
+    QMenu::item:selected {{
+        background: {p["selected"]};
+    }}
+    QMenu::separator {{
+        background: #3a4b5d;
+        height: 1px;
+        margin: 5px 8px;
+    }}
+    QMessageBox, QInputDialog {{
+        background: #17212b;
+    }}
+    QMessageBox QLabel, QInputDialog QLabel {{
+        color: #e8eef5;
     }}
     """
 

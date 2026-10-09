@@ -165,8 +165,10 @@ class MainWindow(QMainWindow):
         chat_layout.addWidget(header)
 
         self.message_scroll = QScrollArea()
+        self.message_scroll.setObjectName("message_scroll")
         self.message_scroll.setWidgetResizable(True)
         self.message_host = QWidget()
+        self.message_host.setObjectName("message_host")
         self.messages = QVBoxLayout(self.message_host)
         self.messages.setContentsMargins(14, 18, 14, 18)
         self.messages.setSpacing(1)
