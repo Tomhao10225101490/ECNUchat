@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from dataclasses import dataclass, field
 from typing import Any
@@ -82,10 +83,14 @@ class ChatEngine:
     pending_x3dh: dict[str, Any] = field(default_factory=dict)
     online_users: set[str] = field(default_factory=set)
     directory: list[str] = field(default_factory=list)
+    connected: bool = False
+    ui_theme: str = "telegram"
     ws: Any = None
     _waiters: dict[str, asyncio.Future] = field(default_factory=dict)
     _incoming_raw: asyncio.Queue = field(default_factory=asyncio.Queue)
     _tasks: list[asyncio.Task] = field(default_factory=list)
+    _request_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _peer_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
 
     @classmethod
     def open(cls, username: str, password: str, db_path: str) -> ChatEngine:
@@ -158,18 +163,23 @@ class ChatEngine:
             self._waiters.pop(t, None)
 
     async def request(self, obj: dict[str, Any], *expect: str) -> dict[str, Any]:
-        fut = self._arm(*expect, "error")
-        try:
-            await self.send_json(obj)
-            result = await asyncio.wait_for(fut, timeout=15)
-        finally:
-            self._disarm(*expect, "error")
+        # 当前协议响应没有 request_id；在升级协议前串行化，避免同类型响应串包。
+        async with self._request_lock:
+            if not self.connected and obj.get("type") not in {"register", "login"}:
+                raise ProtocolError("连接已断开")
+            fut = self._arm(*expect, "error")
+            try:
+                await self.send_json(obj)
+                result = await asyncio.wait_for(fut, timeout=15)
+            finally:
+                self._disarm(*expect, "error")
         if result.get("type") == "error":
             raise ProtocolError(result.get("message") or "服务器错误")
         return result
 
     async def connect(self, uri: str) -> None:
         self.ws = await websockets.connect(uri, max_size=64 * 1024)
+        self.connected = True
         self._tasks.append(asyncio.create_task(self._reader()))
         self._tasks.append(asyncio.create_task(self._processor()))
         registered = self.store.load_peer("__registered__")
@@ -186,6 +196,20 @@ class ChatEngine:
             self.store.save_peer(
                 "__registered__", self.identity.ik_sign_pub, self.identity.ik_dh_pub
             )
+        try:
+            await self._retry_pending_prekeys()
+        except Exception:
+            self.last_error = "预密钥补充将在下次登录重试"
+
+    async def _retry_pending_prekeys(self) -> None:
+        pending = self.store.load_pending_prekeys()
+        if not pending:
+            return
+        await self.request(
+            {"type": "upload_prekeys", "opks": [b64e(pub) for pub in pending]},
+            "upload_prekeys_ok",
+        )
+        self.store.clear_pending_prekeys()
 
     async def _register(self) -> None:
         await self.request(
@@ -231,7 +255,15 @@ class ChatEngine:
                 ):
                     await self._incoming_raw.put(msg)
         except Exception:
-            await self.inbox.put(Incoming("", "", None, "sys", "连接断开"))
+            pass
+        finally:
+            self.connected = False
+            self.online_users.clear()
+            self.last_error = "连接断开"
+            for future in set(self._waiters.values()):
+                if not future.done():
+                    future.set_exception(ProtocolError("连接断开"))
+            await self.inbox.put(Incoming("系统", "连接断开", None, "sys", "连接断开"))
 
     async def _processor(self) -> None:
         while True:
@@ -284,8 +316,13 @@ class ChatEngine:
         except InvalidSignature as exc:
             self.last_error = "对方预密钥签名无效"
             raise X3DHError("对方预密钥签名无效") from exc
+        pinned = self.store.load_peer(peer)
+        if pinned is not None and pinned != (ik_sign, ik_dh):
+            self.last_error = "身份密钥发生变化"
+            raise X3DHError("身份密钥发生变化：已拒绝覆盖已核对的指纹")
         self.peer_keys[peer] = (ik_sign, ik_dh)
-        self.store.save_peer(peer, ik_sign, ik_dh)
+        if pinned is None:
+            self.store.save_peer(peer, ik_sign, ik_dh)
         ek_priv, ek_pub = generate_x25519()
         opk = b64d(bundle.get("opk"))
         sk = initiator_secret(
@@ -309,9 +346,19 @@ class ChatEngine:
             others = [m for m in members if m != self.username]
             if not others:
                 raise ProtocolError("群里没有其他成员")
-            for other in others:
-                await self._send_one(other, text, group=group, kind="chat")
             self.store.add_history(f"group:{group}", self.username, text)
+            delivered = 0
+            try:
+                for other in others:
+                    await self._send_one(other, text, group=group, kind="chat")
+                    delivered += 1
+            except Exception:
+                self.store.add_history(
+                    f"group:{group}",
+                    "系统",
+                    f"群消息仅送达 {delivered}/{len(others)} 人，可稍后重试",
+                )
+                raise
             return
         dest = peer or self.current_peer
         if not dest:
@@ -322,24 +369,58 @@ class ChatEngine:
     async def _send_one(
         self, peer: str, text: str, *, group: str | None, kind: str
     ) -> dict[str, Any]:
-        state = await self._ensure_session_for_send(peer)
-        x3dh = self.pending_x3dh.pop(peer, None)
-        msg, _mk = encrypt(state, text.encode("utf-8"))
-        del _mk
-        payload = encode_ratchet_payload(msg, x3dh=x3dh, group=group, kind=kind)
-        self.store.save_session(peer, state)
-        await self.request(
-            {"type": "envelope", "from": self.username, "to": peer, "payload": payload},
-            "envelope_ok",
-        )
-        return payload
+        lock = self._peer_locks.setdefault(peer, asyncio.Lock())
+        async with lock:
+            pending_payload = self.store.load_outbox(peer)
+            if pending_payload is not None:
+                await self.request(
+                    {
+                        "type": "envelope",
+                        "from": self.username,
+                        "to": peer,
+                        "payload": pending_payload,
+                    },
+                    "envelope_ok",
+                )
+                self.store.delete_outbox(peer)
+                if pending_payload.get("x3dh") is not None:
+                    self.pending_x3dh.pop(peer, None)
+            state = await self._ensure_session_for_send(peer)
+            x3dh = self.pending_x3dh.get(peer)
+            inner = json.dumps(
+                {"v": 1, "text": text, "group": group, "kind": kind},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            msg, _mk = encrypt(state, inner)
+            del _mk
+            payload = encode_ratchet_payload(msg, x3dh=x3dh, group=group, kind=kind)
+            # 先把推进后的加密状态和完全相同的信封原子落盘。崩溃后重发
+            # 同一信封，不会丢 X3DH 初始字段，也不会重复推进发送链。
+            self.store.save_session_with_outbox(peer, state, payload)
+            await self.request(
+                {
+                    "type": "envelope",
+                    "from": self.username,
+                    "to": peer,
+                    "payload": payload,
+                },
+                "envelope_ok",
+            )
+            self.store.delete_outbox(peer)
+            if x3dh is not None:
+                self.pending_x3dh.pop(peer, None)
+            return payload
 
     async def _on_envelope(self, env: dict[str, Any]) -> None:
         sender = env["from"]
         payload = env["payload"]
         group = payload.get("group")
         try:
-            text = await self._decrypt_envelope(sender, payload)
+            text, verified_group, verified_kind = await self._decrypt_envelope(
+                sender, payload
+            )
+            group = verified_group
         except ReplayError:
             self._fail(sender, group, "重放拒绝")
             return
@@ -357,9 +438,9 @@ class ChatEngine:
             return
         self.last_error = None
         conv = f"group:{group}" if group else f"dm:{sender}"
-        who = "系统" if (payload.get("kind") == "group_meta") else sender
+        who = "系统" if verified_kind == "group_meta" else sender
         self.store.add_history(conv, who, text)
-        await self.inbox.put(Incoming(who, text, group, payload.get("kind") or "chat"))
+        await self.inbox.put(Incoming(who, text, group, verified_kind))
 
     def _fail(self, sender: str, group: str | None, phrase: str) -> None:
         self.last_error = phrase
@@ -368,8 +449,12 @@ class ChatEngine:
             self.store.add_history(conv, "系统", phrase)
         self.inbox.put_nowait(Incoming(sender, "", group, "error", phrase))
 
-    async def _decrypt_envelope(self, sender: str, payload: dict[str, Any]) -> str:
+    async def _decrypt_envelope(
+        self, sender: str, payload: dict[str, Any]
+    ) -> tuple[str, str | None, str]:
         ratchet_msg, init = decode_ratchet_payload(payload)
+        new_identity = False
+        consumed_opk: bytes | None = None
         if sender not in self.sessions:
             if init is None:
                 raise X3DHError("没有会话且缺少 X3DH 初始消息")
@@ -385,8 +470,14 @@ class ChatEngine:
                 raise X3DHError("验签失败：身份协商公钥与服务器登记不一致")
             opk_priv = None
             if init.opk_pub:
-                taken = self.identity.take_opk(init.opk_pub)
-                opk_priv = taken.priv
+                matching = next(
+                    (item for item in self.identity.opks if item.pub == init.opk_pub),
+                    None,
+                )
+                if matching is None:
+                    raise X3DHError("本地没有对应的一次性预密钥私钥")
+                opk_priv = matching.priv
+                consumed_opk = init.opk_pub
             sk = responder_secret(
                 self.identity.spk.priv,
                 self.identity.ik_dh_priv,
@@ -397,22 +488,44 @@ class ChatEngine:
             state = init_receiver(
                 sk, self.identity.spk.priv, ratchet_msg.header.dh_pub, self.username, sender
             )
-            self.sessions[sender] = state
-            if self.identity.needs_refill():
-                created = self.identity.refill_opks()
-                await self.request(
-                    {
-                        "type": "upload_prekeys",
-                        "opks": [b64e(o.pub) for o in created],
-                    },
-                    "upload_prekeys_ok",
-                )
-            self.store.save_identity(self.identity)
-        state = self.sessions[sender]
+            new_identity = True
+        else:
+            state = self.sessions[sender]
         plaintext, mk = decrypt(state, ratchet_msg)
         del mk
+        try:
+            inner = json.loads(plaintext.decode("utf-8"))
+            if not isinstance(inner, dict) or inner.get("v") != 1:
+                raise ValueError
+            text = inner["text"]
+            verified_group = inner.get("group")
+            verified_kind = inner.get("kind", "chat")
+            if not isinstance(text, str) or verified_group != payload.get("group"):
+                raise ValueError
+            if verified_kind != (payload.get("kind") or "chat"):
+                raise ValueError
+        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            raise GCMError("GCM 失败：消息语义元数据不一致") from exc
+        if new_identity:
+            self.sessions[sender] = state
+            if consumed_opk is not None:
+                self.identity.take_opk(consumed_opk)
+            self.store.save_identity(self.identity)
         self.store.save_session(sender, state)
-        return plaintext.decode("utf-8")
+        if new_identity and self.identity.needs_refill():
+            created = self.identity.refill_opks()
+            self.store.save_identity(self.identity)
+            self.store.save_pending_prekeys([item.pub for item in created])
+            try:
+                await self.request(
+                    {"type": "upload_prekeys", "opks": [b64e(o.pub) for o in created]},
+                    "upload_prekeys_ok",
+                )
+                self.store.clear_pending_prekeys()
+            except Exception:
+                # 明文已经认证成功且状态已提交；补池失败不能把消息伪装成解密失败。
+                self.last_error = "预密钥补充将在下次登录重试"
+        return text, verified_group, verified_kind
 
     async def list_users(self) -> dict[str, Any]:
         return await self.request({"type": "list_users"}, "users")
@@ -457,6 +570,7 @@ class ChatEngine:
             task.cancel()
         if self.ws is not None:
             await self.ws.close()
+        self.connected = False
         self.store.close()
 
 
@@ -498,14 +612,14 @@ async def legacy_command_loop(engine: ChatEngine) -> None:
         if item.kind == "presence":
             return
         if item.error:
-            console.print(f"[bold red]{item.error}[/bold red]")
+            console.print(Text(item.error, style="bold red"))
             return
         if item.kind in {"sys", "group_meta"} or item.sender == "系统":
-            console.print(f"[yellow]{item.text}[/yellow]")
+            console.print(Text(item.text, style="yellow"))
             return
         where = f"#{item.group} " if item.group else ""
         style = "green" if item.sender == engine.username else "white"
-        console.print(f"[{style}]{where}{item.sender}: {item.text}[/{style}]")
+        console.print(Text(f"{where}{item.sender}: {item.text}", style=style))
 
     async def printer() -> None:
         while True:
@@ -562,6 +676,11 @@ async def handle_line(engine: ChatEngine, line: str) -> CommandResult:
         from src.ui import HELP_TEXT
 
         return CommandResult(overlay=HELP_TEXT)
+    if cmd == "/theme":
+        if len(parts) != 2 or parts[1] not in {"telegram", "wechat"}:
+            raise ProtocolError("用法：/theme telegram 或 /theme wechat")
+        engine.ui_theme = parts[1]
+        return CommandResult(notice=f"已切换到 {parts[1]} 风格")
     if cmd == "/users":
         info = await engine.list_users()
         engine.directory = list(info.get("users") or [])
@@ -574,12 +693,9 @@ async def handle_line(engine: ChatEngine, line: str) -> CommandResult:
         validate_username(parts[1])
         if parts[1] == engine.username:
             raise ProtocolError("不能和自己建立会话")
+        await engine.fetch_user(parts[1])
         engine.current_peer = parts[1]
         engine.current_group = None
-        try:
-            await engine.fetch_user(parts[1])
-        except ProtocolError:
-            pass
         return CommandResult(notice=f"已打开与 {parts[1]} 的会话")
     if cmd == "/fingerprint" and len(parts) == 2:
         name = parts[1]
@@ -600,6 +716,8 @@ async def handle_line(engine: ChatEngine, line: str) -> CommandResult:
         if parts[1] == "add" and len(parts) == 4:
             await engine.add_group_member(parts[2], parts[3])
             return CommandResult(notice=f"已将 {parts[3]} 加入 {parts[2]}")
+        if parts[1] not in engine.groups:
+            raise ProtocolError(f"群 {parts[1]} 不存在")
         engine.current_group = parts[1]
         engine.current_peer = None
         return CommandResult(notice=f"已打开群 {parts[1]}")

@@ -16,6 +16,7 @@ from src.prekeys import verify_spk
 from src.protocol import (
     MAX_GROUP_MEMBERS,
     PROJECT_NAME,
+    ProtocolError,
     b64d,
     b64e,
     check_size,
@@ -112,7 +113,16 @@ class ChatServer:
         ik_dh_pub = b64d(msg["ik_dh_pub"])
         spk_pub = b64d(msg["spk_pub"])
         spk_sig = b64d(msg["spk_sig"])
-        if not ik_sign_pub or not ik_dh_pub or not spk_pub or not spk_sig:
+        if (
+            ik_sign_pub is None
+            or len(ik_sign_pub) != 32
+            or ik_dh_pub is None
+            or len(ik_dh_pub) != 32
+            or spk_pub is None
+            or len(spk_pub) != 32
+            or spk_sig is None
+            or len(spk_sig) != 64
+        ):
             await ws.send(dumps(error_msg("注册公钥不完整")))
             return None
         try:
@@ -122,6 +132,9 @@ class ChatServer:
             return None
         opks = [b64d(x) for x in msg.get("opks") or []]
         opk_bytes = [x for x in opks if x]
+        if len(opk_bytes) > 100 or any(len(item) != 32 for item in opk_bytes):
+            await ws.send(dumps(error_msg("OPK 必须是最多 100 把 32 字节公钥")))
+            return None
         self.store.create_user(
             username,
             ik_sign_pub,
@@ -160,10 +173,13 @@ class ChatServer:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
         try:
+            signature = b64d(sig)
+            if signature is None or len(signature) != 64:
+                raise InvalidSignature
             Ed25519PublicKey.from_public_bytes(user[0]).verify(
-                b64d(sig) or b"", pending[1]
+                signature, pending[1]
             )
-        except InvalidSignature:
+        except (InvalidSignature, ProtocolError):
             await ws.send(dumps(error_msg("登录验签失败")))
             return username
         await self._bind(ws, name)
@@ -193,15 +209,23 @@ class ChatServer:
         log.info("presence count=%s", len(self.online))
 
     async def _push_offline(self, ws: Any, username: str) -> None:
-        items = self.store.drain_offline(username)
-        for raw in items:
-            await ws.send(raw)
-        if items:
-            log.info("offline_push user=%s count=%s", username, len(items))
+        delivered = 0
+        for envelope_id, raw in self.store.list_offline(username):
+            try:
+                await ws.send(raw)
+            except Exception:
+                break
+            self.store.delete_offline(envelope_id)
+            delivered += 1
+        if delivered:
+            log.info("offline_push user=%s count=%s", username, delivered)
 
     async def on_upload_prekeys(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
         opks = [b64d(x) for x in msg.get("opks") or []]
         opk_bytes = [x for x in opks if x]
+        if len(opk_bytes) > 100 or any(len(item) != 32 for item in opk_bytes):
+            await ws.send(dumps(error_msg("OPK 必须是最多 100 把 32 字节公钥")))
+            return
         spk = None
         if msg.get("spk_pub"):
             spk_pub = b64d(msg["spk_pub"]) or b""
@@ -299,7 +323,13 @@ class ChatServer:
         )
         peer = self.online.get(dst)
         if peer is not None:
-            await peer.send(outgoing)
+            try:
+                await peer.send(outgoing)
+            except Exception:
+                self.online.pop(dst, None)
+                self.store.enqueue_offline(dst, outgoing)
+                log.info("offline_queue %s -> %s after send failure", src, dst)
+                await self._broadcast_presence()
         else:
             self.store.enqueue_offline(dst, outgoing)
             log.info("offline_queue %s -> %s", src, dst)

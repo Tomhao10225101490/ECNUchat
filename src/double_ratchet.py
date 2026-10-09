@@ -19,6 +19,7 @@ from src.x3dh import x25519_dh
 
 DR_INFO = b"dr-v1"
 MAX_SKIP = 40
+MAX_SEEN = 160
 NONCE_LEN = 12
 
 
@@ -117,6 +118,7 @@ class RatchetState:
     pns: int = 0
     skipped: dict[bytes, bytes] = field(default_factory=dict)
     seen: set[bytes] = field(default_factory=set)
+    retired_dh: set[bytes] = field(default_factory=set)
     dh_ratchet_count: int = 0
 
     def to_record(self) -> dict:
@@ -134,6 +136,7 @@ class RatchetState:
             "pns": self.pns,
             "skipped": dict(self.skipped),
             "seen": list(self.seen),
+            "retired_dh": list(self.retired_dh),
             "dh_ratchet_count": self.dh_ratchet_count,
         }
 
@@ -153,6 +156,7 @@ class RatchetState:
             pns=rec.get("pns", 0),
             skipped=dict(rec.get("skipped") or {}),
             seen=set(rec.get("seen") or []),
+            retired_dh=set(rec.get("retired_dh") or []),
             dh_ratchet_count=rec.get("dh_ratchet_count", 0),
         )
 
@@ -211,6 +215,8 @@ def _dh_ratchet(state: RatchetState, remote_dh_pub: bytes) -> None:
     """收到新的 dh_pub：先跳过旧接收链，再做接收链 + 新发送链两次 KDF_RK。"""
     if state.dhs_priv is None:
         raise RatchetError("协议错误", "本地还没有发送棘轮密钥，无法完成 DH 棘轮")
+    if state.dhr_pub is not None:
+        state.retired_dh.add(state.dhr_pub)
     state.dhr_pub = remote_dh_pub
     dh_recv = x25519_dh(state.dhs_priv, remote_dh_pub)
     state.rk, state.ckr = kdf_rk(state.rk, dh_recv)
@@ -260,15 +266,43 @@ def _skip_message_keys(state: RatchetState, until: int, dh_pub: bytes) -> None:
 
 
 def decrypt(state: RatchetState, message: RatchetMessage) -> tuple[bytes, bytes]:
-    """解密。返回明文和本次 MK（用完即从 skipped/结构体删除）。"""
+    """原子解密：认证成功才提交棘轮状态，失败时原状态完全不变。"""
+    candidate = RatchetState.from_record(state.to_record())
+    plaintext, mk = _decrypt_mutating(candidate, message)
+    _commit_state(state, candidate)
+    return plaintext, mk
+
+
+def _commit_state(target: RatchetState, source: RatchetState) -> None:
+    for name in RatchetState.__dataclass_fields__:
+        value = getattr(source, name)
+        if isinstance(value, dict):
+            value = dict(value)
+        elif isinstance(value, set):
+            value = set(value)
+        setattr(target, name, value)
+
+
+def _decrypt_mutating(
+    state: RatchetState, message: RatchetMessage
+) -> tuple[bytes, bytes]:
     header = message.header
+    if len(header.dh_pub) != 32 or len(message.nonce) != NONCE_LEN:
+        raise GCMError("GCM 失败：报文头或 nonce 长度无效")
+    if not 0 <= header.n <= 0xFFFFFFFF or not 0 <= header.pn <= 0xFFFFFFFF:
+        raise RatchetError("协议错误", "消息序号超出 uint32 范围")
+    if len(message.ciphertext) < 16:
+        raise GCMError("GCM 失败：密文缺少认证标签")
     key = skipped_key(header.dh_pub, header.n)
+    if header.dh_pub in state.retired_dh:
+        raise ReplayError()
     if key in state.seen:
         raise ReplayError()
     if key in state.skipped:
         mk = state.skipped.pop(key)
-        state.seen.add(key)
-        return _open(state, message, mk), mk
+        plaintext = _open(state, message, mk)
+        _mark_seen(state, key)
+        return plaintext, mk
 
     if state.dhr_pub is None or header.dh_pub != state.dhr_pub:
         if state.ckr is not None and state.dhr_pub is not None:
@@ -290,8 +324,15 @@ def decrypt(state: RatchetState, message: RatchetMessage) -> tuple[bytes, bytes]
     new_ck, mk = kdf_ck(state.ckr)
     state.ckr = new_ck
     state.nr = header.n + 1
+    plaintext = _open(state, message, mk)
+    _mark_seen(state, key)
+    return plaintext, mk
+
+
+def _mark_seen(state: RatchetState, key: bytes) -> None:
     state.seen.add(key)
-    return _open(state, message, mk), mk
+    while len(state.seen) > MAX_SEEN:
+        state.seen.pop()
 
 
 def _open(state: RatchetState, message: RatchetMessage, mk: bytes) -> bytes:

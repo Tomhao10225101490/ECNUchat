@@ -15,7 +15,7 @@ import tty
 from dataclasses import dataclass, field
 
 from rich.cells import cell_len
-from rich.console import Console, RenderableType
+from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.text import Text
@@ -40,6 +40,30 @@ ONLINE = "#4dcd5e"
 BADGE = "bold white on #3390ec"
 AVATARS = ("#e17076", "#faa774", "#a695e7", "#7bc862", "#6ec9cb", "#65aadd", "#ee7aae")
 
+THEMES = {
+    "telegram": {
+        "selected": "on #2b5278",
+        "out": "on #2b5278",
+        "badge": "bold white on #3390ec",
+        "name": "#6ab3f3",
+    },
+    "wechat": {
+        "selected": "on #244238",
+        "out": "on #95ec69",
+        "badge": "bold #10210f on #07c160",
+        "name": "#07c160",
+    },
+}
+
+
+def apply_theme(name: str) -> None:
+    global SELECTED, OUT, BADGE, NAME
+    palette = THEMES.get(name, THEMES["telegram"])
+    SELECTED = palette["selected"]
+    OUT = palette["out"]
+    BADGE = palette["badge"]
+    NAME = palette["name"]
+
 HELP_TEXT = """命令
   /chat 名字              打开单聊
   /fingerprint 名字       16 组身份指纹，线下核对
@@ -48,6 +72,7 @@ HELP_TEXT = """命令
   /group 群名             打开群
   /users                  在线列表
   /history                当前会话记录
+  /theme telegram|wechat  切换蓝色/微信绿色风格
   /help                   本页
   /quit                   退出
 
@@ -138,7 +163,9 @@ def _esc_pending(buf: bytearray) -> bool:
         return False
     if len(buf) == 1:
         return True
-    return len(buf) == 2 and buf[1] == ord("[")
+    if len(buf) >= 2 and buf[1] == ord("["):
+        return not any(0x40 <= value <= 0x7E for value in buf[2:])
+    return len(buf) == 1
 
 
 def drain_keys(buf: bytearray, *, flush: bool = False) -> list[str]:
@@ -150,11 +177,31 @@ def drain_keys(buf: bytearray, *, flush: bool = False) -> list[str]:
     while buf:
         b0 = buf[0]
         if b0 == 0x1B:
-            if len(buf) >= 3 and buf[1] == ord("[") and 0x40 <= buf[2] <= 0x7E:
-                arrows = {ord("A"): "up", ord("B"): "down", ord("C"): "right", ord("D"): "left"}
-                keys.append(arrows.get(buf[2], "esc"))
-                del buf[:3]
-                continue
+            if len(buf) >= 3 and buf[1] == ord("["):
+                end = next(
+                    (i for i, value in enumerate(buf[2:], 2) if 0x40 <= value <= 0x7E),
+                    None,
+                )
+                if end is not None:
+                    sequence = bytes(buf[: end + 1])
+                    mapping = {
+                        b"\x1b[A": "up",
+                        b"\x1b[B": "down",
+                        b"\x1b[C": "right",
+                        b"\x1b[D": "left",
+                        b"\x1b[H": "home",
+                        b"\x1b[F": "end",
+                        b"\x1b[1~": "home",
+                        b"\x1b[4~": "end",
+                        b"\x1b[3~": "delete",
+                        b"\x1b[5~": "page-up",
+                        b"\x1b[6~": "page-down",
+                        b"\x1b[200~": "paste-start",
+                        b"\x1b[201~": "paste-end",
+                    }
+                    keys.append(mapping.get(sequence, "ignore"))
+                    del buf[: end + 1]
+                    continue
             if _esc_pending(buf) and not flush:
                 break
             if len(buf) >= 2 and buf[1] == ord("["):
@@ -226,6 +273,8 @@ class UIState:
     overlay: str | None = None
     toast: str = ""
     unread: dict[str, int] = field(default_factory=dict)
+    overlay_offset: int = 0
+    paste_mode: bool = False
 
 
 def current_key(engine: ChatEngine) -> str | None:
@@ -249,7 +298,9 @@ def list_conversations(engine: ChatEngine, ui: UIState) -> list[ConvItem]:
         found[conv] = ConvItem(conv, title, kind, preview, ts, ui.unread.get(conv, 0))
     for name in engine.groups:
         found.setdefault(f"group:{name}", ConvItem(f"group:{name}", name, "group", unread=ui.unread.get(f"group:{name}", 0)))
-    names = set(engine.sessions) | set(engine.directory)
+    names = set(engine.sessions)
+    if engine.current_peer:
+        names.add(engine.current_peer)
     for name in names:
         if name == engine.username or name.startswith("__"):
             continue
@@ -259,7 +310,7 @@ def list_conversations(engine: ChatEngine, ui: UIState) -> list[ConvItem]:
 
 
 def note_incoming(engine: ChatEngine, ui: UIState, item: Incoming) -> None:
-    if item.kind == "presence" or not (item.text or item.error):
+    if item.kind in {"presence", "sys"} or not (item.text or item.error):
         return
     if item.group:
         key = f"group:{item.group}"
@@ -269,8 +320,10 @@ def note_incoming(engine: ChatEngine, ui: UIState, item: Incoming) -> None:
         return
     if key == current_key(engine):
         ui.unread[key] = 0
+        engine.store.save_unread(ui.unread)
         return
     ui.unread[key] = ui.unread.get(key, 0) + 1
+    engine.store.save_unread(ui.unread)
 
 
 def _line(segments: list[tuple[str, str]], width: int, bg: str, *, divide: bool = False) -> Text:
@@ -310,25 +363,35 @@ class Frame:
         self.engine = engine
         self.ui = ui
 
-    def __rich__(self) -> RenderableType:
-        return self.build()
+    def __rich_console__(self, console: Console, options):
+        yield self.build(options.max_width)
 
-    def build(self) -> Layout:
+    def build(self, width: int = 100) -> Layout:
+        apply_theme(getattr(self.engine, "ui_theme", "telegram"))
         layout = Layout()
         layout.split_column(
             Layout(name="top", size=2),
             Layout(name="mid"),
-            Layout(name="bottom", size=3),
-        )
-        side = 34
-        layout["mid"].split_row(
-            Layout(name="side", size=side),
-            Layout(name="main"),
         )
         layout["top"].update(TopBar(self.engine))
-        layout["side"].update(SideBar(self.engine, self.ui))
+        if width < 70:
+            layout["mid"].split_column(
+                Layout(name="main"),
+                Layout(name="composer", size=3),
+            )
+        else:
+            side = min(34, max(26, width // 3))
+            layout["mid"].split_row(
+                Layout(name="side", size=side),
+                Layout(name="right"),
+            )
+            layout["right"].split_column(
+                Layout(name="main"),
+                Layout(name="composer", size=3),
+            )
+            layout["side"].update(SideBar(self.engine, self.ui))
         layout["main"].update(ChatPane(self.engine, self.ui))
-        layout["bottom"].update(Composer(self.ui))
+        layout["composer"].update(Composer(self.ui))
         return layout
 
 
@@ -339,7 +402,8 @@ class TopBar:
     def __rich_console__(self, console: Console, options):
         width = options.max_width
         err = self.engine.last_error
-        right = f" {err} " if err else f" {self.engine.username} "
+        connection = "在线" if getattr(self.engine, "connected", True) else "已断线"
+        right = f" {err} " if err else f" {connection} · {self.engine.username} "
         right_style = f"bold {RED} {BG}" if err else f"{NAME} {BG}"
         left = " " + PROJECT_NAME
         gap = max(1, width - cell_len(left) - cell_len(right))
@@ -367,8 +431,19 @@ class SideBar:
         ]
         if not items:
             lines.append(line([(" 还没有会话", f"{MUTED} {SIDE_BG}")]))
-        for item in items:
+        capacity = max(0, (height - len(lines)) // 2)
+        active_index = next(
+            (i for i, item in enumerate(items) if item.key == active), 0
+        )
+        start = max(0, active_index - capacity // 2)
+        start = min(start, max(0, len(items) - capacity))
+        visible = items[start : start + capacity]
+        if start:
+            lines.append(line([(" ↑ 更多会话", f"{MUTED} {SIDE_BG}")]))
+        for item in visible:
             lines.extend(self._row(item, item.key == active, width))
+        if start + capacity < len(items):
+            lines.append(line([(" ↓ 更多会话", f"{MUTED} {SIDE_BG}")]))
         blank = line([("", SIDE_BG)])
         if len(lines) < height:
             lines.extend([blank] * (height - len(lines)))
@@ -389,7 +464,7 @@ class SideBar:
         name = clip(item.title, name_w)
         badge = ""
         if item.unread:
-            badge = f" {item.unread} "
+            badge = f" {'99+' if item.unread > 99 else item.unread} "
         preview_w = max(4, width - 6 - cell_len(badge))
         preview = clip(item.preview or " ", preview_w)
         first = _line(
@@ -470,7 +545,9 @@ class ChatPane:
         for para in body.splitlines() or [""]:
             wrapped.extend(wrap_cells(para, inner) or [""])
         lines.append(_line([("  ┌" + "─" * (inner + 2) + "┐", f"{NAME} {BG}")], width, BG))
-        for row in wrapped[:12]:
+        room = 12
+        start = min(self.ui.overlay_offset, max(0, len(wrapped) - room))
+        for row in wrapped[start : start + room]:
             pad = inner - cell_len(row)
             lines.append(
                 _line(
@@ -480,7 +557,10 @@ class ChatPane:
                 )
             )
         lines.append(_line([("  └" + "─" * (inner + 2) + "┘", f"{NAME} {BG}")], width, BG))
-        lines.append(_line([("  Esc 关闭", f"{MUTED} {BG}")], width, BG))
+        scroll = " · PgUp/PgDn 滚动" if len(wrapped) > room else ""
+        lines.append(
+            _line([("  Esc 关闭" + scroll, f"{MUTED} {BG}")], width, BG)
+        )
         return lines
 
     def _messages(self, width: int) -> list[Text]:
@@ -501,7 +581,7 @@ class ChatPane:
             lines.append(_line([("  还没有消息。写一句，回车发送。", f"{MUTED} {BG}")], width, BG))
             return lines
         prev_day = ""
-        inner = max(12, min(42, width - 8))
+        inner = max(4, min(42, width - 8))
         for sender, body, ts in history:
             label = day_label(ts) if ts else ""
             if label and label != prev_day:
@@ -517,7 +597,12 @@ class ChatPane:
             if engine.current_group and not mine:
                 lines.append(_line([("  " + sender, f"bold {avatar_color(sender)} {BG}")], width, BG))
             bubble = OUT if mine else IN
-            fg = f"white {bubble}"
+            fg_color = (
+                "#10210f"
+                if getattr(self.engine, "ui_theme", "telegram") == "wechat" and mine
+                else "white"
+            )
+            fg = f"{fg_color} {bubble}"
             for row in rows:
                 # 时间在行尾，用较淡的颜色画最后的时钟片段
                 content = row
@@ -595,7 +680,14 @@ def edit(ui: UIState, key: str) -> str | None:
         return "stop"
     if key == "esc":
         ui.overlay = None
+        ui.overlay_offset = 0
         return "close"
+    if key == "page-up" and ui.overlay:
+        ui.overlay_offset = max(0, ui.overlay_offset - 10)
+        return None
+    if key == "page-down" and ui.overlay:
+        ui.overlay_offset += 10
+        return None
     if not ui.composer and key in {"up", "ctrl-p"}:
         return "prev"
     if not ui.composer and key in {"down", "ctrl-n", "tab"}:
@@ -604,6 +696,10 @@ def edit(ui: UIState, key: str) -> str | None:
         if ui.cursor > 0:
             ui.composer = ui.composer[: ui.cursor - 1] + ui.composer[ui.cursor :]
             ui.cursor -= 1
+        return None
+    if key == "delete":
+        if ui.cursor < len(ui.composer):
+            ui.composer = ui.composer[: ui.cursor] + ui.composer[ui.cursor + 1 :]
         return None
     if key == "ctrl-u":
         ui.composer = ""
@@ -615,9 +711,24 @@ def edit(ui: UIState, key: str) -> str | None:
     if key == "right":
         ui.cursor = min(len(ui.composer), ui.cursor + 1)
         return None
+    if key == "home":
+        ui.cursor = 0
+        return None
+    if key == "end":
+        ui.cursor = len(ui.composer)
+        return None
     if key == "enter":
         return "submit"
-    if key.startswith("ctrl-") or key in {"up", "down", "esc"}:
+    if key.startswith("ctrl-") or key in {
+        "up",
+        "down",
+        "esc",
+        "ignore",
+        "paste-start",
+        "paste-end",
+        "page-up",
+        "page-down",
+    }:
         return None
     if len(key) == 1 or (len(key) > 1 and not key.startswith("esc")):
         ui.composer = ui.composer[: ui.cursor] + key + ui.composer[ui.cursor :]
@@ -627,6 +738,7 @@ def edit(ui: UIState, key: str) -> str | None:
 
 async def _activate(engine: ChatEngine, ui: UIState, item: ConvItem) -> None:
     ui.unread[item.key] = 0
+    engine.store.save_unread(ui.unread)
     ui.overlay = None
     if item.kind == "group":
         engine.current_group = item.title
@@ -651,10 +763,11 @@ async def _cycle(engine: ChatEngine, ui: UIState, delta: int) -> None:
 
 
 async def _submit(engine: ChatEngine, ui: UIState) -> None:
-    line = ui.composer.strip()
+    original = ui.composer
+    line = original if not original.startswith("/") else original.strip()
     ui.composer = ""
     ui.cursor = 0
-    if not line:
+    if not line.strip():
         if ui.overlay:
             ui.overlay = None
         return
@@ -673,6 +786,7 @@ async def _submit(engine: ChatEngine, ui: UIState) -> None:
         return
     if result.overlay:
         ui.overlay = result.overlay
+        ui.overlay_offset = 0
     if result.notice:
         ui.toast = result.notice
     key = current_key(engine)
@@ -689,8 +803,8 @@ async def _refresh_directory(engine: ChatEngine) -> None:
     engine.online_users = set(info.get("online") or [])
 
 
-def render_app(engine: ChatEngine, ui: UIState) -> Layout:
-    return Frame(engine, ui).build()
+def render_app(engine: ChatEngine, ui: UIState) -> Frame:
+    return Frame(engine, ui)
 
 
 def _set_dark_chrome() -> None:
@@ -704,11 +818,11 @@ def _reset_dark_chrome() -> None:
 
 
 async def telegram_loop(engine: ChatEngine) -> None:
-    ui = UIState(toast="已连接")
+    ui = UIState(toast="已连接", unread=engine.store.load_unread())
     await _refresh_directory(engine)
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
-    tty.setcbreak(fd)
+    old_no_color = os.environ.get("NO_COLOR")
     loop = asyncio.get_running_loop()
     keys: asyncio.Queue[bytes] = asyncio.Queue()
     pending = bytearray()
@@ -722,21 +836,30 @@ async def telegram_loop(engine: ChatEngine) -> None:
             keys.put_nowait(chunk)
 
 
-    loop.add_reader(fd, on_readable)
-    inbox_task = asyncio.create_task(engine.inbox.get())
-    key_task = asyncio.create_task(keys.get())
-    # 云环境会设 NO_COLOR，rich 会因此丢掉背景色，界面就变成白底。
-    os.environ.pop("NO_COLOR", None)
-    console = Console(force_terminal=True, color_system="truecolor")
-    _set_dark_chrome()
+    inbox_task: asyncio.Task | None = None
+    key_task: asyncio.Task | None = None
+    tick_task: asyncio.Task | None = None
+    reader_added = False
     try:
+        tty.setcbreak(fd)
+        loop.add_reader(fd, on_readable)
+        reader_added = True
+        inbox_task = asyncio.create_task(engine.inbox.get())
+        key_task = asyncio.create_task(keys.get())
+        tick_task = asyncio.create_task(asyncio.sleep(0.25))
+        # 云环境会设 NO_COLOR，rich 会因此丢掉背景色，界面就变成白底。
+        os.environ.pop("NO_COLOR", None)
+        console = Console(force_terminal=True, color_system="truecolor")
+        _set_dark_chrome()
         # 不用后台刷新线程。在这个终端里线程刷新会停住，只有改窗口大小才重画。
         with Live(render_app(engine, ui), console=console, screen=True, auto_refresh=False) as live:
             while True:
                 live.update(render_app(engine, ui), refresh=True)
                 done, _pending = await asyncio.wait(
-                    {inbox_task, key_task}, return_when=asyncio.FIRST_COMPLETED
+                    {inbox_task, key_task, tick_task}, return_when=asyncio.FIRST_COMPLETED
                 )
+                if tick_task in done:
+                    tick_task = asyncio.create_task(asyncio.sleep(0.25))
                 if inbox_task in done:
                     note_incoming(engine, ui, inbox_task.result())
                     inbox_task = asyncio.create_task(engine.inbox.get())
@@ -758,6 +881,14 @@ async def telegram_loop(engine: ChatEngine) -> None:
                                 pending.extend(extra)
                             flush = not _esc_pending(pending)
                     for key in drain_keys(pending, flush=flush):
+                        if key == "paste-start":
+                            ui.paste_mode = True
+                            continue
+                        if key == "paste-end":
+                            ui.paste_mode = False
+                            continue
+                        if ui.paste_mode and key == "enter":
+                            key = " "
                         action = edit(ui, key)
                         if action == "stop":
                             raise SystemExit(0)
@@ -768,12 +899,24 @@ async def telegram_loop(engine: ChatEngine) -> None:
                         elif action == "submit":
                             await _submit(engine, ui)
     finally:
-        inbox_task.cancel()
-        key_task.cancel()
-        loop.remove_reader(fd)
-        _reset_dark_chrome()
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        await engine.close()
+        for task in (inbox_task, key_task, tick_task):
+            if task is not None:
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (inbox_task, key_task, tick_task) if task is not None),
+            return_exceptions=True,
+        )
+        if reader_added:
+            loop.remove_reader(fd)
+        try:
+            _reset_dark_chrome()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            if old_no_color is None:
+                os.environ.pop("NO_COLOR", None)
+            else:
+                os.environ["NO_COLOR"] = old_no_color
+            await engine.close()
 
 
 async def run_interface(engine: ChatEngine) -> None:

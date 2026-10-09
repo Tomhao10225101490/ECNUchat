@@ -113,6 +113,7 @@ def test_replay_rejected() -> None:
 def test_gcm_fails_on_flipped_byte() -> None:
     a, b = _bootstrap()
     msg, _ = encrypt(a, b"tamper")
+    before = b.to_record()
     flipped = bytearray(msg.ciphertext)
     flipped[0] ^= 0x01
     bad = RatchetMessage(
@@ -120,6 +121,29 @@ def test_gcm_fails_on_flipped_byte() -> None:
     )
     with pytest.raises(GCMError):
         decrypt(b, bad)
+    assert b.to_record() == before
+    assert decrypt(b, msg)[0] == b"tamper"
+
+
+def test_forged_new_dh_header_does_not_advance_state() -> None:
+    a, b = _bootstrap()
+    reply, _ = encrypt(b, b"reply")
+    assert decrypt(a, reply)[0] == b"reply"
+    legitimate, _ = encrypt(a, b"after-ratchet")
+    before = b.to_record()
+    forged = RatchetMessage(
+        header=Header(
+            dh_pub=legitimate.header.dh_pub,
+            n=legitimate.header.n,
+            pn=legitimate.header.pn,
+        ),
+        nonce=legitimate.nonce,
+        ciphertext=legitimate.ciphertext[:-1] + bytes([legitimate.ciphertext[-1] ^ 1]),
+    )
+    with pytest.raises(GCMError):
+        decrypt(b, forged)
+    assert b.to_record() == before
+    assert decrypt(b, legitimate)[0] == b"after-ratchet"
 
 
 def test_skip_more_than_40_rejected() -> None:
