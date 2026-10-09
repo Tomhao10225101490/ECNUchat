@@ -71,6 +71,7 @@ class ChatServer:
             if username and self.online.get(username) is ws:
                 del self.online[username]
                 log.info("offline user=%s", username)
+                await self._broadcast_presence()
 
     async def dispatch(self, ws: Any, username: str | None, msg: dict[str, Any]) -> str | None:
         typ = msg.get("type")
@@ -180,6 +181,16 @@ class ChatServer:
             except Exception:
                 pass
         self.online[username] = ws
+        await self._broadcast_presence()
+
+    async def _broadcast_presence(self) -> None:
+        raw = dumps({"type": "presence", "online": sorted(self.online)})
+        for sock in list(self.online.values()):
+            try:
+                await sock.send(raw)
+            except Exception:
+                pass
+        log.info("presence count=%s", len(self.online))
 
     async def _push_offline(self, ws: Any, username: str) -> None:
         items = self.store.drain_offline(username)

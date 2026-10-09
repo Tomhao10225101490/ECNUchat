@@ -234,12 +234,25 @@ class ClientStore:
         )
         self.conn.commit()
 
-    def get_history(self, conv: str, limit: int = 50) -> list[tuple[str, str]]:
+    def get_history(self, conv: str, limit: int = 80) -> list[tuple[str, str, float]]:
         rows = self.conn.execute(
-            "SELECT sender, body FROM history WHERE conv=? ORDER BY id DESC LIMIT ?",
+            "SELECT sender, body, ts FROM history WHERE conv=? ORDER BY id DESC LIMIT ?",
             (conv, limit),
         ).fetchall()
-        return list(reversed(rows))
+        return [(r[0], r[1], float(r[2])) for r in reversed(rows)]
+
+    def recent_messages(self) -> list[tuple[str, str, str, float]]:
+        rows = self.conn.execute(
+            """
+            SELECT h.conv, h.sender, h.body, h.ts
+            FROM history h
+            INNER JOIN (
+                SELECT conv, MAX(id) AS id FROM history GROUP BY conv
+            ) t ON h.id = t.id
+            ORDER BY h.id DESC
+            """
+        ).fetchall()
+        return [(r[0], r[1], r[2], float(r[3])) for r in rows]
 
     def save_group(self, name: str, members: list[str]) -> None:
         self.conn.execute(

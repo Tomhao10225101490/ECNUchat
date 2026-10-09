@@ -12,7 +12,6 @@ import websockets
 from cryptography.exceptions import InvalidSignature
 from rich.console import Console
 from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
 
 from src import PROJECT_ABSTRACT, PROJECT_NAME
@@ -62,6 +61,12 @@ class Incoming:
 
 
 @dataclass
+class CommandResult:
+    notice: str | None = None
+    overlay: str | None = None
+
+
+@dataclass
 class ChatEngine:
     username: str
     password: str
@@ -75,6 +80,8 @@ class ChatEngine:
     last_error: str | None = None
     inbox: asyncio.Queue[Incoming] = field(default_factory=asyncio.Queue)
     pending_x3dh: dict[str, Any] = field(default_factory=dict)
+    online_users: set[str] = field(default_factory=set)
+    directory: list[str] = field(default_factory=list)
     ws: Any = None
     _waiters: dict[str, asyncio.Future] = field(default_factory=dict)
     _incoming_raw: asyncio.Queue = field(default_factory=asyncio.Queue)
@@ -219,7 +226,7 @@ class ChatEngine:
                 if waiter is not None and not waiter.done():
                     waiter.set_result(msg)
                     delivered = True
-                if typ in {"envelope", "group_update"} or (
+                if typ in {"envelope", "group_update", "presence"} or (
                     typ == "error" and not delivered
                 ):
                     await self._incoming_raw.put(msg)
@@ -243,9 +250,10 @@ class ChatEngine:
             members = list(msg["members"])
             self.groups[name] = members
             self.store.save_group(name, members)
-            await self.inbox.put(
-                Incoming("系统", f"群 {name} 成员: {', '.join(members)}", name, "sys")
-            )
+            await self.inbox.put(Incoming("系统", "", name, "presence"))
+        elif typ == "presence":
+            self.online_users = set(msg.get("online") or [])
+            await self.inbox.put(Incoming("", "", None, "presence"))
         elif typ == "error":
             self.last_error = msg.get("message")
             await self.inbox.put(Incoming("", "", None, "sys", self.last_error))
@@ -333,28 +341,32 @@ class ChatEngine:
         try:
             text = await self._decrypt_envelope(sender, payload)
         except ReplayError:
-            self.last_error = "重放拒绝"
-            await self.inbox.put(Incoming(sender, "", group, "error", "重放拒绝"))
+            self._fail(sender, group, "重放拒绝")
             return
         except GCMError:
-            self.last_error = "GCM 失败"
-            await self.inbox.put(Incoming(sender, "", group, "error", "GCM 失败"))
+            self._fail(sender, group, "GCM 失败")
             return
         except X3DHError as exc:
-            self.last_error = str(exc) or "验签失败"
-            await self.inbox.put(Incoming(sender, "", group, "error", self.last_error))
+            self._fail(sender, group, str(exc) or "验签失败")
             return
         except RatchetError as exc:
-            self.last_error = exc.kind
-            await self.inbox.put(Incoming(sender, "", group, "error", exc.kind))
+            self._fail(sender, group, exc.kind)
             return
         except Exception as exc:
-            self.last_error = str(exc)
-            await self.inbox.put(Incoming(sender, "", group, "error", str(exc)))
+            self._fail(sender, group, str(exc))
             return
+        self.last_error = None
         conv = f"group:{group}" if group else f"dm:{sender}"
-        self.store.add_history(conv, sender, text)
-        await self.inbox.put(Incoming(sender, text, group, payload.get("kind") or "chat"))
+        who = "系统" if (payload.get("kind") == "group_meta") else sender
+        self.store.add_history(conv, who, text)
+        await self.inbox.put(Incoming(who, text, group, payload.get("kind") or "chat"))
+
+    def _fail(self, sender: str, group: str | None, phrase: str) -> None:
+        self.last_error = phrase
+        conv = f"group:{group}" if group else (f"dm:{sender}" if sender else None)
+        if conv:
+            self.store.add_history(conv, "系统", phrase)
+        self.inbox.put_nowait(Incoming(sender, "", group, "error", phrase))
 
     async def _decrypt_envelope(self, sender: str, payload: dict[str, Any]) -> str:
         ratchet_msg, init = decode_ratchet_payload(payload)
@@ -415,7 +427,8 @@ class ChatEngine:
         self.store.save_group(name, all_members)
         self.current_group = name
         self.current_peer = None
-        notice = f"{self.username} 创建群 {name}"
+        notice = f"{self.username} 创建了群，成员 {', '.join(all_members)}"
+        self.store.add_history(f"group:{name}", "系统", notice)
         for other in all_members:
             if other == self.username:
                 continue
@@ -432,6 +445,7 @@ class ChatEngine:
         self.groups[name] = members
         self.store.save_group(name, members)
         notice = f"{self.username} 将 {member} 加入 {name}"
+        self.store.add_history(f"group:{name}", "系统", notice)
         for other in members:
             if other == self.username:
                 continue
@@ -454,29 +468,49 @@ def print_banner(engine: ChatEngine) -> None:
     console.print(Panel(body, title=PROJECT_NAME, border_style="cyan"))
     console.print(
         "[dim]/chat 名字  /fingerprint 名字  /group create 群名 成员…  "
-        "/group add 群名 新成员  /history  /users  /quit[/dim]"
+        "/group add 群名 新成员  /history  /users  /help  /quit[/dim]"
     )
 
 
-def render_incoming(me: str, item: Incoming) -> None:
-    if item.error:
-        console.print(f"[bold red]{item.error}[/bold red]")
-        return
-    if item.kind == "sys":
-        console.print(f"[yellow]{item.text}[/yellow]")
-        return
-    where = f"#{item.group} " if item.group else ""
-    style = "green" if item.sender == me else "white"
-    console.print(f"[{style}]{where}{item.sender}: {item.text}[/{style}]")
+def _history_text(engine: ChatEngine) -> str:
+    if engine.current_group:
+        conv = f"group:{engine.current_group}"
+    elif engine.current_peer:
+        conv = f"dm:{engine.current_peer}"
+    else:
+        return "先选择会话"
+    lines = []
+    for sender, body, _ts in engine.store.get_history(conv):
+        lines.append(f"{sender}: {body}")
+    return "\n".join(lines) if lines else "这个会话还没有消息"
 
 
 async def command_loop(engine: ChatEngine) -> None:
+    from src.ui import run_interface
+
+    await run_interface(engine)
+
+
+async def legacy_command_loop(engine: ChatEngine) -> None:
     print_banner(engine)
+
+    def render_incoming(item: Incoming) -> None:
+        if item.kind == "presence":
+            return
+        if item.error:
+            console.print(f"[bold red]{item.error}[/bold red]")
+            return
+        if item.kind in {"sys", "group_meta"} or item.sender == "系统":
+            console.print(f"[yellow]{item.text}[/yellow]")
+            return
+        where = f"#{item.group} " if item.group else ""
+        style = "green" if item.sender == engine.username else "white"
+        console.print(f"[{style}]{where}{item.sender}: {item.text}[/{style}]")
 
     async def printer() -> None:
         while True:
             item = await engine.inbox.get()
-            render_incoming(engine.username, item)
+            render_incoming(item)
             console.print(f"[dim]{engine.status_line()}[/dim]")
 
     printer_task = asyncio.create_task(printer())
@@ -490,92 +524,92 @@ async def command_loop(engine: ChatEngine) -> None:
             if not line:
                 continue
             try:
-                await handle_line(engine, line)
+                result = await handle_line(engine, line)
             except (ProtocolError, X3DHError, RatchetError) as exc:
                 engine.last_error = str(exc)
                 console.print(f"[bold red]{exc}[/bold red]")
+                continue
             except Exception as exc:
                 engine.last_error = str(exc)
                 console.print(f"[bold red]{exc}[/bold red]")
+                continue
+            if result.overlay:
+                console.print(Panel(result.overlay, border_style="cyan"))
+            elif result.notice:
+                console.print(result.notice)
+            elif not line.startswith("/"):
+                who = f"#{engine.current_group} " if engine.current_group else ""
+                console.print(f"[green]{who}{engine.username}: {line}[/green]")
             console.print(f"[dim]{engine.status_line()}[/dim]")
     finally:
         printer_task.cancel()
         await engine.close()
 
 
-async def handle_line(engine: ChatEngine, line: str) -> None:
+async def handle_line(engine: ChatEngine, line: str) -> CommandResult:
     if not line.startswith("/"):
         if engine.current_group:
             await engine.send_text(line, group=engine.current_group)
-            console.print(f"[green]#{engine.current_group} {engine.username}: {line}[/green]")
         else:
             await engine.send_text(line)
-            console.print(f"[green]{engine.username}: {line}[/green]")
-        return
+        engine.last_error = None
+        return CommandResult()
     parts = line.split()
     cmd = parts[0]
     if cmd in {"/quit", "/exit"}:
         raise SystemExit(0)
+    if cmd == "/help":
+        from src.ui import HELP_TEXT
+
+        return CommandResult(overlay=HELP_TEXT)
     if cmd == "/users":
         info = await engine.list_users()
-        table = Table(title="用户")
-        table.add_column("用户名")
-        table.add_column("在线")
-        online = set(info.get("online") or [])
-        for u in info.get("users") or []:
-            table.add_row(u, "是" if u in online else "否")
-        console.print(table)
-        return
+        engine.directory = list(info.get("users") or [])
+        engine.online_users = set(info.get("online") or [])
+        rows = ["用户          状态"]
+        for u in engine.directory:
+            rows.append(f"{u:<14}{'在线' if u in engine.online_users else '离线'}")
+        return CommandResult(overlay="\n".join(rows))
     if cmd == "/chat" and len(parts) == 2:
         validate_username(parts[1])
+        if parts[1] == engine.username:
+            raise ProtocolError("不能和自己建立会话")
         engine.current_peer = parts[1]
         engine.current_group = None
         try:
             await engine.fetch_user(parts[1])
         except ProtocolError:
             pass
-        console.print(f"切换到与 {parts[1]} 的单聊")
-        return
+        return CommandResult(notice=f"已打开与 {parts[1]} 的会话")
     if cmd == "/fingerprint" and len(parts) == 2:
         name = parts[1]
         if name == engine.username:
             ik = engine.identity.ik_sign_pub
         else:
             ik, _ = await engine.fetch_user(name)
-        console.print(f"{name} IK_sign 指纹:\n{fingerprint(ik)}")
-        return
+        groups = fingerprint(ik).split()
+        grid = "\n".join("  ".join(groups[i : i + 4]) for i in range(0, 16, 4))
+        body = f"{name} 的 IK_sign 指纹\n用线下渠道核对这 16 组。不一致就不要继续聊。\n\n{grid}"
+        return CommandResult(overlay=body, notice=f"{name} 指纹已显示")
     if cmd == "/history":
-        if engine.current_group:
-            conv = f"group:{engine.current_group}"
-        elif engine.current_peer:
-            conv = f"dm:{engine.current_peer}"
-        else:
-            console.print("先选择会话")
-            return
-        for sender, body in engine.store.get_history(conv):
-            console.print(f"{sender}: {body}")
-        return
+        return CommandResult(overlay=_history_text(engine))
     if cmd == "/group" and len(parts) >= 2:
         if parts[1] == "create" and len(parts) >= 4:
             await engine.create_group(parts[2], parts[3:])
-            console.print(f"已创建群 {parts[2]}")
-            return
+            return CommandResult(notice=f"已创建群 {parts[2]}")
         if parts[1] == "add" and len(parts) == 4:
             await engine.add_group_member(parts[2], parts[3])
-            console.print(f"已向 {parts[2]} 加入 {parts[3]}")
-            return
+            return CommandResult(notice=f"已将 {parts[3]} 加入 {parts[2]}")
         engine.current_group = parts[1]
         engine.current_peer = None
-        console.print(f"切换到群 {parts[1]}")
-        return
-    raise ProtocolError("无法识别的命令")
+        return CommandResult(notice=f"已打开群 {parts[1]}")
+    raise ProtocolError("无法识别的命令，输入 /help 查看")
 
 
 async def async_main(args: argparse.Namespace) -> None:
     engine = ChatEngine.open(args.user, args.password, args.db)
     uri = f"ws://{args.host}:{args.port}"
     await engine.connect(uri)
-    console.print(f"[dim]已连接 {uri}[/dim]")
     await command_loop(engine)
 
 
