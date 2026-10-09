@@ -49,7 +49,19 @@ def b64e(data: bytes | None) -> str | None:
 def b64d(data: str | None) -> bytes | None:
     if data is None:
         return None
-    return base64.b64decode(data)
+    if not isinstance(data, str):
+        raise ProtocolError("Base64 字段必须是字符串")
+    try:
+        return base64.b64decode(data, validate=True)
+    except (ValueError, base64.binascii.Error) as exc:
+        raise ProtocolError("Base64 字段无效") from exc
+
+
+def _fixed(data: str | None, length: int, name: str) -> bytes:
+    decoded = b64d(data)
+    if decoded is None or len(decoded) != length:
+        raise ProtocolError(f"{name} 必须是 {length} 字节")
+    return decoded
 
 
 def validate_username(username: str) -> None:
@@ -104,10 +116,14 @@ def decode_x3dh(data: dict[str, Any] | None) -> InitialMessage | None:
     if not data:
         return None
     return InitialMessage(
-        ik_dh_pub=b64d(data["ik_dh_pub"]) or b"",
-        ek_pub=b64d(data["ek_pub"]) or b"",
-        opk_pub=b64d(data.get("opk_pub")),
-        signature=b64d(data["signature"]) or b"",
+        ik_dh_pub=_fixed(data.get("ik_dh_pub"), 32, "IK_dh 公钥"),
+        ek_pub=_fixed(data.get("ek_pub"), 32, "EK 公钥"),
+        opk_pub=(
+            _fixed(data.get("opk_pub"), 32, "OPK 公钥")
+            if data.get("opk_pub") is not None
+            else None
+        ),
+        signature=_fixed(data.get("signature"), 64, "初始消息签名"),
     )
 
 
@@ -134,15 +150,25 @@ def encode_ratchet_payload(
 
 
 def decode_ratchet_payload(payload: dict[str, Any]) -> tuple[RatchetMessage, InitialMessage | None]:
+    try:
+        n = int(payload["n"])
+        pn = int(payload["pn"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ProtocolError("棘轮序号无效") from exc
+    if not 0 <= n <= 0xFFFFFFFF or not 0 <= pn <= 0xFFFFFFFF:
+        raise ProtocolError("棘轮序号超出 uint32 范围")
     header = Header(
-        dh_pub=b64d(payload["dh_pub"]) or b"",
-        n=int(payload["n"]),
-        pn=int(payload["pn"]),
+        dh_pub=_fixed(payload.get("dh_pub"), 32, "DH 棘轮公钥"),
+        n=n,
+        pn=pn,
     )
+    ciphertext = b64d(payload.get("ciphertext"))
+    if ciphertext is None or len(ciphertext) < 16:
+        raise ProtocolError("密文缺少 GCM 认证标签")
     msg = RatchetMessage(
         header=header,
-        nonce=b64d(payload["nonce"]) or b"",
-        ciphertext=b64d(payload["ciphertext"]) or b"",
+        nonce=_fixed(payload.get("nonce"), 12, "AES-GCM nonce"),
+        ciphertext=ciphertext,
     )
     return msg, decode_x3dh(payload.get("x3dh"))
 

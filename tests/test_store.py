@@ -34,3 +34,33 @@ def test_password_unlocks_ratchet_and_continues(tmp_path) -> None:
     second, _ = encrypt(a, "重启后继续".encode())
     assert decrypt(loaded, second)[0] == "重启后继续".encode()
     store2.close()
+
+
+def test_session_and_outbox_commit_together(tmp_path) -> None:
+    alice = generate_identity("alice")
+    bob = generate_identity("bob")
+    ek_priv, _ = generate_x25519()
+    sk = initiator_secret(
+        alice.ik_dh_priv, ek_priv, bob.spk.pub, bob.ik_dh_pub, None
+    )
+    state = init_sender(sk, bob.spk.pub, "alice", "bob")
+    path = tmp_path / "alice.db"
+    store = ClientStore(path)
+    store.create("password123", alice)
+    payload = {"ciphertext": "same-envelope", "x3dh": {"signature": "kept"}}
+    store.save_session_with_outbox("bob", state, payload)
+    store.close()
+
+    reopened = ClientStore(path)
+    reopened.unlock("password123")
+    assert reopened.load_session("bob") is not None
+    assert reopened.load_outbox("bob") == payload
+    reopened.delete_outbox("bob")
+    assert reopened.load_outbox("bob") is None
+    reopened.save_unread({"dm:bob": 3, "group:test": 120})
+    assert reopened.load_unread() == {"dm:bob": 3, "group:test": 120}
+    reopened.save_pending_prekeys([b"a" * 32, b"b" * 32])
+    assert reopened.load_pending_prekeys() == [b"a" * 32, b"b" * 32]
+    reopened.clear_pending_prekeys()
+    assert reopened.load_pending_prekeys() == []
+    reopened.close()

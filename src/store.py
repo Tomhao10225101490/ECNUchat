@@ -97,6 +97,7 @@ def _state_to_json(state: RatchetState) -> bytes:
         "pns": rec["pns"],
         "skipped": [[b64e(k), b64e(v)] for k, v in rec["skipped"].items()],
         "seen": [b64e(k) for k in rec["seen"]],
+        "retired_dh": [b64e(k) for k in rec["retired_dh"]],
         "dh_ratchet_count": rec["dh_ratchet_count"],
     }
     return json.dumps(obj, separators=(",", ":")).encode("utf-8")
@@ -106,6 +107,7 @@ def _state_from_json(raw: bytes) -> RatchetState:
     obj = json.loads(raw.decode("utf-8"))
     skipped = {b64d(k) or b"": b64d(v) or b"" for k, v in obj.get("skipped") or []}
     seen = {b64d(k) or b"" for k in obj.get("seen") or []}
+    retired_dh = {b64d(k) or b"" for k in obj.get("retired_dh") or []}
     return RatchetState.from_record(
         {
             "rk": b64d(obj["rk"]) or b"",
@@ -121,6 +123,7 @@ def _state_from_json(raw: bytes) -> RatchetState:
             "pns": obj.get("pns", 0),
             "skipped": skipped,
             "seen": seen,
+            "retired_dh": retired_dh,
             "dh_ratchet_count": obj.get("dh_ratchet_count", 0),
         }
     )
@@ -150,6 +153,10 @@ class ClientStore:
                 peer TEXT PRIMARY KEY,
                 blob BLOB NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS outbox (
+                peer TEXT PRIMARY KEY,
+                blob BLOB NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 conv TEXT NOT NULL,
@@ -165,6 +172,10 @@ class ClientStore:
                 username TEXT PRIMARY KEY,
                 ik_sign_pub BLOB NOT NULL,
                 ik_dh_pub BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ui_state (
+                k TEXT PRIMARY KEY,
+                v TEXT NOT NULL
             );
             """
         )
@@ -207,6 +218,28 @@ class ClientStore:
             raise RuntimeError("身份密文缺失")
         return _identity_from_json(decrypt_blob(self._require_key(), row[0]))
 
+    def save_pending_prekeys(self, pubs: list[bytes]) -> None:
+        raw = json.dumps([b64e(pub) for pub in pubs], separators=(",", ":")).encode()
+        blob = encrypt_blob(self._require_key(), raw)
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO vault(name, blob) VALUES('pending_prekeys', ?)",
+                (blob,),
+            )
+
+    def load_pending_prekeys(self) -> list[bytes]:
+        row = self.conn.execute(
+            "SELECT blob FROM vault WHERE name='pending_prekeys'"
+        ).fetchone()
+        if not row:
+            return []
+        raw = decrypt_blob(self._require_key(), row[0])
+        return [b64d(item) or b"" for item in json.loads(raw.decode())]
+
+    def clear_pending_prekeys(self) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM vault WHERE name='pending_prekeys'")
+
     def save_session(self, peer: str, state: RatchetState) -> None:
         blob = encrypt_blob(self._require_key(), _state_to_json(state))
         self.conn.execute(
@@ -214,6 +247,42 @@ class ClientStore:
             (peer, blob),
         )
         self.conn.commit()
+
+    def save_session_with_outbox(
+        self, peer: str, state: RatchetState, payload: dict[str, Any]
+    ) -> None:
+        state_blob = encrypt_blob(self._require_key(), _state_to_json(state))
+        payload_blob = encrypt_blob(
+            self._require_key(),
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            ),
+        )
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO sessions(peer, blob) VALUES(?, ?)",
+                (peer, state_blob),
+            )
+            self.conn.execute(
+                "INSERT OR REPLACE INTO outbox(peer, blob) VALUES(?, ?)",
+                (peer, payload_blob),
+            )
+
+    def load_outbox(self, peer: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT blob FROM outbox WHERE peer=?", (peer,)
+        ).fetchone()
+        if not row:
+            return None
+        raw = decrypt_blob(self._require_key(), row[0])
+        value = json.loads(raw.decode("utf-8"))
+        if not isinstance(value, dict):
+            raise RuntimeError("待发信封格式无效")
+        return value
+
+    def delete_outbox(self, peer: str) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM outbox WHERE peer=?", (peer,))
 
     def load_session(self, peer: str) -> RatchetState | None:
         row = self.conn.execute(
@@ -281,6 +350,25 @@ class ClientStore:
             return None
         return row[0], row[1]
 
+    def save_unread(self, unread: dict[str, int]) -> None:
+        clean = {key: min(999, max(0, int(value))) for key, value in unread.items()}
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO ui_state(k, v) VALUES('unread', ?)",
+                (json.dumps(clean, ensure_ascii=False),),
+            )
+
+    def load_unread(self) -> dict[str, int]:
+        row = self.conn.execute(
+            "SELECT v FROM ui_state WHERE k='unread'"
+        ).fetchone()
+        if not row:
+            return {}
+        value = json.loads(row[0])
+        if not isinstance(value, dict):
+            return {}
+        return {str(key): int(count) for key, count in value.items()}
+
     def close(self) -> None:
         self.conn.close()
 
@@ -346,20 +434,20 @@ class ServerStore:
         spk_created: float,
         opks: list[bytes],
     ) -> None:
-        self.conn.execute(
-            "INSERT INTO users(username, ik_sign_pub, ik_dh_pub) VALUES(?,?,?)",
-            (username, ik_sign_pub, ik_dh_pub),
-        )
-        self.conn.execute(
-            "INSERT INTO signed_prekeys(username, spk_pub, spk_sig, created) VALUES(?,?,?,?)",
-            (username, spk_pub, spk_sig, spk_created),
-        )
-        for pub in opks:
+        with self.conn:
             self.conn.execute(
-                "INSERT INTO one_time_prekeys(username, opk_pub) VALUES(?,?)",
-                (username, pub),
+                "INSERT INTO users(username, ik_sign_pub, ik_dh_pub) VALUES(?,?,?)",
+                (username, ik_sign_pub, ik_dh_pub),
             )
-        self.conn.commit()
+            self.conn.execute(
+                "INSERT INTO signed_prekeys(username, spk_pub, spk_sig, created) VALUES(?,?,?,?)",
+                (username, spk_pub, spk_sig, spk_created),
+            )
+            for pub in opks:
+                self.conn.execute(
+                    "INSERT INTO one_time_prekeys(username, opk_pub) VALUES(?,?)",
+                    (username, pub),
+                )
 
     def get_user(self, username: str) -> tuple[bytes, bytes] | None:
         row = self.conn.execute(
@@ -406,17 +494,17 @@ class ServerStore:
         ).fetchone()
         if not spk:
             return None
-        opk_row = self.conn.execute(
-            "SELECT id, opk_pub FROM one_time_prekeys WHERE username=? ORDER BY id LIMIT 1",
-            (username,),
-        ).fetchone()
-        opk_pub = None
-        if opk_row:
-            self.conn.execute("DELETE FROM one_time_prekeys WHERE id=?", (opk_row[0],))
-            self.conn.commit()
-            opk_pub = opk_row[1]
-        else:
-            self.conn.commit()
+        with self.conn:
+            opk_row = self.conn.execute(
+                "SELECT id, opk_pub FROM one_time_prekeys WHERE username=? ORDER BY id LIMIT 1",
+                (username,),
+            ).fetchone()
+            opk_pub = None
+            if opk_row:
+                self.conn.execute(
+                    "DELETE FROM one_time_prekeys WHERE id=?", (opk_row[0],)
+                )
+                opk_pub = opk_row[1]
         return {
             "ik_sign_pub": ik_sign_pub,
             "ik_dh_pub": ik_dh_pub,
@@ -433,27 +521,36 @@ class ServerStore:
         )
         self.conn.commit()
 
-    def drain_offline(self, recipient: str) -> list[str]:
+    def list_offline(self, recipient: str) -> list[tuple[int, str]]:
         rows = self.conn.execute(
             "SELECT id, payload FROM offline_queue WHERE recipient=? ORDER BY id",
             (recipient,),
         ).fetchall()
-        if rows:
-            ids = [r[0] for r in rows]
-            self.conn.executemany(
-                "DELETE FROM offline_queue WHERE id=?", [(i,) for i in ids]
+        return [(int(row[0]), str(row[1])) for row in rows]
+
+    def delete_offline(self, envelope_id: int) -> None:
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM offline_queue WHERE id=?", (envelope_id,)
             )
-            self.conn.commit()
-        return [r[1] for r in rows]
+
+    def drain_offline(self, recipient: str) -> list[str]:
+        """测试/维护接口；运行时推送使用 list + 逐条成功后删除。"""
+        rows = self.list_offline(recipient)
+        with self.conn:
+            self.conn.executemany(
+                "DELETE FROM offline_queue WHERE id=?", [(row[0],) for row in rows]
+            )
+        return [row[1] for row in rows]
 
     def create_group(self, name: str, members: list[str]) -> None:
-        self.conn.execute("INSERT INTO groups(name) VALUES(?)", (name,))
-        for u in members:
-            self.conn.execute(
-                "INSERT INTO group_members(group_name, username) VALUES(?,?)",
-                (name, u),
-            )
-        self.conn.commit()
+        with self.conn:
+            self.conn.execute("INSERT INTO groups(name) VALUES(?)", (name,))
+            for u in members:
+                self.conn.execute(
+                    "INSERT INTO group_members(group_name, username) VALUES(?,?)",
+                    (name, u),
+                )
 
     def group_exists(self, name: str) -> bool:
         row = self.conn.execute("SELECT 1 FROM groups WHERE name=?", (name,)).fetchone()

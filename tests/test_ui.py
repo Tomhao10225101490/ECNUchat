@@ -66,6 +66,18 @@ def test_drain_keys_utf8_and_arrows() -> None:
     assert buf == bytearray()
     buf = bytearray(b"\x7f\r")
     assert drain_keys(buf) == ["backspace", "enter"]
+    buf = bytearray(b"\x1b[3~\x1b[H\x1b[F\x1b[5~\x1b[6~")
+    assert drain_keys(buf) == ["delete", "home", "end", "page-up", "page-down"]
+    buf = bytearray(b"\x1b[200~hello\x1b[201~")
+    assert drain_keys(buf) == [
+        "paste-start",
+        "h",
+        "e",
+        "l",
+        "l",
+        "o",
+        "paste-end",
+    ]
 
 
 def test_edit_composer_and_chat_switch() -> None:
@@ -87,7 +99,7 @@ def test_sidebar_orders_recent_chat_first() -> None:
     items = list_conversations(engine, ui)
     assert items[0].title == "bob"
     titles = [item.title for item in items]
-    assert "carol" in titles
+    assert "carol" not in titles  # 用户目录不应挤进真实会话列表
     assert "三人组" in titles
     assert "alice" not in titles
 
@@ -106,6 +118,20 @@ def test_render_shows_project_bubbles_and_security() -> None:
     assert "棘轮代数" in text
     assert "指纹" in text
     assert "bob" in text
+
+
+def test_narrow_layout_hides_sidebar_but_keeps_chat() -> None:
+    engine = _engine()
+    engine.ui_theme = "wechat"
+    engine.connected = True
+    console = Console(
+        width=52, height=24, force_terminal=True, color_system="truecolor", record=True
+    )
+    console.print(render_app(engine, UIState()))
+    text = console.export_text()
+    assert PROJECT_NAME in text
+    assert "你好鲍勃" in text
+    assert "棘轮代数" in text
 
 
 def test_tty_boots_project_name(tmp_path) -> None:
