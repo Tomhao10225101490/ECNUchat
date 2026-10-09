@@ -53,6 +53,13 @@ async def _e2e(tmp_path: Path) -> None:
 
         users = await alice.list_users()
         assert set(users["users"]) >= {"alice", "bob", "carol"}
+        concurrent = await asyncio.gather(
+            alice.list_users(),
+            alice.fetch_user("bob"),
+            alice.fetch_user("carol"),
+        )
+        assert set(concurrent[0]["users"]) >= {"alice", "bob", "carol"}
+        assert len(concurrent[1][0]) == len(concurrent[2][0]) == 32
 
         first = await alice.request({"type": "fetch_bundle", "username": "bob"}, "bundle")
         second = await carol.request({"type": "fetch_bundle", "username": "bob"}, "bundle")

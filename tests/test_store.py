@@ -59,6 +59,15 @@ def test_session_and_outbox_commit_together(tmp_path) -> None:
     assert reopened.load_outbox("bob") is None
     reopened.save_unread({"dm:bob": 3, "group:test": 120})
     assert reopened.load_unread() == {"dm:bob": 3, "group:test": 120}
+    reopened.save_ui_value("theme", "wechat")
+    assert reopened.load_ui_value("theme") == "wechat"
+    assert reopened.load_ui_value("missing", "fallback") == "fallback"
+    reopened.add_history("dm:bob", "bob", "你好，适合中文搜索")
+    assert reopened.search_history("中文")[0][3] == "你好，适合中文搜索"
+    reopened.save_message_status("local-1", "dm:bob", "待发送", "sending")
+    assert reopened.pending_message_statuses()[0][0] == "local-1"
+    reopened.update_message_status("local-1", "accepted")
+    assert reopened.pending_message_statuses() == []
     reopened.save_pending_prekeys([b"a" * 32, b"b" * 32])
     assert reopened.load_pending_prekeys() == [b"a" * 32, b"b" * 32]
     reopened.clear_pending_prekeys()

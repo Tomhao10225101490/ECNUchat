@@ -7,11 +7,26 @@ X25519 就是椭圆曲线 Diffie-Hellman；每条消息用 AES-256-GCM 加密并
 ## 依赖
 
 - Python 3.11+
-- 只使用 `requirements.txt`：`cryptography`、`websockets`、`rich`、`pytest`
+- 只使用 `requirements.txt`：`cryptography`、`websockets`、`rich`、`PySide6`、`pytest`
 
 ```bash
 python3 -m pip install -r requirements.txt
 ```
+
+## 桌面 GUI（推荐）
+
+先启动服务器，然后分别启动三个桌面客户端：
+
+```bash
+python3 -m src.server --host 127.0.0.1 --port 8765 --db data/server.db
+python3 -m src.gui
+python3 -m src.gui
+python3 -m src.gui
+```
+
+登录窗口依次使用 `alice`、`bob`、`carol`，口令均为 `password123`。桌面端提供 Telegram 式会话侧栏、WeChat 绿色主题、左右消息气泡、在线状态、持久化未读数、本地中文历史搜索、身份指纹、棘轮代数、发送状态和轻量淡入动画。右上角可切换主题或减少动态效果。消息先以「发送中」乐观显示；服务器确认后显示「已发送」，这只表示服务器接受信封，**不表示对方已读**。网络断开后会自动重连，未确认的加密 outbox 信封会按原字节重发，不重复推进棘轮。
+
+桌面 GUI 只负责展示和交互；WebSocket、SQLite、X3DH、AES-256-GCM 与双棘轮仍全部由 `ChatEngine` 执行，Qt 主线程不接触 SK、RK、CK 或 MK。终端客户端仍保留，便于答辩演示和脚本化测试。
 
 ## 三个终端演示
 
@@ -85,7 +100,7 @@ bob、carol 应各收到一条中文。carol 解不开 alice 发给 bob 的那�
 /quit
 ```
 
-界面用 rich 画成桌面即时通讯双栏：左侧会话列表（彩色头像、最后一条预览、时间、持久化未读数、在线绿点），右侧自己的消息靠右、对方靠左。默认是 Telegram 蓝色风格，输入 `/theme wechat` 可切成微信绿色发送气泡，`/theme telegram` 切回。窄终端会自动隐藏侧栏，只保留聊天和输入区。顶栏是项目全名。打开会话后能看到对端指纹前 8 组、棘轮代数，以及标红的「验签失败 / 重放拒绝 / GCM 失败」。
+终端兼容界面用 rich 绘制双栏：左侧会话列表，右侧自己的消息靠右、对方靠左。默认是 Telegram 蓝色风格，输入 `/theme wechat` 可切成微信绿色发送气泡，`/theme telegram` 切回。窄终端会自动隐藏侧栏。顶栏是项目全名。打开会话后能看到对端指纹前 8 组、棘轮代数，以及标红的「验签失败 / 重放拒绝 / GCM 失败」。
 
 终端里直接打字回车发送。输入框为空时用 Tab 或上下键切换会话，Esc 关闭指纹卡片，PgUp/PgDn 滚动长浮层；Home、End、Delete 和 bracketed paste 均可用。`/help` 列出命令。管道或非交互终端会退回逐行模式。
 

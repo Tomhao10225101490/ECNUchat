@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextvars
 import logging
 import os
 import sys
@@ -35,6 +36,43 @@ logging.basicConfig(
 )
 log = logging.getLogger("e2ee-server")
 
+UNSOLICITED_TYPES = {"envelope", "presence"}
+
+
+class RequestSocket:
+    """给响应透明附加 request_id，同时保持推送消息不带关联 ID。"""
+
+    def __init__(self, raw: Any) -> None:
+        self.raw = raw
+        self._request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+            f"request_id_{id(self)}", default=None
+        )
+
+    async def send(self, raw: str | bytes) -> None:
+        request_id = self._request_id.get()
+        if request_id and isinstance(raw, str):
+            try:
+                message = loads(raw)
+            except Exception:
+                message = None
+            if (
+                isinstance(message, dict)
+                and message.get("type") not in UNSOLICITED_TYPES
+                and "request_id" not in message
+            ):
+                message["request_id"] = request_id
+                raw = dumps(message)
+        await self.raw.send(raw)
+
+    def begin_request(self, request_id: str | None) -> contextvars.Token:
+        return self._request_id.set(request_id)
+
+    def end_request(self, token: contextvars.Token) -> None:
+        self._request_id.reset(token)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.raw, name)
+
 
 class ChatServer:
     def __init__(self, store: ServerStore) -> None:
@@ -43,6 +81,7 @@ class ChatServer:
         self.pending_challenge: dict[int, tuple[str, bytes]] = {}
 
     async def handler(self, ws: Any) -> None:
+        socket = RequestSocket(ws)
         username: str | None = None
         try:
             async for raw in ws:
@@ -62,14 +101,17 @@ class ChatServer:
                     await ws.send(dumps(error_msg(str(exc))))
                     continue
                 try:
-                    username = await self.dispatch(ws, username, msg)
+                    token = socket.begin_request(msg.get("request_id"))
+                    username = await self.dispatch(socket, username, msg)
                 except Exception as exc:
                     log.info("error type=%s detail=%s", msg.get("type"), type(exc).__name__)
-                    await ws.send(dumps(error_msg(str(exc))))
+                    await socket.send(dumps(error_msg(str(exc))))
+                finally:
+                    socket.end_request(token)
         except ConnectionClosed:
             pass
         finally:
-            if username and self.online.get(username) is ws:
+            if username and self.online.get(username) is socket:
                 del self.online[username]
                 log.info("offline user=%s", username)
                 await self._broadcast_presence()

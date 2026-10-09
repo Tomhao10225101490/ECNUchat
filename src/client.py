@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import uuid
 import sys
 from dataclasses import dataclass, field
 from typing import Any
@@ -89,7 +90,6 @@ class ChatEngine:
     _waiters: dict[str, asyncio.Future] = field(default_factory=dict)
     _incoming_raw: asyncio.Queue = field(default_factory=asyncio.Queue)
     _tasks: list[asyncio.Task] = field(default_factory=list)
-    _request_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _peer_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
 
     @classmethod
@@ -151,30 +151,31 @@ class ChatEngine:
         check_size(raw)
         await self.ws.send(raw)
 
-    def _arm(self, *types: str) -> asyncio.Future:
+    def _arm(self, request_id: str) -> asyncio.Future:
         loop = asyncio.get_event_loop()
         fut: asyncio.Future = loop.create_future()
-        for t in types:
-            self._waiters[t] = fut
+        self._waiters[request_id] = fut
         return fut
 
-    def _disarm(self, *types: str) -> None:
-        for t in types:
-            self._waiters.pop(t, None)
+    def _disarm(self, request_id: str) -> None:
+        self._waiters.pop(request_id, None)
 
     async def request(self, obj: dict[str, Any], *expect: str) -> dict[str, Any]:
-        # 当前协议响应没有 request_id；在升级协议前串行化，避免同类型响应串包。
-        async with self._request_lock:
-            if not self.connected and obj.get("type") not in {"register", "login"}:
-                raise ProtocolError("连接已断开")
-            fut = self._arm(*expect, "error")
-            try:
-                await self.send_json(obj)
-                result = await asyncio.wait_for(fut, timeout=15)
-            finally:
-                self._disarm(*expect, "error")
+        if not self.connected and obj.get("type") not in {"register", "login"}:
+            raise ProtocolError("连接已断开")
+        request_id = uuid.uuid4().hex
+        request_obj = dict(obj)
+        request_obj["request_id"] = request_id
+        fut = self._arm(request_id)
+        try:
+            await self.send_json(request_obj)
+            result = await asyncio.wait_for(fut, timeout=15)
+        finally:
+            self._disarm(request_id)
         if result.get("type") == "error":
             raise ProtocolError(result.get("message") or "服务器错误")
+        if expect and result.get("type") not in expect:
+            raise ProtocolError(f"响应类型错误：{result.get('type')}")
         return result
 
     async def connect(self, uri: str) -> None:
@@ -196,10 +197,34 @@ class ChatEngine:
             self.store.save_peer(
                 "__registered__", self.identity.ik_sign_pub, self.identity.ik_dh_pub
             )
+        await self._retry_outboxes()
         try:
             await self._retry_pending_prekeys()
         except Exception:
             self.last_error = "预密钥补充将在下次登录重试"
+
+    async def _retry_outboxes(self) -> None:
+        """重连后重发原始加密信封，不再次推进双棘轮。"""
+        for peer in self.store.list_outbox_peers():
+            payload = self.store.load_outbox(peer)
+            if payload is None:
+                continue
+            try:
+                await self.request(
+                    {
+                        "type": "envelope",
+                        "from": self.username,
+                        "to": peer,
+                        "payload": payload,
+                    },
+                    "envelope_ok",
+                )
+            except Exception:
+                self.last_error = "待发加密信封将在下次重连重试"
+                continue
+            self.store.delete_outbox(peer)
+            if payload.get("x3dh") is not None:
+                self.pending_x3dh.pop(peer, None)
 
     async def _retry_pending_prekeys(self) -> None:
         pending = self.store.load_pending_prekeys()
@@ -243,9 +268,7 @@ class ChatEngine:
                 except Exception:
                     continue
                 typ = msg.get("type")
-                waiter = self._waiters.get(typ)
-                if waiter is None and typ == "error":
-                    waiter = self._waiters.get("error")
+                waiter = self._waiters.get(msg.get("request_id", ""))
                 delivered = False
                 if waiter is not None and not waiter.done():
                     waiter.set_result(msg)
