@@ -123,3 +123,127 @@ def test_login_and_modern_chat_window() -> None:
     window.hide()
     login.close()
 
+
+def test_composer_enter_shift_and_ime() -> None:
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QInputMethodEvent, QKeyEvent
+
+    from src.gui.widgets import ComposerEdit
+
+    qt = app()
+    edit = ComposerEdit()
+    edit.resize(320, 40)
+    sent: list[int] = []
+    edit.sendRequested.connect(lambda: sent.append(1))
+    edit.setPlainText("你好")
+    edit.keyPressEvent(
+        QKeyEvent(
+            QEvent.Type.KeyPress,
+            Qt.Key.Key_Return,
+            Qt.KeyboardModifier.ShiftModifier,
+        )
+    )
+    assert sent == []
+    assert "\n" in edit.toPlainText()
+
+    edit.keyPressEvent(
+        QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return, Qt.KeyboardModifier.NoModifier)
+    )
+    assert sent == [1]
+
+    composing = ComposerEdit()
+    held: list[int] = []
+    composing.sendRequested.connect(lambda: held.append(1))
+    composing.inputMethodEvent(QInputMethodEvent("nihao", []))
+    assert composing.preedit_text() == "nihao"
+    composing.keyPressEvent(
+        QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return, Qt.KeyboardModifier.NoModifier)
+    )
+    assert held == []
+
+    commit = QInputMethodEvent()
+    commit.setCommitString("你")
+    composing.inputMethodEvent(commit)
+    composing.keyPressEvent(
+        QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return, Qt.KeyboardModifier.NoModifier)
+    )
+    assert held == []
+    composing._swallow_until = 0
+    composing.setPlainText("你")
+    composing.keyPressEvent(
+        QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return, Qt.KeyboardModifier.NoModifier)
+    )
+    assert held == [1]
+    cursor = composing.inputMethodQuery(Qt.InputMethodQuery.ImCursorRectangle)
+    assert cursor.isValid()
+    edit.hide()
+    composing.hide()
+    qt.processEvents()
+
+
+def test_composer_grows_then_caps_at_six_lines() -> None:
+    from src.gui.widgets import ComposerEdit
+
+    qt = app()
+    edit = ComposerEdit()
+    edit.resize(360, 40)
+    edit.show()
+    qt.processEvents()
+    edit.setPlainText("甲")
+    qt.processEvents()
+    one = edit.height()
+    edit.setPlainText("\n".join("甲" for _ in range(3)))
+    qt.processEvents()
+    three = edit.height()
+    edit.setPlainText("\n".join("甲" for _ in range(6)))
+    qt.processEvents()
+    six = edit.height()
+    edit.setPlainText("\n".join("甲" for _ in range(12)))
+    qt.processEvents()
+    twelve = edit.height()
+    assert three > one
+    assert six >= three
+    assert abs(twelve - six) <= 2
+    edit.hide()
+
+
+def test_message_groups_only_show_avatar_on_the_first() -> None:
+    qt = app()
+    worker = FakeWorker()
+    window = MainWindow(worker, snapshot())
+    window.open_conversation("dm:bob")
+    now = time.time()
+    window.show_history(
+        "dm:bob",
+        [
+            {"sender": "bob", "body": "一", "ts": now},
+            {"sender": "bob", "body": "二", "ts": now + 5},
+            {"sender": "alice", "body": "三", "ts": now + 10},
+            {"sender": "alice", "body": "四", "ts": now + 20},
+        ],
+    )
+    flags = [item for item in window.message_group_flags() if item[3] == "message"]
+    assert flags[0][0] is True
+    assert flags[1][0] is False
+    assert flags[1][2] is True
+    assert flags[2][0] is False  # 自己的消息在单聊里不占头像
+    assert flags[3][0] is False
+    assert flags[2][1] is False and flags[3][1] is False
+    window.show_history(
+        "group:三人组",
+        [],
+    )
+    window.current_conv = "group:三人组"
+    window.show_history(
+        "group:三人组",
+        [
+            {"sender": "bob", "body": "群一", "ts": now},
+            {"sender": "bob", "body": "群二", "ts": now + 3},
+        ],
+    )
+    group_flags = [item for item in window.message_group_flags() if item[3] == "message"]
+    assert group_flags[0][0] is True and group_flags[0][1] is True
+    assert group_flags[1][0] is False and group_flags[1][1] is False
+    window.hide()
+    qt.processEvents()
+
