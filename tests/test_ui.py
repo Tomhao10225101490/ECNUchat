@@ -118,6 +118,8 @@ def test_render_shows_project_bubbles_and_security() -> None:
     assert "棘轮代数" in text
     assert "指纹" in text
     assert "bob" in text
+    assert "> " in text
+    assert "▌" in text
 
 
 def test_narrow_layout_hides_sidebar_but_keeps_chat() -> None:

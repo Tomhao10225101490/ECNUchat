@@ -148,6 +148,9 @@ class EngineWorker(QThread):
             "theme": engine.store.load_ui_value("theme", "telegram"),
             "reduce_motion": engine.store.load_ui_value("reduce_motion", "0") == "1",
             "current_conv": engine.store.load_ui_value("current_conv"),
+            "pins": engine.store.load_ui_value("pins", ""),
+            "mutes": engine.store.load_ui_value("mutes", ""),
+            "hidden": engine.store.load_ui_value("hidden", ""),
             "pending": [
                 {
                     "local_id": row[0],
@@ -213,7 +216,7 @@ class EngineWorker(QThread):
             conv = str(payload["conv"])
             rows = [
                 {"sender": s, "body": b, "ts": ts}
-                for s, b, ts in engine.store.get_history(conv, limit=500)
+                for s, b, ts in engine.store.get_history(conv, limit=1000)
             ]
             self.historyReady.emit(conv, rows)
         elif action == "search":
@@ -261,9 +264,8 @@ class EngineWorker(QThread):
             unread = dict(payload.get("unread", {}))
             engine.store.save_unread(unread)
         elif action == "set_ui":
-            for key in ("theme", "reduce_motion", "current_conv"):
-                if key in payload:
-                    engine.store.save_ui_value(key, str(payload[key]))
+            for key, value in payload.items():
+                engine.store.save_ui_value(str(key), str(value))
         elif action == "refresh":
             self.snapshot.emit(self._snapshot())
         else:

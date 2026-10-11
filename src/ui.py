@@ -46,23 +46,29 @@ THEMES = {
         "out": "on #2b5278",
         "badge": "bold white on #3390ec",
         "name": "#6ab3f3",
+        "box": "#6ab3f3",
     },
     "wechat": {
         "selected": "on #244238",
         "out": "on #95ec69",
         "badge": "bold #10210f on #07c160",
         "name": "#07c160",
+        "box": "#3ddc84",
     },
 }
 
 
 def apply_theme(name: str) -> None:
-    global SELECTED, OUT, BADGE, NAME
+    global SELECTED, OUT, BADGE, NAME, BOX
     palette = THEMES.get(name, THEMES["telegram"])
     SELECTED = palette["selected"]
     OUT = palette["out"]
     BADGE = palette["badge"]
     NAME = palette["name"]
+    BOX = palette["box"]
+
+
+BOX = "#6ab3f3"
 
 HELP_TEXT = """命令
   /chat 名字              打开单聊
@@ -619,28 +625,70 @@ class ChatPane:
 
 
 class Composer:
+    """底部始终有一行带边框的输入框，提示符是 '> '，后面跟着光标。"""
+
     def __init__(self, ui: UIState) -> None:
         self.ui = ui
 
     def __rich_console__(self, console: Console, options):
-        width = options.max_width
-        shown, caret_at = _composer_window(self.ui.composer, self.ui.cursor, max(4, width - 6))
-        yield _line([("", BG)], width, BG)
-        if shown:
-            left, right = shown[:caret_at], shown[caret_at:]
-            segs: list[tuple[str, str]] = [
-                ("  ", BG),
-                (" ", COMPOSER),
-                (left, f"white {COMPOSER}"),
-                ("▏", f"bold {NAME} {COMPOSER}"),
-                (right, f"white {COMPOSER}"),
-                (" ", COMPOSER),
-            ]
-        else:
-            segs = [("  ", BG), (" 写一条消息… ", f"{MUTED} {COMPOSER}"), ("▏", f"bold {NAME} {COMPOSER}")]
-        yield _line(segs, width, BG)
-        hint = self.ui.toast or " Enter 发送   /fingerprint 核对身份   验签失败 / 重放拒绝 / GCM 失败 会标红"
-        yield _line([(" " + clip(hint, width - 1), f"{MUTED} {BG}")], width, BG)
+        yield from render_composer(self.ui, options.max_width)
+
+
+def render_composer(ui: UIState, width: int):
+    if width < 4:
+        yield Text("> " + ui.composer + "▌")
+        return
+    border = BOX
+    inner = width - 2
+    title = ui.toast or ""
+    yield _box_edge("┌", "┐", inner, title, border)
+    yield _composer_middle(ui, width, border)
+    yield _box_edge("└", "┘", inner, "", border)
+
+
+def _box_edge(left: str, right: str, inner: int, title: str, border: str) -> Text:
+    text = Text()
+    text.append(left, style=border)
+    if title and inner > cell_len(title) + 2:
+        label = " " + title + " "
+        text.append(label, style=f"{MUTED}")
+        fill = inner - cell_len(label)
+        text.append("─" * max(0, fill), style=border)
+    else:
+        text.append("─" * max(0, inner), style=border)
+    text.append(right, style=border)
+    return text
+
+
+def _composer_middle(ui: UIState, width: int, border: str) -> Text:
+    inner = max(0, width - 2)
+    prompt = "> "
+    cursor = "▌"
+    room = max(0, inner - cell_len(prompt) - cell_len(cursor) - 2)
+    shown, caret_at = _composer_window(ui.composer, ui.cursor, room)
+    left, right = shown[:caret_at], shown[caret_at:]
+    text = Text()
+    text.append("│", style=border)
+    text.append(" ", style=COMPOSER)
+    text.append(prompt, style=f"bold {NAME} {COMPOSER}")
+    text.append(left, style=f"white {COMPOSER}")
+    text.append(cursor, style=f"bold {NAME} {COMPOSER}")
+    text.append(right, style=f"white {COMPOSER}")
+    if not ui.composer:
+        placeholder = " 输入消息…"
+        used_now = cell_len(text.plain)
+        if used_now + cell_len(placeholder) < width:
+            text.append(placeholder, style=f"{MUTED} {COMPOSER}")
+    used = cell_len(text.plain)
+    pad = width - 1 - used
+    if pad > 0:
+        text.append(" " * pad, style=COMPOSER)
+    elif pad < 0:
+        # 超宽时丢掉末尾，保证右边框仍在这一行里。
+        plain = text.plain[: width - 1]
+        text = Text(plain, style=f"white {COMPOSER}")
+    text.append("│", style=border)
+    return text
 
 
 def _peer_subtitle(online: str, fp: str, gen: int, width: int) -> str:
