@@ -163,10 +163,11 @@ class ConversationDelegate(QStyledItemDelegate):
         preview_w = max(20, rect.width() - left - right_pad - badge_w - icons - 12)
         painter.setFont(self.font_preview)
         painter.setPen(QColor(muted))
+        preview = " ".join((item.preview or "").split()) or " "
         painter.drawText(
             QRectF(left, rect.y() + 36, preview_w, 20),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            elide(item.preview or " ", self.font_preview, int(preview_w)),
+            elide(preview, self.font_preview, int(preview_w)),
         )
         dpr = self.view.devicePixelRatioF()
         icon_x = left + preview_w + 4
