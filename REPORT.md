@@ -80,3 +80,25 @@ KDF 标签、字段和题目一致：`x3dh-v1`、`dr-v1`、HMAC 的 `0x01` / `0x
 安全审计后又加了四层防线。第一，接收方先在棘轮状态副本上跳号、换 DH 链并尝试 GCM，认证成功才原子提交；篡改包失败后，同一序号的合法原报文仍能解开。第二，OPK 私钥同样延迟到首条密文认证成功后删除。第三，第一次获取的 `IK_sign` 与 `IK_dh` 固定在本地，后续 bundle 若变化会提示身份密钥变化并拒绝覆盖，避免核对过的指纹失效。第四，推进后的发送状态和完整待发信封一起用本地保险库密钥加密、在 SQLite 事务中落盘；崩溃后重发原信封，不会丢掉 X3DH 初始字段。题目规定的 AAD 保持不变；群名和消息类别另复制进 AES-GCM 密文，解密后必须与外层一致，服务器篡改显示语义也会被拒绝。
 
 桌面客户端使用 PySide6，采用 Telegram 的会话信息架构和可切换的微信绿色发送气泡：左侧显示头像、消息预览、时间、持久化未读数与在线绿点，右侧自己的消息靠右、对方靠左。界面支持中文本地历史搜索、乐观发送状态、断线重连、未确认加密 outbox 恢复、主题淡入和“减少动态效果”。「已发送」只表示服务器接受信封，不伪称已读。顶栏仍是项目全名，打开会话后能看到对端指纹前八组和棘轮代数；验签失败、重放拒绝和 GCM 失败均以红色安全气泡呈现，便于答辩时指着屏幕讲「现在双方已经换过公钥」。Qt 主线程不处理任何密钥，专用工作线程独占 asyncio、WebSocket、SQLite 和 `ChatEngine`，所以 PBKDF2 与网络操作不会卡住动画。原 rich 终端界面继续保留，用于脚本化演示；两套界面复用同一个密码协议实现。
+
+## 9. 文献与代码的对应
+
+可以再分发的全文、书目和逐段说明在 `docs/papers/`。这里只保留答辩要能指到函数的那一层。
+
+曲线、签名、派生和 AEAD 分别是：
+
+- Bernstein，PKC 2006，*Curve25519: new Diffie-Hellman speed records*。X25519 就是这篇里的函数，RFC 7748 规定字节格式。作者 PDF 只允许引用，仓库里留链接，不收录文件。调用点是 `x25519_dh`。
+- Bernstein、Duif、Lange、Schwabe、Yang，ePrint 2011/368，*High-speed high-security signatures*。Ed25519。本仓库用它做 `IK_sign`，不实现 XEdDSA，所以签名钥匙和 DH 钥匙从生成起就是两把。
+- Krawczyk，ePrint 2010/264，HKDF 的 extract-then-expand。`hkdf_sk` 用 32 个零字节做盐、`info = x3dh-v1`；`kdf_rk` 用上一把根钥匙做盐、`info = dr-v1`。对称棘轮 `kdf_ck` 不是 HKDF，而是双棘轮规范里的 HMAC，常数 `0x01` 和 `0x02`。
+- McGrew、Viega，ePrint 2004/193，GCM。12 字节 nonce，16 字节标签，附加数据进 GHASH。Bellare、Tackmann，CRYPTO 2016，讨论的是一把长期 GCM 钥匙加密许多条记录时的多用户安全。本仓库每条消息一把 32 字节 `MK`，用完即弃，不把那条 TLS 定理当成聊天本身的定理。
+
+协议证明是：
+
+- Cohn-Gordon、Cremers、Garratt，IEEE CSF 2016，ePrint 2016/221。破密恢复的定义：秘密已经泄露之后，只要继续混入泄露时没有交出的新临时 DH，回复并完成下一轮 DH 棘轮之后的新消息可以重新变安全。回复之前只有对称链上的前向安全。
+- Cohn-Gordon、Cremers、Dowling、Garratt、Stebila，IEEE EuroS&P 2017，期刊版 *Journal of Cryptology* 2020。把 X3DH 加双棘轮做成一棵阶段树，在随机预言机模型下证明消息钥匙不可区分，并给出 PRF-ODH 变体下走向标准模型的路线。他们没有在这个核心里发现重大设计缺陷。
+- Alwen、Coretti、Dodis，EUROCRYPT 2019。把棘轮拆成连续密钥协商、前向安全 AEAD 和 PRF-PRNG，并正式写入立即解密。本仓库的跳过缓存就是立即解密，上限 40 把。
+- Bienstock、Fairoze、Garg、Mukherjee、Raghuraman，CRYPTO 2022。双棘轮实现他们的 `F_DR`。同一篇文章指出，棘轮私钥必须留到对方下一把公钥到来，这段窗口里的两次状态泄露可以拼出本轮消息钥匙。他们的 Triple Ratchet 在本地多做一次单向更新。本仓库没有做这一步。
+- Rösler、Mainka、Schwenk，IEEE EuroS&P 2018。当时 Signal / WhatsApp 的发送者钥匙群不继承两人棘轮的破密恢复。本仓库对每个成员各发一封双棘轮信封，所以每一封仍有那一对的前向安全和回复后的恢复。成员表本身仍在服务器上。
+- Fiedler、Günther，PKC 2025。PQXDH 在 X3DH 的 DH 组合上再加后量子密钥封装，用来挡住先记录、以后打破 X25519 的攻击。Bhargavan、Jacomme、Kiefer、Schmidt，USENIX Security 2024，用 ProVerif 和 CryptoVerif 核过这份规范。本仓库没有密钥封装。
+
+这些定理没有在本仓库上重新证明。屏幕指纹只覆盖 `IK_sign`，第一次取回的 `IK_dh` 不在 `SPK` 签名里；钉住之后这一对公钥再变会被拒绝。双棘轮规范建议的报文加密是 AES-256-CBC 加 HMAC；本仓库按题目把 `MK` 直接用作 AES-256-GCM 钥匙。头 `dh_pub`、`n`、`pn` 是明文。
