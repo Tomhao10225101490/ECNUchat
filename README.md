@@ -28,6 +28,7 @@ X25519 就是椭圆曲线 Diffie-Hellman；每条消息用 AES-256-GCM 加密并
 - [建议的读码顺序](#建议的读码顺序)
 - [测试时应该看到什么](#测试时应该看到什么)
 - [和 Signal、WhatsApp 的差别](#和-signalwhatsapp-的差别)
+- [论文对应哪段代码](#论文对应哪段代码)
 
 ## 先用大白话讲清楚
 
@@ -380,3 +381,11 @@ python3 -m pytest -q
 - **身份钥匙不是 XEdDSA。** Ed25519 只签名，X25519 只做 Diffie-Hellman。
 
 KDF 标签和题目一致：`x3dh-v1`、`dr-v1`、HMAC 的 `0x01` / `0x02`，附加数据是用户名和 4 字节大端序号。没有协议偏离需要单独解释。
+
+## 论文对应哪段代码
+
+X25519、Ed25519、HKDF、AES-256-GCM、X3DH 和双棘轮各自有直接对应的论文。2016 年的破密恢复定义、2017 到 2020 年的 Signal 多阶段证明、2019 年的棘轮拆分、2022 年的通用可组合分析，以及 2025 年的 PQXDH，都写在 [docs/papers/README.md](docs/papers/README.md)。可以再分发的全文放在 `docs/papers/`，书目是 `docs/papers/references.bib`。
+
+Curve25519 的设计论文只链接到作者页面。那份文本写明可以引用，没有授予再分发。这些 PDF 使用各自的知识共享许可，不在本仓库的 MIT 许可之下。2022 年 Bienstock 等人的那篇是署名-非商业性使用。
+
+说明里把每篇结论指回函数：`x25519_dh`、`hkdf_sk`、`kdf_ck`、`kdf_rk`、`encrypt`。也写明哪些话不能说成「论文已经证明了本仓库」：屏幕指纹不覆盖 `IK_dh`，群是每人一封而不是 Sender Keys，没有 Triple Ratchet，也没有 PQXDH。
