@@ -1,4 +1,35 @@
-"""没有头加密的双棘轮：对称棘轮 + DH 棘轮 + 乱序 MK 缓存。
+"""双棘轮：对称棘轮、DH 棘轮、乱序缓存，消息钥匙用后即弃。
+
+对照 Bienstock、Fairoze、Garg、Mukherjee、Raghuraman，CRYPTO 2022
+（ePrint 2022/355）。会议正式题名是 *A More Complete Analysis of the
+Signal Double Ratchet Algorithm*。对外介绍把这篇称作对双棘轮的通用可组合
+分析：他们定义 UC 功能 F_DR，并证明 Signal 双棘轮实现它。本文件按那条
+双棘轮的积木实现。没有实现文中更强的 Triple Ratchet / F_TR，也没有在
+本仓库上重跑 UC 证明。
+
+概念对应：
+
+- 对称棘轮（文中的 inner symmetric-key ratchet）：`kdf_ck`。
+  同一把棘轮公钥下，HMAC 推出一次性 MK，并换成下一把链钥匙。
+  这一步给出前向安全，本身不给出破密恢复。
+- DH 棘轮（文中的 public ratchet）：`kdf_rk`、`init_sender`、
+  `_prepare_sending_chain`、`_dh_ratchet`。新的 X25519 输出混进根钥匙，
+  开出新链。破密恢复发生在双方都换过棘轮公钥之后。
+- 乱序与丢包（文中的 immediate decryption）：`_skip_message_keys`。
+  空隙里的 MK 按 `dh_pub || n` 缓存，后到的包仍能解。永久丢失的一条
+  不挡住后面的消息。上限 `MAX_SKIP` 是本实现的拒绝线；论文里的立即解密
+  没有这道常数上限。
+- 消息钥匙用后即弃：`encrypt` / `decrypt` 不把已经用于 GCM 的 MK 留在
+  `RatchetState` 里。调用方拿到返回值后丢掉。跳过缓存里的 MK 要留到
+  对应密文到来，解开时弹出。这避开他们列出的 T1：把已经不需要的上一
+  发送世代对称秘密继续留在状态里，妥协之后的注入在 F_DR 下成立。
+
+安全边界：发送棘轮私钥 `dhs_priv` 必须留到收到对方下一把棘轮公钥。
+这个窗口里对同一方连续取走两次状态，可以拼出本轮已经发出的消息钥匙。
+这是他们指出的双棘轮缺口。Triple Ratchet 会在算出本轮 DH 之后对私钥
+材料再做一次本地单向更新。本文件保存的是完整 X25519 私钥，没有那一层。
+证明假设（可编程理想密码、公钥棘轮 KDF 的随机预言机、强 Diffie-Hellman）
+也没有在这段 Python 上重新建立。X3DH 如何得到初始 SK 不在他们的定理里。
 
 SK 只用于初始化。每条聊天明文用独立的 MK 做 AES-256-GCM。
 本模块只做字节进、字节出，不 import 网络或数据库。
@@ -17,7 +48,13 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from src.x3dh import x25519_dh
 
+# 公钥棘轮 KDF 的 info。与 X3DH 的 x3dh-v1 分开，两次派生不会撞车。
 DR_INFO = b"dr-v1"
+# 对称棘轮的两个 HMAC 输入，对应 Signal 的 KDF_CK，也就是 CRYPTO 2022
+# 文中的 inner symmetric-key ratchet：0x01 推出一次性消息钥匙，0x02 推出下一把链钥匙。
+SYMMETRIC_RATCHET_MK_LABEL = b"\x01"
+SYMMETRIC_RATCHET_CK_LABEL = b"\x02"
+# 立即解密的实现上限。论文对多项式大小的空隙都成立；超过这个空隙就拒绝。
 MAX_SKIP = 40
 MAX_SEEN = 160
 NONCE_LEN = 12
@@ -47,14 +84,22 @@ class GCMError(RatchetError):
 
 
 def kdf_ck(ck: bytes) -> tuple[bytes, bytes]:
-    """对称棘轮：MK = HMAC(ck, 0x01)，新 CK = HMAC(ck, 0x02)。"""
-    mk = _hmac_sha256(ck, b"\x01")
-    new_ck = _hmac_sha256(ck, b"\x02")
+    """对称棘轮：MK = HMAC(ck, 0x01)，新 CK = HMAC(ck, 0x02)。
+
+    Bienstock 等把这一步称作 inner symmetric-key ratchet。链是确定的，
+    所以它提供前向安全，不提供破密恢复。旧的 CK 不保留。
+    """
+    mk = _hmac_sha256(ck, SYMMETRIC_RATCHET_MK_LABEL)
+    new_ck = _hmac_sha256(ck, SYMMETRIC_RATCHET_CK_LABEL)
     return new_ck, mk
 
 
 def kdf_rk(rk: bytes, dh_out: bytes) -> tuple[bytes, bytes]:
-    """DH 棘轮：HKDF(ikm=dh_out, salt=rk, info=dr-v1, 64) → RK||CK。"""
+    """DH 棘轮：HKDF(ikm=dh_out, salt=rk, info=dr-v1, 64) → RK||CK。
+
+    对应 CRYPTO 2022 的 public ratchet：新世代的根钥匙和链钥匙一起从
+    上一把根钥匙与这一次的 DH 输出派生。
+    """
     out = HKDF(
         algorithm=hashes.SHA256(),
         length=64,
@@ -108,6 +153,9 @@ class RatchetState:
     rk: bytes
     local_user: str
     remote_user: str
+    # 当前发送世代的 X25519 私钥。必须留到对方下一把棘轮公钥到来，
+    # 否则算不出下一次 DH。Bienstock 等指出：这个窗口里的两次状态泄露
+    # 可以恢复本轮 MK。Triple Ratchet 会在算出 DH 后对它做本地单向更新。
     dhs_priv: bytes | None = None
     dhs_pub: bytes | None = None
     dhr_pub: bytes | None = None
@@ -116,6 +164,7 @@ class RatchetState:
     ns: int = 0
     nr: int = 0
     pns: int = 0
+    # 立即解密缓存：还没送达的 MK，键是 dh_pub || n。解开后弹出，不长期保留。
     skipped: dict[bytes, bytes] = field(default_factory=dict)
     seen: set[bytes] = field(default_factory=set)
     retired_dh: set[bytes] = field(default_factory=set)
@@ -198,7 +247,11 @@ def init_receiver(
 
 
 def _prepare_sending_chain(state: RatchetState) -> None:
-    """B 第一次回复前：生成 R_B，把当前接收链长度记入 PNs，换发送链。"""
+    """第一次回复前的公钥棘轮：生成新的棘轮私钥，把接收链长度记入 PNs，换发送链。
+
+    新的 `dhs_priv` 从这里开始留在状态里，直到对方的下一把棘轮公钥触发
+    `_dh_ratchet`。这就是 CRYPTO 2022 写出的那个双棘轮窗口。
+    """
     if state.cks is not None and state.dhs_priv is not None:
         return
     if state.dhr_pub is None:
@@ -212,7 +265,11 @@ def _prepare_sending_chain(state: RatchetState) -> None:
 
 
 def _dh_ratchet(state: RatchetState, remote_dh_pub: bytes) -> None:
-    """收到新的 dh_pub：先跳过旧接收链，再做接收链 + 新发送链两次 KDF_RK。"""
+    """收到新的 dh_pub：用仍留着的发送私钥做接收链，再换一把新的发送私钥。
+
+    两次 `kdf_rk` 是公钥棘轮进入下一世代。调用前应先按 PN 把旧接收链上
+    没到的 MK 放进跳过缓存，丢失的旧消息才仍能补解。
+    """
     if state.dhs_priv is None:
         raise RatchetError("协议错误", "本地还没有发送棘轮密钥，无法完成 DH 棘轮")
     if state.dhr_pub is not None:
@@ -230,7 +287,11 @@ def _dh_ratchet(state: RatchetState, remote_dh_pub: bytes) -> None:
 
 
 def encrypt(state: RatchetState, plaintext: bytes) -> tuple[RatchetMessage, bytes]:
-    """用当前发送链做一次对称棘轮。返回报文和本次 MK（调用方用完即弃，禁止写日志）。"""
+    """用当前发送链做一次对称棘轮。
+
+    返回报文和本次 MK。MK 不写入 `RatchetState`；调用方用完即弃，禁止写日志。
+    状态里换成下一把链钥匙，推不回这把 MK。
+    """
     _prepare_sending_chain(state)
     assert state.cks is not None and state.dhs_pub is not None
     new_ck, mk = kdf_ck(state.cks)
@@ -246,6 +307,11 @@ def encrypt(state: RatchetState, plaintext: bytes) -> tuple[RatchetMessage, byte
 
 
 def _skip_message_keys(state: RatchetState, until: int, dh_pub: bytes) -> None:
+    """为乱序或丢包预派生 MK，放进跳过缓存。这是立即解密，不是推迟删除。
+
+    超过 `MAX_SKIP` 把未消费的缓存项就拒绝，避免一个巨大序号迫使客户端
+    无界派生。论文里的立即解密没有这个常数上限。
+    """
     if state.ckr is None:
         return
     if until < state.nr:
