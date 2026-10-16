@@ -22,6 +22,8 @@ PROJECT_ABSTRACT = (
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 MAX_WS_MESSAGE = 64 * 1024
+# 群正文按收件人各发一封双棘轮信封，信封数随人数线性增长，所以封顶。
+# 不是 Sender Keys 的一条群链。见 ChatEngine.send_text。
 MAX_GROUP_MEMBERS = 8
 PROTOCOL_TYPES = (
     "register",
@@ -134,6 +136,11 @@ def encode_ratchet_payload(
     group: str | None = None,
     kind: str = "chat",
 ) -> dict[str, Any]:
+    """一封两人棘轮信封。`group` 只标记它属于哪个群，不表示全群共用钥匙。
+
+    群扇出是对每个收件人各调用一次。EuroS&P 2018 分析的 Sender Keys
+    会在这里变成一把群链钥匙；本函数没有那种钥匙。
+    """
     payload: dict[str, Any] = {
         "dh_pub": b64e(message.header.dh_pub),
         "n": message.header.n,

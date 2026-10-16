@@ -2,6 +2,8 @@
 
 本目录的 PDF 是论文作者提交到 IACR Cryptology ePrint Archive 的版本。它们的许可以 ePrint 条目页面为准，和仓库根目录的 MIT 许可不是同一份。MIT 许可不授予这些 PDF 的版权，也不能把它们再许可成 MIT。
 
+对外介绍的三篇主引用就是下面三份全文，不是只放链接：`2022-355-bienstock-etal-double-ratchet.pdf`（CRYPTO 2022 的双棘轮通用可组合分析）、`2024-702-fiedler-guenther-pqxdh.pdf`（PKC 2025 的 PQXDH）、`2017-713-rosler-etal-group-chats.pdf`（EuroS&P 2018 的群聊安全）。介绍里的简称和 PDF 首页的正式题名如何对应，写在 [README.md](README.md)。
+
 保留下面的署名、来源和许可。2022/355 是 署名-非商业性使用，不得作商业性使用。
 
 | 文件 | 作品 | ePrint | 页面所标许可 |

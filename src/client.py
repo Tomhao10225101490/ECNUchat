@@ -1,4 +1,10 @@
-"""Rich 终端客户端：注册/登录、单聊、最多 8 人的逐人棘轮群聊。"""
+"""Rich 终端客户端：注册/登录、单聊、最多 8 人的逐人棘轮群聊。
+
+群正文不是 Sender Keys。`ChatEngine.send_text` 对每个其他成员各发一封
+独立双棘轮信封。这是对 Rösler、Mainka、Schwenk，EuroS&P 2018
+（*More is Less*，ePrint 2017/713）的回应：他们指出 Signal / WhatsApp
+的群对称链继承不到两人双棘轮的 future secrecy。
+"""
 
 from __future__ import annotations
 
@@ -364,6 +370,23 @@ class ChatEngine:
         return await self.start_session(peer)
 
     async def send_text(self, text: str, *, peer: str | None = None, group: str | None = None) -> None:
+        """发送一条聊天正文。群消息按成员扇出，每人一封双棘轮信封。
+
+        对每个其他成员调用一次 `_send_one`，走已经建立的那一对双棘轮。
+        没有全群共用的发送者钥匙，也没有一条群对称链。桌面端和终端端
+        都走这里。
+
+        Rösler、Mainka、Schwenk 在 EuroS&P 2018 分析的 Signal / WhatsApp
+        群，先用两人会话分发一把 Sender Key，群正文再走这把钥匙自己的
+        对称链。两人双棘轮上的 future secrecy 不会自动继承到那条群链。
+        逐人信封把每一封留在那一对的 `kdf_ck` 和回复触发的 DH 棘轮上。
+        正式题名是 *More is Less: On the End-to-End Security of Group
+        Chats in Signal, WhatsApp, and Threema*。
+
+        成员名单仍是服务器记录（`group_create` / `group_add`）。论文里的
+        群完整性与「谁有权管理群」没有被这个扇出补上。`group_meta` 只是
+        把通知正文放进同一套逐人信封。
+        """
         if group:
             members = self.groups.get(group) or []
             others = [m for m in members if m != self.username]
@@ -416,6 +439,8 @@ class ChatEngine:
                 separators=(",", ":"),
             ).encode("utf-8")
             msg, _mk = encrypt(state, inner)
+            # 消息钥匙用后即弃：MK 不进棘轮状态，也不进日志。
+            # 这是 CRYPTO 2022 对称棘轮的一次性消息钥匙，不是把 MK 留到下一世代。
             del _mk
             payload = encode_ratchet_payload(msg, x3dh=x3dh, group=group, kind=kind)
             # 先把推进后的加密状态和完全相同的信封原子落盘。崩溃后重发
@@ -515,6 +540,7 @@ class ChatEngine:
         else:
             state = self.sessions[sender]
         plaintext, mk = decrypt(state, ratchet_msg)
+        # 解开后的 MK 立即丢掉。跳过缓存里的那一把已在 decrypt 内弹出。
         del mk
         try:
             inner = json.loads(plaintext.decode("utf-8"))

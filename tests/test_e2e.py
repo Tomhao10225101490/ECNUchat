@@ -97,6 +97,7 @@ async def _e2e(tmp_path: Path) -> None:
         await bob._on_envelope({"from": "alice", "to": "bob", "payload": flipped})
         assert (await wait_pred(bob, lambda i: i.error in {"重放拒绝", "GCM 失败"})).error
 
+        # 群正文按成员各发一封双棘轮信封。Bob 与 Carol 各解自己的那一封。
         await alice.create_group("三人组", ["bob", "carol"])
         await alice.send_text("群里大家好", group="三人组")
         assert await wait_pred(bob, lambda i: i.text == "群里大家好")

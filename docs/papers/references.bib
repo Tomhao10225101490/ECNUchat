@@ -1,3 +1,45 @@
+% 对外介绍的三篇主引用放在最前。title 用会议正式题名。
+% 介绍里的简称写在 note，不替换 title。
+
+@inproceedings{bienstock2022doubleratchet,
+  author = {Alexander Bienstock and Jaiden Fairoze and Sanjam Garg and Pratyay Mukherjee and Srinivasan Raghuraman},
+  title = {A More Complete Analysis of the {Signal} Double Ratchet Algorithm},
+  booktitle = {Advances in Cryptology -- CRYPTO 2022},
+  series = {Lecture Notes in Computer Science},
+  volume = {13507},
+  pages = {782--811},
+  year = {2022},
+  publisher = {Springer},
+  doi = {10.1007/978-3-031-15802-5_27},
+  url = {https://eprint.iacr.org/2022/355},
+  note = {ePrint 2022/355. The external description of this repository calls the paper a universally composable analysis of the Double Ratchet, after its ideal functionality F\_DR. The proceedings title is the title field. This repository implements the Double Ratchet, not the Triple Ratchet.}
+}
+
+@inproceedings{fiedler2025pqxdh,
+  author = {Rune Fiedler and Felix G{\"u}nther},
+  title = {Security Analysis of {Signal}'s {PQXDH} Handshake},
+  booktitle = {Public-Key Cryptography -- PKC 2025},
+  series = {Lecture Notes in Computer Science},
+  volume = {15675},
+  pages = {137--169},
+  year = {2025},
+  publisher = {Springer},
+  doi = {10.1007/978-3-031-91823-0_5},
+  url = {https://eprint.iacr.org/2024/702},
+  note = {ePrint 2024/702, version 2.1, corresponding to PKC 2025, Part II. The external description names the object of the paper PQXDH: A Post-Quantum Extension of X3DH. This repository implements classic X3DH only.}
+}
+
+@inproceedings{rosler2018groups,
+  author = {Paul R{\"o}sler and Christian Mainka and J{\"o}rg Schwenk},
+  title = {More is Less: On the End-to-End Security of Group Chats in {Signal}, {WhatsApp}, and {Threema}},
+  booktitle = {2018 IEEE European Symposium on Security and Privacy (EuroS\&P)},
+  pages = {415--429},
+  year = {2018},
+  doi = {10.1109/EuroSP.2018.00036},
+  url = {https://eprint.iacr.org/2017/713},
+  note = {ePrint 2017/713. The external description shortens the title to More is Less: On the Security of Instant Messaging Groups. Group ciphertext in this repository is one Double Ratchet envelope per member.}
+}
+
 @inproceedings{bernstein2006curve25519,
   author = {Daniel J. Bernstein},
   title = {Curve25519: New {Diffie-Hellman} Speed Records},
@@ -72,15 +114,6 @@
   note = {Conference version: IEEE EuroS{\&}P 2017. DOI 10.1109/EuroSP.2017.27}
 }
 
-@misc{rosler2018groups,
-  author = {Paul R{\"o}sler and Christian Mainka and J{\"o}rg Schwenk},
-  title = {More is Less: On the End-to-End Security of Group Chats in {Signal}, {WhatsApp}, and {Threema}},
-  howpublished = {Cryptology {ePrint} Archive, Paper 2017/713},
-  year = {2018},
-  url = {https://eprint.iacr.org/2017/713},
-  note = {IEEE EuroS{\&}P 2018, pp. 415--429. DOI 10.1109/EuroSP.2018.00045}
-}
-
 @inproceedings{alwen2019doubleratchet,
   author = {Jo{\"e}l Alwen and Sandro Coretti and Yevgeniy Dodis},
   title = {The Double Ratchet: Security Notions, Proofs, and Modularization for the {Signal} Protocol},
@@ -92,27 +125,6 @@
   publisher = {Springer},
   doi = {10.1007/978-3-030-17653-2_5},
   url = {https://eprint.iacr.org/2018/1037}
-}
-
-@misc{bienstock2022doubleratchet,
-  author = {Alexander Bienstock and Jaiden Fairoze and Sanjam Garg and Pratyay Mukherjee and Srinivasan Raghuraman},
-  title = {A More Complete Analysis of the {Signal} Double Ratchet Algorithm},
-  howpublished = {Cryptology {ePrint} Archive, Paper 2022/355},
-  year = {2022},
-  url = {https://eprint.iacr.org/2022/355},
-  note = {CRYPTO 2022}
-}
-
-@inproceedings{fiedler2025pqxdh,
-  author = {Rune Fiedler and Felix G{\"u}nther},
-  title = {Security Analysis of {Signal}'s {PQXDH} Handshake},
-  booktitle = {Public-Key Cryptography -- PKC 2025},
-  series = {Lecture Notes in Computer Science},
-  year = {2025},
-  pages = {137--169},
-  publisher = {Springer},
-  doi = {10.1007/978-3-031-91823-0_5},
-  url = {https://eprint.iacr.org/2024/702}
 }
 
 @misc{bhargavan2024pqxdh,

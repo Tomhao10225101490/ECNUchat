@@ -1,4 +1,13 @@
-"""双棘轮内存单测：往返明文、MK 变化、DH 代数、乱序、重放、GCM、跳过上限。"""
+"""双棘轮内存单测，对照 Bienstock 等 CRYPTO 2022 的双棘轮积木。
+
+这些测试固定现有行为，不把 UC 证明搬进断言。
+
+- `test_same_dh_pub_two_messages_different_mk`：对称棘轮。同一把棘轮公钥下 MK 不同，用后不留在状态里。
+- `test_dh_ratchet_increments_after_reply_and_mk_changes`：DH 棘轮。对方回复后代数加一。
+- `test_out_of_order_still_decrypts` 与 `test_late_old_chain_message_uses_pn_cache_after_dh_ratchet`：乱序、丢包后仍能解，对应立即解密。
+- `test_replay_rejected`：同一 `(dh_pub, n)` 不能再使用已经弹出的 MK。
+- `test_skip_more_than_40_rejected`：论文里的立即解密没有 40 条上限；这里的拒绝是本实现的边界。
+"""
 
 import pytest
 

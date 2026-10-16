@@ -19,6 +19,7 @@ X25519 就是椭圆曲线 Diffie-Hellman；每条消息用 AES-256-GCM 加密并
 - [每个人手上有哪些钥匙](#每个人手上有哪些钥匙)
 - [注册和登录在证明什么](#注册和登录在证明什么)
 - [第一条消息如何算出同一把 SK](#第一条消息如何算出同一把-sk)
+- [这条握手的后量子扩展还没做](#这条握手的后量子扩展还没做)
 - [为什么后面每条消息还要换钥匙](#为什么后面每条消息还要换钥匙)
 - [乱序、重放和篡改](#乱序重放和篡改)
 - [不核对指纹时服务器能做什么](#不核对指纹时服务器能做什么)
@@ -219,6 +220,12 @@ Bob 不用把 Alice 的私钥要过来。他把角色对调：自己的 SPK 私�
 
 客户端第一次见过对方的两把身份公钥之后会固定下来。以后 bundle 里的身份公钥变了，提示身份密钥发生变化，拒绝覆盖已经见过的指纹。
 
+## 这条握手的后量子扩展还没做
+
+Fiedler 和 Günther 在 PKC 2025 分析的 PQXDH，是在上面这四次 Diffie-Hellman 之外再并入一次后量子密钥封装。Signal 部署用 Kyber，论文也处理 ML-KEM。封装那一项用来挡住「现在记下握手，以后量子计算机打破 X25519」。对外介绍把这篇称作 *PQXDH: A Post-Quantum Extension of X3DH*；正式题名是 *Security Analysis of Signal's PQXDH Handshake*。全文在 [docs/papers/2024-702-fiedler-guenther-pqxdh.pdf](docs/papers/2024-702-fiedler-guenther-pqxdh.pdf)。
+
+本仓库停在经典 X3DH。`src/x3dh.py` 的 `initiator_secret`、`responder_secret` 和 `hkdf_sk` 只吃 DH 输出的拼接，预密钥包里没有 KEM 公钥，初始消息里没有封装密文。没有把曲线运算换成 Kyber，也没有把现有的 X25519 说成后量子。若要沿他们分析的路径延伸，需要在目录公布 KEM 公钥，把封装得到的共享秘密按单独的域分离并进 HKDF，并处理他们指出的 KEM 绑定。这一步没有实现。
+
 ## 为什么后面每条消息还要换钥匙
 
 如果 `SK` 直接加密所有聊天，那么 `SK` 一旦泄露，历史和未来全都能解开。双棘轮把 `SK` 只当成启动根钥匙，后面分成两种「往前滚」：
@@ -272,6 +279,8 @@ out = HKDF-SHA256(ikm = dh_out, salt = rk, info = b"dr-v1", length = 64)
 
 **破密恢复**讲的是将来，而且不要说成「一泄露就立刻恢复」。准确的时间点是：对方刚回复，双方都换过棘轮公钥之后。旧的链钥匙推不出新的 DH 输出，也就解不开回复之后的新消息。回复发生之前，发送方还在旧链上，这一段还没有 DH 棘轮意义上的恢复。
 
+Bienstock 等人在 CRYPTO 2022 用通用可组合功能 `F_DR` 分析的就是这套双棘轮。对外介绍把它称作 *A Universally Composable Analysis of the Double Ratchet*；正式题名是 *A More Complete Analysis of the Signal Double Ratchet Algorithm*。`kdf_ck` 是他们的对称棘轮，`kdf_rk` 是 DH 棘轮，`_skip_message_keys` 是乱序和丢包仍能解开的立即解密，`encrypt` / `decrypt` 不把用过的消息钥匙留在状态里。他们同时指出一个本仓库仍然留着的窗口：发送棘轮私钥 `dhs_priv` 要留到对方下一把公钥到来，这段时间里连续两次取走状态，可以拼出本轮已经发出的消息钥匙。补上这个窗口的 Triple Ratchet 没有实现。全文在 [docs/papers/2022-355-bienstock-etal-double-ratchet.pdf](docs/papers/2022-355-bienstock-etal-double-ratchet.pdf)。
+
 ## 乱序、重放和篡改
 
 网络不保证先发先到。收到的序号 `n` 如果比期望序号大，就把中间那些还没到的 `MK` 算出来，放进跳过缓存。缓存键是 `dh_pub || n`，最多 40 把。再多就拒绝，避免别人发一个巨大序号，逼客户端算出成千上万把钥匙。
@@ -300,11 +309,11 @@ python3 scripts/demo_attack.py
 
 ## 三个人的群聊是怎么加密的
 
-群最多 8 个人。一条群消息不是「大家共用一把发送钥匙」，而是 Alice 对 Bob 跑一遍她和 Bob 的双棘轮，再对 Carol 跑一遍她和 Carol 的双棘轮，发出 2 封信封。服务器按收件人分发。Bob 只能解开写着给 Bob 的那封，Carol 只能解开写着给 Carol 的那封。
+群最多 8 个人。一条群消息不是大家共用一把发送者钥匙。`ChatEngine.send_text` 对每个其他成员各跑那一对已经建立的双棘轮，发出多封信封。服务器按收件人分发。Bob 只能解开写着给 Bob 的那封，Carol 只能解开写着给 Carol 的那封。
 
-所以群和单聊用的是同一套棘轮。人数增加，信封数量线性增加，因此限制 8 人。这不是 WhatsApp 的 Sender Keys，也不是 MLS。答辩时要讲清楚：没有「一条发送链、全群共用」的优化。
+Rösler、Mainka 和 Schwenk 在 EuroS&P 2018 指出，Signal 和 WhatsApp 当时的群先用两人会话分发 Sender Key，群正文再走发送者自己的对称链，两人双棘轮上的 future secrecy 到不了这条群链。逐人信封是对这个威胁分析的回应：每一封仍有那一对的前向安全，对方回复并换过棘轮公钥之后也仍有破密恢复。正式题名是 *More is Less: On the End-to-End Security of Group Chats in Signal, WhatsApp, and Threema*；对外介绍收成 *More is Less: On the Security of Instant Messaging Groups*。全文在 [docs/papers/2017-713-rosler-etal-group-chats.pdf](docs/papers/2017-713-rosler-etal-group-chats.pdf)。
 
-`/group add 群名 新成员` 只能由已经在群里的人发起。新成员只进入之后的新消息；旧消息不会补发给他，因为他没有那些已经丢掉的消息钥匙。
+人数增加，信封数量线性增加，因此 `MAX_GROUP_MEMBERS` 是 8。这不是 MLS。成员名单仍然记在服务器上，建群和拉人没有端到端的成员管理保证。`/group add 群名 新成员` 只能由已经在群里的人发起。新成员只进入之后的新消息；旧消息不会补发给他，因为他没有那些已经丢掉的消息钥匙。
 
 ## 关掉再打开，为什么还能接着聊
 
@@ -374,18 +383,27 @@ python3 -m pytest -q
 本仓库按课程步骤自己把协议拼起来，没有使用 libsignal 或别的现成棘轮库。和那两套产品相比，故意没做这些：
 
 - **没有多设备。** 一台客户端一份加密数据库，新手机不能把旧链同步过去。
-- **没有 PQXDH。** 没有 Kyber 之类的后量子握手。
+- **没有 PQXDH。** 握手停在经典 X3DH。没有 Kyber 或 ML-KEM，也没有把 X25519 说成后量子。
 - **没有密封发送者。** 信封上的发送方和接收方是明文，服务器知道谁在和谁通信，只是不知道正文。
 - **没有头加密。** `dh_pub`、`n`、`pn` 可以直接看见。
-- **群不是 Sender Keys。** 收件人增加，独立双棘轮也增加，所以最多 8 人。
+- **群不是 Sender Keys。** `send_text` 按收件人各发一封双棘轮信封，所以最多 8 人。这是对 EuroS&P 2018 群威胁分析的回应，成员表本身仍在服务器上。
+- **没有 Triple Ratchet。** 发送棘轮私钥会留到对方下一把公钥到来。CRYPTO 2022 指出的那个窗口还在。
 - **身份钥匙不是 XEdDSA。** Ed25519 只签名，X25519 只做 Diffie-Hellman。
 
 KDF 标签和题目一致：`x3dh-v1`、`dr-v1`、HMAC 的 `0x01` / `0x02`，附加数据是用户名和 4 字节大端序号。没有协议偏离需要单独解释。
 
 ## 论文对应哪段代码
 
-X25519、Ed25519、HKDF、AES-256-GCM、X3DH 和双棘轮各自有直接对应的论文。2016 年的破密恢复定义、2017 到 2020 年的 Signal 多阶段证明、2019 年的棘轮拆分、2022 年的通用可组合分析，以及 2025 年的 PQXDH，都写在 [docs/papers/README.md](docs/papers/README.md)。可以再分发的全文放在 `docs/papers/`，书目是 `docs/papers/references.bib`。
+对外介绍以三篇为主引用。正式题名更长，两套名字指向同一份 ePrint PDF。书目在 [docs/papers/references.bib](docs/papers/references.bib)，逐段说明在 [docs/papers/README.md](docs/papers/README.md)。
 
-Curve25519 的设计论文只链接到作者页面。那份文本写明可以引用，没有授予再分发。这些 PDF 使用各自的知识共享许可，不在本仓库的 MIT 许可之下。2022 年 Bienstock 等人的那篇是署名-非商业性使用。
+| 对外介绍 | 代码 | 本仓库满足的部分 | 本仓库不满足的部分 |
+| --- | --- | --- | --- |
+| Bienstock 等，*A Universally Composable Analysis of the Double Ratchet*，CRYPTO 2022 | `kdf_ck` 对称棘轮；`kdf_rk`、`_dh_ratchet`、`_prepare_sending_chain` 是 DH 棘轮；`_skip_message_keys` 处理乱序和丢包；`encrypt` / `decrypt` 用过消息钥匙即弃 | 双棘轮这四块积木的形状，与他们证明能实现 `F_DR` 的构造一致 | 没有在本仓库上重跑 UC 证明。`dhs_priv` 仍留在窗口里，没有 Triple Ratchet / `F_TR`。跳过缓存超过 40 把就拒绝 |
+| Fiedler、Günther，*PQXDH: A Post-Quantum Extension of X3DH*，PKC 2025 | `src/x3dh.py` 的 `initiator_secret`、`responder_secret`、`hkdf_sk` | 经典 X3DH：最多四次 X25519，再 HKDF | 没有 Kyber / ML-KEM。目录和信封里没有 KEM 公钥或封装密文。先记录、后打破 X25519，不在已实现的范围内 |
+| Rösler、Mainka、Schwenk，*More is Less: On the Security of Instant Messaging Groups*，EuroS&P 2018 | `ChatEngine.send_text` 对每个其他成员调用 `_send_one` | 每人独立双棘轮信封，群正文不走 Sender Keys，因此每一封仍有那一对的前向安全和回复后的破密恢复 | 成员表仍是服务器记录。群管理的端到端保护、以及让其他成员互相核验发送者的群签名，都没有做 |
 
-说明里把每篇结论指回函数：`x25519_dh`、`hkdf_sk`、`kdf_ck`、`kdf_rk`、`encrypt`。也写明哪些话不能说成「论文已经证明了本仓库」：屏幕指纹不覆盖 `IK_dh`，群是每人一封而不是 Sender Keys，没有 Triple Ratchet，也没有 PQXDH。
+正式题名分别是 *A More Complete Analysis of the Signal Double Ratchet Algorithm*、*Security Analysis of Signal's PQXDH Handshake*、*More is Less: On the End-to-End Security of Group Chats in Signal, WhatsApp, and Threema*。三份全文是 `docs/papers/2022-355-bienstock-etal-double-ratchet.pdf`、`docs/papers/2024-702-fiedler-guenther-pqxdh.pdf`、`docs/papers/2017-713-rosler-etal-group-chats.pdf`。
+
+X25519、Ed25519、HKDF、AES-256-GCM，以及 2016 年的破密恢复定义、2017/2020 年的 Signal 多阶段证明、2019 年的棘轮拆分，仍写在同一篇文献说明里。Curve25519 的设计论文只链接到作者页面。这些 PDF 使用各自的知识共享许可，不在本仓库的 MIT 许可之下。2022 年 Bienstock 等人的那篇是署名-非商业性使用。
+
+上面三篇的定理都没有在本仓库上重新证明。屏幕指纹不覆盖 `IK_dh`。头 `dh_pub`、`n`、`pn` 是明文。

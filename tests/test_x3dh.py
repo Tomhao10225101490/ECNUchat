@@ -1,4 +1,8 @@
-"""X3DH 内存单测：双方 SK 必须完全一致，覆盖有 OPK / 无 OPK。"""
+"""经典 X3DH 的内存单测。双方 SK 必须完全一致，覆盖有 OPK / 无 OPK。
+
+输入材料只有 X25519 输出。PKC 2025 的 PQXDH 还要并入 KEM 共享秘密；
+这些断言不覆盖 Kyber 或 ML-KEM，代码里也没有这条输入。
+"""
 
 from cryptography.exceptions import InvalidSignature
 

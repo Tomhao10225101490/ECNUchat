@@ -1,8 +1,16 @@
 # 文献与实现的对应
 
-这些文献对着仓库里正在调用的算法，不另起一套协议。2016 年之后的几篇是对这条握手和双棘轮的形式化分析，其中 2022 年和 2025 年的两篇是这条线上最新的公开证明。更早的四篇定义本仓库实际使用的曲线、签名、密钥派生和 AEAD。
+对外介绍以下面三篇为主引用。三篇都可以再分发的 ePrint 全文放在本目录，书目在 [references.bib](references.bib)，许可见 [NOTICES.md](NOTICES.md)。根目录的 MIT 许可不覆盖这些 PDF。
 
-全文 PDF 放在本目录，许可见 [NOTICES.md](NOTICES.md)。书目在 [references.bib](references.bib)。根目录的 MIT 许可不覆盖这些 PDF。
+口头介绍用的是「这篇在证明什么」。会议论文的正式题名更长。两套名字指向同一篇 PDF，引用时写正式题名。
+
+| 对外介绍 | 正式题名 | 全文 | 落到本仓库的哪一段 |
+| --- | --- | --- | --- |
+| Bienstock 等，*A Universally Composable Analysis of the Double Ratchet*，CRYPTO 2022 | *A More Complete Analysis of the Signal Double Ratchet Algorithm*。Bienstock、Fairoze、Garg、Mukherjee、Raghuraman。CRYPTO 2022，LNCS 13507，pp. 782–811。DOI `10.1007/978-3-031-15802-5_27`。ePrint 2022/355 | [PDF](2022-355-bienstock-etal-double-ratchet.pdf) | `kdf_ck`、`kdf_rk`、`_skip_message_keys`、`encrypt` / `decrypt`。没有 Triple Ratchet |
+| Fiedler、Günther，*PQXDH: A Post-Quantum Extension of X3DH*，PKC 2025 | *Security Analysis of Signal's PQXDH Handshake*。Fiedler、Günther。PKC 2025，LNCS 15675，pp. 137–169。DOI `10.1007/978-3-031-91823-0_5`。ePrint 2024/702 | [PDF](2024-702-fiedler-guenther-pqxdh.pdf) | `src/x3dh.py` 的经典四次 DH。没有 Kyber / ML-KEM |
+| Rösler、Mainka、Schwenk，*More is Less: On the Security of Instant Messaging Groups*，EuroS&P 2018 | *More is Less: On the End-to-End Security of Group Chats in Signal, WhatsApp, and Threema*。EuroS&P 2018，pp. 415–429。DOI `10.1109/EuroSP.2018.00036`。ePrint 2017/713 | [PDF](2017-713-rosler-etal-group-chats.pdf) | `ChatEngine.send_text` 对每个其他成员各发一封双棘轮信封 |
+
+这三篇覆盖三件事：双棘轮在通用可组合定义下还挡住什么、经典 X3DH 的后量子扩展本仓库停在哪里、群为什么不走 Sender Keys。曲线、签名、HKDF、GCM，以及 2016–2019 年的破密恢复定义和棘轮拆分，仍然对着正在调用的算法，写在下面的对照表里。
 
 Curve25519 的设计论文可以引用，作者没有授予再分发许可，所以这里只留正式链接，不把 PDF 放进仓库。
 
@@ -16,10 +24,10 @@ Curve25519 的设计论文可以引用，作者没有授予再分发许可，所
 | 每条消息一把 `MK` 的 AES-256-GCM | `encrypt` / `decrypt` | McGrew、Viega，ePrint 2004/193；Bellare、Tackmann，ePrint 2016/564 | [GCM](2004-193-mcgrew-viega-gcm.pdf)、[多用户](2016-564-bellare-tackmann-aes-gcm.pdf) |
 | 泄露之后还能不能恢复 | 回复触发的 DH 棘轮 | Cohn-Gordon、Cremers、Garratt，ePrint 2016/221 | [PDF](2016-221-cohn-gordon-etal-post-compromise.pdf) |
 | X3DH 加双棘轮整条密钥调度 | `src/x3dh.py`、`src/double_ratchet.py` | Cohn-Gordon 等，ePrint 2016/1013 | [PDF](2016-1013-cohn-gordon-etal-signal.pdf) |
-| 对称棘轮、DH 棘轮、乱序仍能解开 | `kdf_ck`、`kdf_rk`、跳过缓存 | Alwen、Coretti、Dodis，ePrint 2018/1037 | [PDF](2018-1037-alwen-etal-double-ratchet.pdf) |
-| 双棘轮还挡住哪些妥协，以及它还留着的窗口 | 同上，本仓库没有做文中的 Triple Ratchet | Bienstock 等，ePrint 2022/355 | [PDF](2022-355-bienstock-etal-double-ratchet.pdf) |
-| 群消息拆成每人一封 | `ChatEngine` 里按成员扇出 | Rösler、Mainka、Schwenk，ePrint 2017/713 | [PDF](2017-713-rosler-etal-group-chats.pdf) |
-| 同一条握手的后量子下一版。本仓库没有做 | 无 KEM | Fiedler、Günther，ePrint 2024/702 | [PDF](2024-702-fiedler-guenther-pqxdh.pdf) |
+| 对称棘轮、DH 棘轮、乱序仍能解开 | `kdf_ck`、`kdf_rk`、`_skip_message_keys` | Alwen、Coretti、Dodis，EUROCRYPT 2019 | [PDF](2018-1037-alwen-etal-double-ratchet.pdf) |
+| 主引用。双棘轮的通用可组合分析 `F_DR`，以及它还留着的窗口 | `kdf_ck`、`kdf_rk`、`encrypt` / `decrypt`、`dhs_priv`。没有 Triple Ratchet | Bienstock 等，CRYPTO 2022，ePrint 2022/355 | [PDF](2022-355-bienstock-etal-double-ratchet.pdf) |
+| 主引用。群消息拆成每人一封双棘轮信封，回应 Sender Keys 的 future secrecy 缺口 | `ChatEngine.send_text`、`_send_one` | Rösler、Mainka、Schwenk，EuroS&P 2018，ePrint 2017/713 | [PDF](2017-713-rosler-etal-group-chats.pdf) |
+| 主引用。同一条握手的后量子扩展。本仓库实现的是经典 X3DH | `initiator_secret`、`hkdf_sk`。无 KEM | Fiedler、Günther，PKC 2025，ePrint 2024/702 | [PDF](2024-702-fiedler-guenther-pqxdh.pdf) |
 
 证明所依据的协议文本是两份规范，不是上面的会议论文：
 
@@ -127,25 +135,38 @@ Alwen、Coretti 和 Dodis 在 EUROCRYPT 2019 给安全消息传递一个同时�
 
 乱序靠跳过缓存实现立即解密。收到的序号比期望序号大时，中间那些 `MK` 先算出来，键是 `dh_pub || n`。缓存最多 40 把，再大就拒绝，避免一个巨大序号迫使客户端派生无界多的钥匙。这 40 把是实现上的上限；论文里的立即解密对多项式大小的空隙都成立。已经处理过的 `(dh_pub, n)` 再出现，直接「重放拒绝」。换到新的 DH 链之后，旧链里按 `PN` 缓存过的迟到消息仍用缓存里的那把 `MK`。
 
-Bienstock、Fairoze、Garg、Mukherjee 和 Raghuraman 在 CRYPTO 2022 给出通用可组合定义 `F_DR`，并证明双棘轮实现它。模型用了可编程理想密码。这个定义把妥协之后立刻能做的选择密文类注入也算进去，并构造了六种改动过的双棘轮：它们在 2017 或 2019 的定义下仍算安全，在 `F_DR` 下不安全。双棘轮本身抵抗这些改动所对应的攻击。他们对 `F_DR` 的证明把公钥棘轮的 KDF 放在随机预言机里，并假定强 Diffie-Hellman，用来得到密文不可延展。2019 年那篇在不含这类篡改的定义下，用判定性 Diffie-Hellman 就够了。
+Bienstock、Fairoze、Garg、Mukherjee 和 Raghuraman 在 CRYPTO 2022 给出通用可组合定义 `F_DR`，并证明双棘轮实现它。对外介绍因此把这篇称作 *A Universally Composable Analysis of the Double Ratchet*；会议正式题名是 *A More Complete Analysis of the Signal Double Ratchet Algorithm*。模型用了可编程理想密码。这个定义把妥协之后立刻能做的选择密文类注入也算进去，并构造了六种改动过的双棘轮：它们在 2017 或 2019 的定义下仍算安全，在 `F_DR` 下不安全。双棘轮本身抵抗这些改动所对应的攻击。他们对 `F_DR` 的证明把公钥棘轮的 KDF 放在随机预言机里，并假定强 Diffie-Hellman，用来得到密文不可延展。2019 年那篇在不含这类篡改的定义下，用判定性 Diffie-Hellman 就够了。X3DH 如何得到初始共享秘密不在他们的定理里；本仓库把 `SK` 交给 `init_sender` / `init_receiver` 之后才进入这篇讨论的范围。
 
-同一篇文章也写出双棘轮还留着的一个窗口。发送方必须把这一轮的棘轮私钥留到收到对方的下一把棘轮公钥，否则算不出下一次 DH。同一个人在这个窗口里被连续取走两次状态，两次快照可以拼出这一轮的消息钥匙，包括两次取走之间已经发出的那些。这既碰到他们期望的破密恢复，也碰到前向安全。2017 和 2019 的定义都没有把这个窗口写进去。他们的 Triple Ratchet 在算出本轮 DH 之后，对留下来的私钥材料再做一次本地单向更新，线上仍然只传一个群元素。`src/double_ratchet.py` 留着的是完整棘轮私钥，没有这层更新。本仓库实现的是双棘轮，不实现 Triple Ratchet。
+和 `src/double_ratchet.py` 的对应是：
+
+- 对称棘轮，文中的 inner symmetric-key ratchet，是 `kdf_ck`。常数 `SYMMETRIC_RATCHET_MK_LABEL`（`0x01`）推出一次性 `MK`，`SYMMETRIC_RATCHET_CK_LABEL`（`0x02`）推出下一把链钥匙。同一把 `dh_pub` 下连续消息只走这一步。它提供前向安全，不提供破密恢复。
+- DH 棘轮，文中的 public ratchet，是 `kdf_rk`、`init_sender`、`_prepare_sending_chain` 和 `_dh_ratchet`。一次 X25519 输出混进根钥匙，展开成新的根钥匙和链钥匙，序号归零。界面上的代数加一就是新的发送世代。
+- 乱序和丢包，文中的 immediate decryption，是 `_skip_message_keys`。序号跳空时先把中间的 `MK` 放进 `skipped`，键是 `dh_pub || n`。永久丢掉的一条不挡住后面的消息；它若在上限内后到，仍用缓存里的那把 `MK`。换到新的 DH 链之前，按头里的 `PN` 把旧链上没到的 `MK` 也放进同一缓存。
+- 消息钥匙用后即弃：`encrypt` 和 `decrypt` 不把已经用于 AES-256-GCM 的 `MK` 写进 `RatchetState`。`ChatEngine._send_one` 和 `_decrypt_envelope` 拿到返回的 `MK` 后立刻丢掉。跳过缓存里的 `MK` 要留到对应密文到来，解开时弹出。他们的变换 T1 是另一件事：把已经不需要的上一发送世代对称秘密继续留在状态里，妥协之后可以注入。本仓库在进入下一世代时不再保留上一把链钥匙。
+
+本实现跟着写的是上面这四块积木的形状。没有在本仓库上重做 UC 证明。证明用的可编程理想密码、随机预言机和强 Diffie-Hellman，都不能从这段 Python 里读出来。报文加密是题目要求的 AES-256-GCM，头 `dh_pub`、`n`、`pn` 是明文。`MAX_SKIP = 40` 是实现上限；论文里的立即解密对多项式大小的空隙都成立，超过 40 条时本仓库选择拒绝。
+
+同一篇文章写出双棘轮还留着的窗口，本仓库不满足他们用来补这个窗口的 `F_TR`。发送方必须把这一轮的棘轮私钥留到收到对方的下一把棘轮公钥，否则算不出下一次 DH。状态里的 `dhs_priv` 就是这把私钥。同一个人在这个窗口里被连续取走两次状态，两次快照可以拼出这一轮的消息钥匙，包括两次取走之间已经发出的那些。这既碰到他们期望的破密恢复，也碰到前向安全。2017 和 2019 的定义都没有把这个窗口写进去。他们的 Triple Ratchet 在算出本轮 DH 之后，对留下来的私钥材料再做一次本地单向更新，线上仍然只传一个群元素。`src/double_ratchet.py` 留着的是完整 X25519 私钥，没有这层更新。
 
 ## 群为什么是每人一封
 
-Rösler、Mainka 和 Schwenk 在 EuroS&P 2018 写下当时 Signal、WhatsApp 和 Threema 的群机制，并给动态群一个同时考虑机密性、完整性和成员管理的模型。他们分析的 Signal / WhatsApp 群，是先用两人会话把一把发送者钥匙分发出去，群正文再走这把发送者自己的对称链。两人双棘轮上的破密恢复不会自动继承到这条群链上，因为群正文的钥匙本身不再做 DH 棘轮。他们还指出，当时这几个系统里，成员增减和「谁有权管理群」也没有被端到端保护。
+Rösler、Mainka 和 Schwenk 在 EuroS&P 2018 写下当时 Signal、WhatsApp 和 Threema 的群机制。对外介绍把标题收成 *More is Less: On the Security of Instant Messaging Groups*；正式题名是 *More is Less: On the End-to-End Security of Group Chats in Signal, WhatsApp, and Threema*。他们给动态群一个同时考虑机密性、完整性和成员管理的模型。分析结论有三块：消息完整性没有端到端保护，群的 closeness（谁有权管理成员）没有端到端保护，以及两人会话上的 future secrecy 不会自动继承到 Signal / WhatsApp 的群正文。
 
-本仓库的群不走发送者钥匙。一条群消息是对其他每个成员各跑那一对已经建立的双棘轮，发出多封信封。每一封仍有那一对的前向安全和回复之后的破密恢复。人数增加，信封数量线性增加，所以群最多 8 人。新成员只进入之后的消息；旧的 `MK` 已经丢掉，不会把历史补发给他。
+他们分析的 Signal / WhatsApp 群，是先用两人会话把一把发送者钥匙分发出去，群正文再走这把发送者自己的对称链。那条群链不再做 DH 棘轮，所以两人双棘轮上的破密恢复停在分发钥匙的那一刻。
 
-成员名单仍然是服务器上的记录。建群和拉人会向服务器发 `group_create` / `group_add`，再给每个成员一封 `kind = group_meta` 的棘轮信封。两人棘轮证明的是信封里的正文。服务器少投、多投，或者改写自己保存的成员表，不在这个证明里面。
+本仓库的回应写在 `ChatEngine.send_text`。一条群消息对其他每个成员各跑那一对已经建立的双棘轮，`_send_one` 发出独立信封，`encode_ratchet_payload` 上的 `group` 字段只标记这封信属于哪个群。服务器按收件人分发。没有全群共用的 Sender Key，也没有一条群对称链。每一封仍走 `kdf_ck` 和后续回复触发的 `kdf_rk`，所以那一对的前向安全、以及回复之后的破密恢复，留在这一封上。人数增加，信封数量线性增加，所以 `MAX_GROUP_MEMBERS = 8`。新成员只进入之后的消息；旧的 `MK` 已经丢掉，不会把历史补发给他。
+
+这个选择回应的是论文里 future secrecy 到不了群正文的那一条。另外两块没有被这个扇出补上。成员名单仍然是服务器上的记录：`group_create` / `group_add` 先改服务器表，再给每个成员一封 `kind = group_meta` 的棘轮信封。两人棘轮保证的是信封里的正文。服务器少投、多投，或者改写自己保存的成员表，不在这个保证里面。群里也没有让其他成员互相核验「这条群消息确实来自声称的发送者」的群签名；每个收件人只能核对自己那一封的 GCM 标签。
 
 ## 后量子握手，以及本仓库停在哪里
 
-Fiedler 和 Günther 在 PKC 2025 分析 Signal 已经部署的 PQXDH。它保留 X3DH 的 Diffie-Hellman 组合，再加一个后量子密钥封装（部署里用的是 Kyber；他们也处理后来的 ML-KEM）。会话钥匙要在「最大暴露」模型里安全：长期钥匙、半静态的签名预密钥、临时钥匙都可以被细粒度地妥协，对手可以是经典的，也可以是量子的。先记录握手、等以后的量子计算机打破 X25519，这种 harvest-now-decrypt-later 要由密钥封装那一项挡住，前提是封装的秘密当时没有泄露。
+Fiedler 和 Günther 在 PKC 2025 分析 Signal 已经部署的 PQXDH。对外介绍把对象写成 *PQXDH: A Post-Quantum Extension of X3DH*；论文正式题名是 *Security Analysis of Signal's PQXDH Handshake*。PQXDH 保留 X3DH 的 Diffie-Hellman 组合，再加一个后量子密钥封装（部署里用的是 Kyber；他们也处理后来的 ML-KEM）。会话钥匙要在「最大暴露」模型里安全：长期钥匙、半静态的签名预密钥、临时钥匙都可以被细粒度地妥协，对手可以是经典的，也可以是量子的。先记录握手、等以后的量子计算机打破 X25519，这种 harvest-now-decrypt-later 要由密钥封装那一项挡住，前提是封装的秘密当时没有泄露。
 
 他们的归约需要密钥封装的一个绑定性质，并证明 Kyber 和 ML-KEM 满足他们定义的那一版。缺少域分离会把具体安全界降下来。Bhargavan、Jacomme、Kiefer 和 Schmidt 在 USENIX Security 2024 用 ProVerif 和 CryptoVerif 核过同一份规范，并把发现送回修订版。那篇的全文在 USENIX 页面：<https://www.usenix.org/conference/usenixsecurity24/presentation/bhargavan>。USENIX 的版本不放进本仓库。
 
-本仓库的握手停在经典 X3DH，没有密钥封装。目录和信封里的 X25519 公钥构成的是这两篇论文要避免其在量子计算机出现后仍然够用的那份经典副本。README 里「没有 PQXDH」指的就是这件事。
+本仓库的握手停在经典 X3DH。`initiator_secret` / `responder_secret` 的输入材料只有 DH1、DH2、DH3，拿到一次性预密钥才接 DH4，然后 `hkdf_sk` 用 `info = b"x3dh-v1"`。预密钥目录、初始消息和信封里都没有 KEM 公钥或封装密文。`src/x3dh.py` 不调用 Kyber 或 ML-KEM，也不把 X25519 的输出当成后量子共享秘密。
+
+后量子扩展路径没有写进代码。若以后要做，是在不改现有四次 DH 顺序的前提下加一件事：目录里公布一把 KEM 公钥（PQXDH 的完整握手用临时封装公钥，缩减握手用半静态封装公钥），发起方封装，双方把 KEM 共享秘密按单独的 `info` 域分离并入 HKDF 的输入。Fiedler 和 Günther 说明这一项才挡住对 X25519 的先记录后解密，并且域分离和 KEM 绑定都不能省。现在记下本仓库的握手，等到能打破 X25519 的量子计算机出现，经典 `SK` 不在他们证明的后量子会话钥匙范围内。
 
 ## 答辩时不能说成什么
 

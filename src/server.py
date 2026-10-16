@@ -395,6 +395,8 @@ class ChatServer:
             if not self.store.user_exists(m):
                 await ws.send(dumps(error_msg(f"成员 {m} 未注册")))
                 return
+        # 成员表是服务器状态。EuroS&P 2018 指出当时几个系统的群管理
+        # 没有端到端保护；这里同样没有。群正文的加密在客户端逐人棘轮里。
         self.store.create_group(name, members)
         update = dumps({"type": "group_update", "group": name, "members": members})
         await self._fanout_control(members, update)
