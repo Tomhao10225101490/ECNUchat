@@ -13,7 +13,11 @@ from typing import Any
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from src.prekeys import verify_spk
+from src.groups import (
+    verify_group_state_sig,
+    verify_state_transition,
+)
+from src.prekeys import MLKEM768_PUB_LEN, verify_pq, verify_spk
 from src.protocol import (
     MAX_GROUP_MEMBERS,
     PROJECT_NAME,
@@ -21,7 +25,9 @@ from src.protocol import (
     b64d,
     b64e,
     check_size,
+    decode_group_state,
     dumps,
+    encode_group_state,
     error_msg,
     loads,
     validate_group_name,
@@ -141,6 +147,8 @@ class ChatServer:
             await self.on_group_add(ws, username, msg)
         elif typ == "group_info":
             await self.on_group_info(ws, msg)
+        elif typ == "group_sync":
+            await self.on_group_sync(ws, msg)
         else:
             await ws.send(dumps(error_msg(f"未知类型 {typ}")))
         return username
@@ -155,6 +163,8 @@ class ChatServer:
         ik_dh_pub = b64d(msg["ik_dh_pub"])
         spk_pub = b64d(msg["spk_pub"])
         spk_sig = b64d(msg["spk_sig"])
+        pq_pub = b64d(msg.get("pq_pub"))
+        pq_sig = b64d(msg.get("pq_sig"))
         if (
             ik_sign_pub is None
             or len(ik_sign_pub) != 32
@@ -172,6 +182,18 @@ class ChatServer:
         except Exception:
             await ws.send(dumps(error_msg("SPK 签名无效，拒绝入库")))
             return None
+        if (pq_pub is None) != (pq_sig is None):
+            await ws.send(dumps(error_msg("PQK 公钥与签名必须同时提供")))
+            return None
+        if pq_pub is not None:
+            if len(pq_pub) != MLKEM768_PUB_LEN or pq_sig is None or len(pq_sig) != 64:
+                await ws.send(dumps(error_msg("PQK 公钥或签名长度无效")))
+                return None
+            try:
+                verify_pq(ik_sign_pub, pq_pub, username, pq_sig)
+            except Exception:
+                await ws.send(dumps(error_msg("PQK 签名无效，拒绝入库")))
+                return None
         opks = [b64d(x) for x in msg.get("opks") or []]
         opk_bytes = [x for x in opks if x]
         if len(opk_bytes) > 100 or any(len(item) != 32 for item in opk_bytes):
@@ -184,6 +206,8 @@ class ChatServer:
             spk_pub,
             spk_sig,
             float(msg.get("spk_created") or 0),
+            pq_pub,
+            pq_sig,
             opk_bytes,
         )
         await self._bind(ws, username)
@@ -300,6 +324,8 @@ class ChatServer:
                     "spk_sig": b64e(bundle["spk_sig"]),
                     "spk_created": bundle["spk_created"],
                     "opk": b64e(bundle["opk_pub"]) if bundle["opk_pub"] else None,
+                    "pq_pub": b64e(bundle["pq_pub"]) if bundle["pq_pub"] else None,
+                    "pq_sig": b64e(bundle["pq_sig"]) if bundle["pq_sig"] else None,
                 }
             )
         )
@@ -323,6 +349,7 @@ class ChatServer:
                     "username": name,
                     "ik_sign_pub": b64e(user[0]),
                     "ik_dh_pub": b64e(user[1]),
+                    "ik_pq_pub": b64e(user[2]) if user[2] else None,
                 }
             )
         )
@@ -378,53 +405,101 @@ class ChatServer:
         await ws.send(dumps({"type": "envelope_ok", "to": dst}))
 
     async def on_group_create(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
-        name = msg.get("group", "")
+        try:
+            state = decode_group_state(msg.get("state") or {})
+        except (ProtocolError, KeyError) as exc:
+            await ws.send(dumps(error_msg(f"群状态无效：{exc}")))
+            return
+        name = state.name
         validate_group_name(name)
         if self.store.group_exists(name):
             await ws.send(dumps(error_msg("群名已存在")))
             return
-        members = list(dict.fromkeys([username, *(msg.get("members") or [])]))
+        members = list(state.members)
         if len(members) < 2:
             await ws.send(dumps(error_msg("群至少需要两名成员")))
             return
         if len(members) > MAX_GROUP_MEMBERS:
             await ws.send(dumps(error_msg("群最多 8 人")))
             return
+        if state.signer != username or username not in members:
+            await ws.send(dumps(error_msg("只有创建者能签署创世状态")))
+            return
         for m in members:
             validate_username(m)
             if not self.store.user_exists(m):
                 await ws.send(dumps(error_msg(f"成员 {m} 未注册")))
                 return
-        # 成员表是服务器状态。EuroS&P 2018 指出当时几个系统的群管理
-        # 没有端到端保护；这里同样没有。群正文的加密在客户端逐人棘轮里。
+        try:
+            verify_state_transition(None, state)
+            verify_group_state_sig(state, self.store.get_user(state.signer)[0])
+        except Exception as exc:
+            await ws.send(dumps(error_msg(f"群状态签名无效：{exc}")))
+            return
+        # 成员表仍是服务器状态，但现在只能是「由合法成员签署过的状态」：
+        # 服务器伪造不了，客户端还会自己再验一遍。
         self.store.create_group(name, members)
-        update = dumps({"type": "group_update", "group": name, "members": members})
+        self.store.save_group_state(state)
+        update = dumps(
+            {
+                "type": "group_update",
+                "group": name,
+                "members": members,
+                "state": encode_group_state(state),
+            }
+        )
         await self._fanout_control(members, update)
-        log.info("group_create name=%s size=%s", name, len(members))
+        log.info("group_create name=%s size=%s epoch=%s", name, len(members), state.epoch)
 
     async def on_group_add(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
-        name = msg.get("group", "")
-        newbie = msg.get("member", "")
+        try:
+            state = decode_group_state(msg.get("state") or {})
+        except (ProtocolError, KeyError) as exc:
+            await ws.send(dumps(error_msg(f"群状态无效：{exc}")))
+            return
+        name = state.name
         validate_group_name(name)
+        if not self.store.group_exists(name):
+            await ws.send(dumps(error_msg("群不存在")))
+            return
+        last = self.store.latest_group_state(name)
+        if last is None:
+            await ws.send(dumps(error_msg("群状态链缺失，无法拉人")))
+            return
+        newbies = [m for m in state.members if m not in last.members]
+        if len(newbies) != 1:
+            await ws.send(dumps(error_msg("每次拉人必须恰好新增一名成员")))
+            return
+        newbie = newbies[0]
         validate_username(newbie)
-        members = self.store.group_members(name)
-        if username not in members:
-            await ws.send(dumps(error_msg("只有群内成员能拉人")))
+        if state.signer != username:
+            await ws.send(dumps(error_msg("签署者必须是你自己")))
             return
         if not self.store.user_exists(newbie):
             await ws.send(dumps(error_msg("新成员未注册")))
             return
-        if newbie in members:
-            await ws.send(dumps(error_msg("已在群内")))
-            return
-        if len(members) + 1 > MAX_GROUP_MEMBERS:
+        if len(state.members) > MAX_GROUP_MEMBERS:
             await ws.send(dumps(error_msg("群最多 8 人")))
             return
+        try:
+            verify_state_transition(last, state)
+            verify_group_state_sig(state, self.store.get_user(state.signer)[0])
+        except Exception as exc:
+            await ws.send(dumps(error_msg(f"群状态签名无效：{exc}")))
+            return
         self.store.add_group_member(name, newbie)
-        members = self.store.group_members(name)
-        update = dumps({"type": "group_update", "group": name, "members": members})
+        self.store.save_group_state(state)
+        members = list(state.members)
+        update = dumps(
+            {
+                "type": "group_update",
+                "group": name,
+                "members": members,
+                "state": encode_group_state(state),
+            }
+        )
         await self._fanout_control(members, update)
-        log.info("group_add name=%s member=%s", name, newbie)
+        log.info("group_add name=%s member=%s epoch=%s", name, newbie, state.epoch)
 
     async def on_group_info(self, ws: Any, msg: dict[str, Any]) -> None:
         name = msg.get("group", "")
@@ -432,12 +507,31 @@ class ChatServer:
         if not self.store.group_exists(name):
             await ws.send(dumps(error_msg("群不存在")))
             return
+        state = self.store.latest_group_state(name)
         await ws.send(
             dumps(
                 {
                     "type": "group_update",
                     "group": name,
                     "members": self.store.group_members(name),
+                    "state": encode_group_state(state) if state else None,
+                }
+            )
+        )
+
+    async def on_group_sync(self, ws: Any, msg: dict[str, Any]) -> None:
+        name = msg.get("group", "")
+        validate_group_name(name)
+        if not self.store.group_exists(name):
+            await ws.send(dumps(error_msg("群不存在")))
+            return
+        states = self.store.load_group_states(name)
+        await ws.send(
+            dumps(
+                {
+                    "type": "group_states",
+                    "group": name,
+                    "states": [encode_group_state(s) for s in states],
                 }
             )
         )

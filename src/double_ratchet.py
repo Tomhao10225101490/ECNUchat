@@ -24,6 +24,16 @@ Signal Double Ratchet Algorithm*。对外介绍把这篇称作对双棘轮的通
   对应密文到来，解开时弹出。这避开他们列出的 T1：把已经不需要的上一
   发送世代对称秘密继续留在状态里，妥协之后的注入在 F_DR 下成立。
 
+混合棘轮（本仓库的 PQXDH 配套）：握手含 KEM 时，每一把新发送链都再混入
+一次新鲜的 ML-KEM 共享秘密。发起链的一方封装到对方的长期 PQK 公钥，
+密文随这条链的每条消息携带（`RatchetMessage.pq_ct`）；收链的一方用自己
+的 PQK 私钥解封后并入 `kdf_rk_pq`，info 用 `pq-dr-v1` 与 `dr-v1` 域分离。
+双方都记录对端 PQK 公钥（`remote_pq_pk`）之后，新链缺 PQ 封装就拒绝，
+防止中间人剥掉 PQ 封装把棘轮降级回经典。旧会话没有 PQK 时会自动升级：
+客户端在收发前补拉对端 bundle，之后的链全部混入 PQ；升级前的旧消息仍是
+经典密文（记录后可用量子计算机打破），升级之后不再依赖 X25519 的
+抗量子性。MLKEM 不可用时整层退化为经典双棘轮。
+
 安全边界：发送棘轮私钥 `dhs_priv` 必须留到收到对方下一把棘轮公钥。
 这个窗口里对同一方连续取走两次状态，可以拼出本轮已经发出的消息钥匙。
 这是他们指出的双棘轮缺口。Triple Ratchet 会在算出本轮 DH 之后对私钥
@@ -46,10 +56,16 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
+from src.prekeys import (
+    MLKEM_SUPPORTED,
+    decapsulate_mlkem,
+    encapsulate_mlkem,
+)
 from src.x3dh import x25519_dh
 
 # 公钥棘轮 KDF 的 info。与 X3DH 的 x3dh-v1 分开，两次派生不会撞车。
 DR_INFO = b"dr-v1"
+PQDR_INFO = b"pq-dr-v1"
 # 对称棘轮的两个 HMAC 输入，对应 Signal 的 KDF_CK，也就是 CRYPTO 2022
 # 文中的 inner symmetric-key ratchet：0x01 推出一次性消息钥匙，0x02 推出下一把链钥匙。
 SYMMETRIC_RATCHET_MK_LABEL = b"\x01"
@@ -109,6 +125,22 @@ def kdf_rk(rk: bytes, dh_out: bytes) -> tuple[bytes, bytes]:
     return out[:32], out[32:]
 
 
+def kdf_rk_pq(rk: bytes, dh_out: bytes, kem_ss: bytes) -> tuple[bytes, bytes]:
+    """混合 DH 棘轮：HKDF(ikm=dh_out||kem_ss, salt=rk, info=pq-dr-v1, 64)。
+
+    与经典 dr-v1 域分离。KEM 共享秘密来自对端长期 PQK 公钥的一次新鲜
+    封装，因此即使 X25519 材料将来被量子计算机恢复，只要 PQK 私钥未
+    泄露，换链之后的消息钥匙仍然安全。
+    """
+    out = HKDF(
+        algorithm=hashes.SHA256(),
+        length=64,
+        salt=rk,
+        info=PQDR_INFO,
+    ).derive(dh_out + kem_ss)
+    return out[:32], out[32:]
+
+
 def _hmac_sha256(key: bytes, msg: bytes) -> bytes:
     h = hmac.HMAC(key, hashes.SHA256())
     h.update(msg)
@@ -146,6 +178,7 @@ class RatchetMessage:
     header: Header
     nonce: bytes
     ciphertext: bytes
+    pq_ct: bytes | None = None
 
 
 @dataclass
@@ -158,7 +191,9 @@ class RatchetState:
     # 可以恢复本轮 MK。Triple Ratchet 会在算出 DH 后对它做本地单向更新。
     dhs_priv: bytes | None = None
     dhs_pub: bytes | None = None
+    dhs_pq_ct: bytes | None = None
     dhr_pub: bytes | None = None
+    remote_pq_pk: bytes | None = None
     cks: bytes | None = None
     ckr: bytes | None = None
     ns: int = 0
@@ -177,7 +212,9 @@ class RatchetState:
             "remote_user": self.remote_user,
             "dhs_priv": self.dhs_priv,
             "dhs_pub": self.dhs_pub,
+            "dhs_pq_ct": self.dhs_pq_ct,
             "dhr_pub": self.dhr_pub,
+            "remote_pq_pk": self.remote_pq_pk,
             "cks": self.cks,
             "ckr": self.ckr,
             "ns": self.ns,
@@ -197,7 +234,9 @@ class RatchetState:
             remote_user=rec["remote_user"],
             dhs_priv=rec.get("dhs_priv"),
             dhs_pub=rec.get("dhs_pub"),
+            dhs_pq_ct=rec.get("dhs_pq_ct"),
             dhr_pub=rec.get("dhr_pub"),
+            remote_pq_pk=rec.get("remote_pq_pk"),
             cks=rec.get("cks"),
             ckr=rec.get("ckr"),
             ns=rec.get("ns", 0),
@@ -210,18 +249,35 @@ class RatchetState:
         )
 
 
-def init_sender(sk: bytes, spk_pub_b: bytes, local_user: str, remote_user: str) -> RatchetState:
-    """A 算完 SK 后生成 R_A，用 SPK_B 做第一次 DH 棘轮，只得到发送链。"""
+def init_sender(
+    sk: bytes,
+    spk_pub_b: bytes,
+    local_user: str,
+    remote_user: str,
+    remote_pq_pk: bytes | None = None,
+) -> RatchetState:
+    """A 算完 SK 后生成 R_A，用 SPK_B 做第一次 DH 棘轮，只得到发送链。
+
+    若已知 B 的 PQK 公钥，第一条发送链就混入一次新鲜 KEM 共享秘密，
+    密文挂在 `dhs_pq_ct`，随这条链的每条消息外带。
+    """
     dhs_priv, dhs_pub = generate_ratchet_keypair()
     dh_out = x25519_dh(dhs_priv, spk_pub_b)
-    rk, cks = kdf_rk(sk, dh_out)
+    pq_ct = None
+    if remote_pq_pk is not None and MLKEM_SUPPORTED:
+        kem_ss, pq_ct = encapsulate_mlkem(remote_pq_pk)
+        rk, cks = kdf_rk_pq(sk, dh_out, kem_ss)
+    else:
+        rk, cks = kdf_rk(sk, dh_out)
     return RatchetState(
         rk=rk,
         local_user=local_user,
         remote_user=remote_user,
         dhs_priv=dhs_priv,
         dhs_pub=dhs_pub,
+        dhs_pq_ct=pq_ct,
         cks=cks,
+        remote_pq_pk=remote_pq_pk,
         dh_ratchet_count=1,
     )
 
@@ -232,16 +288,30 @@ def init_receiver(
     remote_dh_pub: bytes,
     local_user: str,
     remote_user: str,
+    remote_pq_pk: bytes | None = None,
+    pq_ct: bytes | None = None,
+    local_pq_priv: bytes | None = None,
 ) -> RatchetState:
-    """B 用 SPK 私钥和头里的 R_A 重算 DH / KDF_RK，得到接收链。"""
+    """B 用 SPK 私钥和头里的 R_A 重算 DH / KDF_RK，得到接收链。
+
+    第一条消息若带 PQ 封装，用本地 PQK 私钥解封后并入第一条接收链。
+    """
     dh_out = x25519_dh(spk_priv_b, remote_dh_pub)
-    rk, ckr = kdf_rk(sk, dh_out)
+    if pq_ct is not None and local_pq_priv is not None and MLKEM_SUPPORTED:
+        try:
+            kem_ss = decapsulate_mlkem(local_pq_priv, pq_ct)
+        except ValueError as exc:
+            raise GCMError("GCM 失败：PQ 解封失败") from exc
+        rk, ckr = kdf_rk_pq(sk, dh_out, kem_ss)
+    else:
+        rk, ckr = kdf_rk(sk, dh_out)
     return RatchetState(
         rk=rk,
         local_user=local_user,
         remote_user=remote_user,
         dhr_pub=remote_dh_pub,
         ckr=ckr,
+        remote_pq_pk=remote_pq_pk,
         dh_ratchet_count=1,
     )
 
@@ -259,16 +329,29 @@ def _prepare_sending_chain(state: RatchetState) -> None:
     state.pns = state.nr
     state.dhs_priv, state.dhs_pub = generate_ratchet_keypair()
     dh_out = x25519_dh(state.dhs_priv, state.dhr_pub)
-    state.rk, state.cks = kdf_rk(state.rk, dh_out)
+    if state.remote_pq_pk is not None and MLKEM_SUPPORTED:
+        kem_ss, pq_ct = encapsulate_mlkem(state.remote_pq_pk)
+        state.rk, state.cks = kdf_rk_pq(state.rk, dh_out, kem_ss)
+        state.dhs_pq_ct = pq_ct
+    else:
+        state.rk, state.cks = kdf_rk(state.rk, dh_out)
+        state.dhs_pq_ct = None
     state.ns = 0
     state.dh_ratchet_count += 1
 
 
-def _dh_ratchet(state: RatchetState, remote_dh_pub: bytes) -> None:
+def _dh_ratchet(
+    state: RatchetState,
+    remote_dh_pub: bytes,
+    pq_ct: bytes | None,
+    local_pq_priv: bytes | None,
+) -> None:
     """收到新的 dh_pub：用仍留着的发送私钥做接收链，再换一把新的发送私钥。
 
     两次 `kdf_rk` 是公钥棘轮进入下一世代。调用前应先按 PN 把旧接收链上
     没到的 MK 放进跳过缓存，丢失的旧消息才仍能补解。
+    已记录对端 PQK 公钥时，两条链都必须是混合的：缺 PQ 封装拒绝（降级
+    攻击），否则用本地 PQK 私钥解封后并入 `kdf_rk_pq`。
     """
     if state.dhs_priv is None:
         raise RatchetError("协议错误", "本地还没有发送棘轮密钥，无法完成 DH 棘轮")
@@ -276,12 +359,31 @@ def _dh_ratchet(state: RatchetState, remote_dh_pub: bytes) -> None:
         state.retired_dh.add(state.dhr_pub)
     state.dhr_pub = remote_dh_pub
     dh_recv = x25519_dh(state.dhs_priv, remote_dh_pub)
-    state.rk, state.ckr = kdf_rk(state.rk, dh_recv)
+    if state.remote_pq_pk is not None:
+        if pq_ct is None:
+            raise RatchetError("PQ 降级", "缺少 PQ 封装，拒绝把棘轮降级回经典")
+        if local_pq_priv is None or not MLKEM_SUPPORTED:
+            raise RatchetError("协议错误", "本地没有 PQK 私钥，无法完成混合棘轮")
+        try:
+            kem_ss = decapsulate_mlkem(local_pq_priv, pq_ct)
+        except ValueError as exc:
+            raise GCMError("GCM 失败：PQ 解封失败") from exc
+        state.rk, state.ckr = kdf_rk_pq(state.rk, dh_recv, kem_ss)
+    else:
+        if pq_ct is not None:
+            raise RatchetError("协议错误", "未记录对端 PQK 公钥，无法处理 PQ 封装")
+        state.rk, state.ckr = kdf_rk(state.rk, dh_recv)
     state.nr = 0
     state.pns = state.ns
     state.dhs_priv, state.dhs_pub = generate_ratchet_keypair()
     dh_send = x25519_dh(state.dhs_priv, remote_dh_pub)
-    state.rk, state.cks = kdf_rk(state.rk, dh_send)
+    if state.remote_pq_pk is not None and MLKEM_SUPPORTED:
+        kem_ss, new_ct = encapsulate_mlkem(state.remote_pq_pk)
+        state.rk, state.cks = kdf_rk_pq(state.rk, dh_send, kem_ss)
+        state.dhs_pq_ct = new_ct
+    else:
+        state.rk, state.cks = kdf_rk(state.rk, dh_send)
+        state.dhs_pq_ct = None
     state.ns = 0
     state.dh_ratchet_count += 1
 
@@ -303,7 +405,15 @@ def encrypt(state: RatchetState, plaintext: bytes) -> tuple[RatchetMessage, byte
     nonce = os.urandom(NONCE_LEN)
     aad = build_aad(state.local_user, state.remote_user, n, pn, state.dhs_pub)
     ciphertext = AESGCM(mk).encrypt(nonce, plaintext, aad)
-    return RatchetMessage(header=header, nonce=nonce, ciphertext=ciphertext), mk
+    return (
+        RatchetMessage(
+            header=header,
+            nonce=nonce,
+            ciphertext=ciphertext,
+            pq_ct=state.dhs_pq_ct,
+        ),
+        mk,
+    )
 
 
 def _skip_message_keys(state: RatchetState, until: int, dh_pub: bytes) -> None:
@@ -331,10 +441,19 @@ def _skip_message_keys(state: RatchetState, until: int, dh_pub: bytes) -> None:
         state.nr += 1
 
 
-def decrypt(state: RatchetState, message: RatchetMessage) -> tuple[bytes, bytes]:
-    """原子解密：认证成功才提交棘轮状态，失败时原状态完全不变。"""
+def decrypt(
+    state: RatchetState,
+    message: RatchetMessage,
+    *,
+    pq_priv: bytes | None = None,
+) -> tuple[bytes, bytes]:
+    """原子解密：认证成功才提交棘轮状态，失败时原状态完全不变。
+
+    `pq_priv` 是本地 PQK 私钥，处理新链上的 PQ 封装时解封用。
+    经典会话（remote_pq_pk 为空）不传即可。
+    """
     candidate = RatchetState.from_record(state.to_record())
-    plaintext, mk = _decrypt_mutating(candidate, message)
+    plaintext, mk = _decrypt_mutating(candidate, message, pq_priv)
     _commit_state(state, candidate)
     return plaintext, mk
 
@@ -350,7 +469,9 @@ def _commit_state(target: RatchetState, source: RatchetState) -> None:
 
 
 def _decrypt_mutating(
-    state: RatchetState, message: RatchetMessage
+    state: RatchetState,
+    message: RatchetMessage,
+    local_pq_priv: bytes | None,
 ) -> tuple[bytes, bytes]:
     header = message.header
     if len(header.dh_pub) != 32 or len(message.nonce) != NONCE_LEN:
@@ -380,7 +501,7 @@ def _decrypt_mutating(
         if state.dhr_pub is not None and header.dh_pub == state.dhr_pub:
             pass
         else:
-            _dh_ratchet(state, header.dh_pub)
+            _dh_ratchet(state, header.dh_pub, message.pq_ct, local_pq_priv)
 
     if header.n < state.nr:
         raise ReplayError()

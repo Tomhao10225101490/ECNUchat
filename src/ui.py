@@ -73,6 +73,7 @@ BOX = "#6ab3f3"
 HELP_TEXT = """命令
   /chat 名字              打开单聊
   /fingerprint 名字       16 组身份指纹，线下核对
+  /pq status 名字         混合握手与 PQ 棘轮状态
   /group create 群名 成员…
   /group add 群名 新成员
   /group 群名             打开群

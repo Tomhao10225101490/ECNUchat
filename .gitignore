@@ -5,6 +5,9 @@ __pycache__/
 venv/
 data/*.db
 *.db
+*.log
+*.db-shm
+*.db-wal
 .idea/
 .vscode/
 *.egg-info/
