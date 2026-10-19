@@ -8,6 +8,7 @@ import json
 import uuid
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import websockets
@@ -17,6 +18,19 @@ from rich.panel import Panel
 from rich.text import Text
 
 from src import PROJECT_ABSTRACT, PROJECT_NAME
+from src.attachments import (
+    MAX_FILE_BYTES,
+    AttachmentError,
+    attachment_root,
+    attachment_view,
+    display_text,
+    history_body,
+    meta_from_dict,
+    meta_to_dict,
+    open_bytes,
+    plaintext_len,
+    seal_bytes,
+)
 from src.double_ratchet import (
     GCMError,
     RatchetError,
@@ -60,6 +74,7 @@ class Incoming:
     group: str | None
     kind: str
     error: str | None = None
+    attachment: dict[str, Any] | None = None
 
 
 @dataclass
@@ -91,6 +106,9 @@ class ChatEngine:
     _incoming_raw: asyncio.Queue = field(default_factory=asyncio.Queue)
     _tasks: list[asyncio.Task] = field(default_factory=list)
     _peer_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    _incoming_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _incoming_done: set[str] = field(default_factory=set)
+    on_file_progress: Any = None
 
     @classmethod
     def open(cls, username: str, password: str, db_path: str) -> ChatEngine:
@@ -199,6 +217,10 @@ class ChatEngine:
             )
         await self._retry_outboxes()
         try:
+            await self._retry_incoming_files()
+        except Exception:
+            self.last_error = "文件下载将在下次连接重试"
+        try:
             await self._retry_pending_prekeys()
         except Exception:
             self.last_error = "预密钥补充将在下次登录重试"
@@ -206,25 +228,34 @@ class ChatEngine:
     async def _retry_outboxes(self) -> None:
         """重连后重发原始加密信封，不再次推进双棘轮。"""
         for peer in self.store.list_outbox_peers():
-            payload = self.store.load_outbox(peer)
-            if payload is None:
-                continue
+            lock = self._peer_locks.setdefault(peer, asyncio.Lock())
             try:
-                await self.request(
-                    {
-                        "type": "envelope",
-                        "from": self.username,
-                        "to": peer,
-                        "payload": payload,
-                    },
-                    "envelope_ok",
-                )
+                async with lock:
+                    await self._flush_outbox(peer)
             except Exception:
                 self.last_error = "待发加密信封将在下次重连重试"
-                continue
-            self.store.delete_outbox(peer)
-            if payload.get("x3dh") is not None:
-                self.pending_x3dh.pop(peer, None)
+
+    async def _flush_outbox(self, peer: str) -> None:
+        pending_payload = self.store.load_outbox(peer)
+        if pending_payload is None:
+            return
+        await self.request(
+            {
+                "type": "envelope",
+                "from": self.username,
+                "to": peer,
+                "payload": pending_payload,
+            },
+            "envelope_ok",
+        )
+        self.store.delete_outbox(peer)
+        if pending_payload.get("x3dh") is not None:
+            self.pending_x3dh.pop(peer, None)
+
+    def _progress(self, local_id: str, done: int, total: int) -> None:
+        callback = self.on_file_progress
+        if callback is not None:
+            callback(local_id, done, total)
 
     async def _retry_pending_prekeys(self) -> None:
         pending = self.store.load_pending_prekeys()
@@ -389,25 +420,248 @@ class ChatEngine:
         await self._send_one(dest, text, group=None, kind="chat")
         self.store.add_history(f"dm:{dest}", self.username, text)
 
+    async def send_file(
+        self,
+        path: str | None = None,
+        *,
+        peer: str | None = None,
+        group: str | None = None,
+        caption: str = "",
+        local_id: str | None = None,
+        data: bytes | None = None,
+        filename: str | None = None,
+        mime: str | None = None,
+    ) -> str:
+        """上传一份密文，再给每个收件人发一封带文件钥匙的棘轮信封。"""
+        if not isinstance(caption, str) or len(caption) > 2000:
+            raise ProtocolError("附件说明过长")
+        local_id = local_id or uuid.uuid4().hex
+        if group:
+            members = self.groups.get(group) or []
+            recipients = sorted(member for member in members if member != self.username)
+            if not recipients:
+                raise ProtocolError("群里没有其他成员")
+            conv = f"group:{group}"
+            target_group: str | None = group
+        else:
+            dest = peer or self.current_peer
+            if not dest:
+                raise ProtocolError("先用 /chat 名字 选择对端")
+            if dest == self.username:
+                raise ProtocolError("不能给自己发文件")
+            recipients = [dest]
+            conv = f"dm:{dest}"
+            target_group = None
+        record = self.store.load_file_job(local_id)
+        if record is None:
+            record = self._new_file_job(
+                local_id=local_id,
+                conv=conv,
+                group=target_group,
+                recipients=recipients,
+                caption=caption,
+                path=path,
+                data=data,
+                filename=filename,
+                mime=mime,
+            )
+        else:
+            recipients = list(record["recipients"])
+            conv = str(record["conv"])
+            target_group = record.get("group")
+        if not record.get("history"):
+            record["history"] = self._file_history_body(record)
+        self.store.save_file_job(local_id, record)
+        self.store.save_message_status(local_id, conv, str(record["history"]), "sending")
+        if not record.get("uploaded"):
+            await self._upload_file(record)
+            record["uploaded"] = True
+            self.store.save_file_job(local_id, record)
+        if not record.get("logged"):
+            self.store.add_history(conv, self.username, str(record["history"]))
+            record["logged"] = True
+            self.store.save_file_job(local_id, record)
+        delivered = 0
+        try:
+            for other in recipients:
+                await self._deliver_file_envelope(other, record)
+                delivered += 1
+        except Exception:
+            if target_group:
+                self.store.add_history(
+                    conv,
+                    "系统",
+                    f"文件仅送达 {delivered}/{len(recipients)} 人，可稍后重试",
+                )
+            raise
+        size = int(record["meta"]["size"])
+        self._progress(local_id, size, size)
+        return str(record["history"])
+
+    def _new_file_job(
+        self,
+        *,
+        local_id: str,
+        conv: str,
+        group: str | None,
+        recipients: list[str],
+        caption: str,
+        path: str | None,
+        data: bytes | None,
+        filename: str | None,
+        mime: str | None,
+    ) -> dict[str, Any]:
+        if data is None:
+            if not path:
+                raise ProtocolError("没有要发送的文件")
+            file_path = Path(path)
+            if not file_path.is_file():
+                raise ProtocolError("文件不存在")
+            if file_path.stat().st_size > MAX_FILE_BYTES:
+                raise ProtocolError("文件超过 32MiB")
+            payload = file_path.read_bytes()
+            filename = filename or file_path.name
+        else:
+            if len(data) > MAX_FILE_BYTES:
+                raise ProtocolError("文件超过 32MiB")
+            payload = bytes(data)
+            filename = filename or "file"
+        sealed = seal_bytes(payload, filename, mime)
+        blob_hex = sealed.meta.file_id.hex()
+        root = attachment_root(self.store.path)
+        cipher = root / "cipher" / blob_hex
+        cipher.mkdir(parents=True, exist_ok=True)
+        for index, chunk in enumerate(sealed.chunks):
+            (cipher / str(index)).write_bytes(chunk)
+        rel = f"files/{blob_hex}/{sealed.meta.name}"
+        dest = root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(payload)
+        return {
+            "local_id": local_id,
+            "conv": conv,
+            "group": group,
+            "recipients": recipients,
+            "caption": caption,
+            "meta": meta_to_dict(sealed.meta),
+            "rel": rel,
+            "enveloped": [],
+            "uploaded": False,
+            "logged": False,
+            "history": "",
+        }
+
+    def _file_history_body(self, record: dict[str, Any]) -> str:
+        meta = meta_from_dict(record["meta"])
+        return history_body(
+            name=meta.name,
+            mime=meta.mime,
+            size=meta.size,
+            sha256=meta.sha256,
+            rel_path=str(record["rel"]),
+            caption=str(record.get("caption") or ""),
+        )
+
+    async def _upload_file(self, record: dict[str, Any]) -> None:
+        meta = meta_from_dict(record["meta"])
+        blob_id = meta.file_id.hex()
+        await self.request(
+            {
+                "type": "blob_begin",
+                "id": blob_id,
+                "size": meta.size,
+                "chunks": meta.chunks,
+                "recipients": list(record["recipients"]),
+            },
+            "blob_begin_ok",
+        )
+        cipher = attachment_root(self.store.path) / "cipher" / blob_id
+        total = meta.size
+        sent = 0
+        self._progress(str(record["local_id"]), 0, total)
+        for index in range(meta.chunks):
+            chunk_path = cipher / str(index)
+            if not chunk_path.is_file():
+                raise ProtocolError("本地密文丢失")
+            ciphertext = chunk_path.read_bytes()
+            await self.request(
+                {
+                    "type": "blob_chunk",
+                    "id": blob_id,
+                    "idx": index,
+                    "data": b64e(ciphertext),
+                },
+                "blob_chunk_ok",
+            )
+            sent += plaintext_len(meta.size, meta.chunks, index)
+            self._progress(str(record["local_id"]), sent, total)
+        await self.request({"type": "blob_finish", "id": blob_id}, "blob_finish_ok")
+
+    async def _deliver_file_envelope(self, peer: str, record: dict[str, Any]) -> None:
+        lock = self._peer_locks.setdefault(peer, asyncio.Lock())
+        async with lock:
+            if peer in (record.get("enveloped") or []):
+                await self._flush_outbox(peer)
+                return
+            await self._flush_outbox(peer)
+            state = await self._ensure_session_for_send(peer)
+            x3dh = self.pending_x3dh.get(peer)
+            inner = json.dumps(
+                {
+                    "v": 1,
+                    "text": record.get("caption") or "",
+                    "group": record.get("group"),
+                    "kind": "file",
+                    "file": record["meta"],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            if len(inner) > 12 * 1024:
+                raise ProtocolError("附件说明过长")
+            msg, message_key = encrypt(state, inner)
+            del message_key
+            payload = encode_ratchet_payload(
+                msg, x3dh=x3dh, group=record.get("group"), kind="file"
+            )
+            check_size(
+                dumps(
+                    {
+                        "type": "envelope",
+                        "from": self.username,
+                        "to": peer,
+                        "payload": payload,
+                    }
+                )
+            )
+            updated = dict(record)
+            updated["enveloped"] = list(record.get("enveloped") or []) + [peer]
+            self.store.save_session_with_outbox(
+                peer,
+                state,
+                payload,
+                file_job=(str(record["local_id"]), updated),
+            )
+            record["enveloped"] = updated["enveloped"]
+            await self.request(
+                {
+                    "type": "envelope",
+                    "from": self.username,
+                    "to": peer,
+                    "payload": payload,
+                },
+                "envelope_ok",
+            )
+            self.store.delete_outbox(peer)
+            if x3dh is not None:
+                self.pending_x3dh.pop(peer, None)
+
     async def _send_one(
         self, peer: str, text: str, *, group: str | None, kind: str
     ) -> dict[str, Any]:
         lock = self._peer_locks.setdefault(peer, asyncio.Lock())
         async with lock:
-            pending_payload = self.store.load_outbox(peer)
-            if pending_payload is not None:
-                await self.request(
-                    {
-                        "type": "envelope",
-                        "from": self.username,
-                        "to": peer,
-                        "payload": pending_payload,
-                    },
-                    "envelope_ok",
-                )
-                self.store.delete_outbox(peer)
-                if pending_payload.get("x3dh") is not None:
-                    self.pending_x3dh.pop(peer, None)
+            await self._flush_outbox(peer)
             state = await self._ensure_session_for_send(peer)
             x3dh = self.pending_x3dh.get(peer)
             inner = json.dumps(
@@ -440,7 +694,7 @@ class ChatEngine:
         payload = env["payload"]
         group = payload.get("group")
         try:
-            text, verified_group, verified_kind = await self._decrypt_envelope(
+            text, verified_group, verified_kind, file_meta = await self._decrypt_envelope(
                 sender, payload
             )
             group = verified_group
@@ -460,6 +714,21 @@ class ChatEngine:
             self._fail(sender, group, str(exc))
             return
         self.last_error = None
+        if verified_kind == "file" and file_meta is not None:
+            record = {
+                "meta": meta_to_dict(file_meta),
+                "sender": sender,
+                "group": verified_group,
+                "caption": text,
+                "logged": False,
+            }
+            try:
+                await self._accept_incoming(record)
+            except AttachmentError:
+                self._fail(sender, verified_group, "GCM 失败")
+            except Exception:
+                self._fail(sender, verified_group, "文件下载失败")
+            return
         conv = f"group:{group}" if group else f"dm:{sender}"
         who = "系统" if verified_kind == "group_meta" else sender
         self.store.add_history(conv, who, text)
@@ -472,9 +741,100 @@ class ChatEngine:
             self.store.add_history(conv, "系统", phrase)
         self.inbox.put_nowait(Incoming(sender, "", group, "error", phrase))
 
+    async def _retry_incoming_files(self) -> None:
+        for _blob_id, record in self.store.list_incoming_files():
+            try:
+                await self._accept_incoming(record)
+            except AttachmentError:
+                blob_id = str(record.get("meta", {}).get("id") or _blob_id)
+                self.store.delete_incoming_file(blob_id)
+                self._fail(str(record.get("sender") or ""), record.get("group"), "GCM 失败")
+            except Exception:
+                self.last_error = "文件下载将在下次连接重试"
+
+    async def _accept_incoming(self, record: dict[str, Any]) -> None:
+        """同一份文件只下载一次。登录补拉和实时信封可能撞在一起。"""
+        blob_id = str(record.get("meta", {}).get("id") or "")
+        async with self._incoming_lock:
+            if blob_id in self._incoming_done:
+                return
+            self._incoming_done.add(blob_id)
+        try:
+            await self._finish_incoming(record)
+        except Exception:
+            async with self._incoming_lock:
+                self._incoming_done.discard(blob_id)
+            raise
+
+    async def _finish_incoming(self, record: dict[str, Any]) -> None:
+        meta = meta_from_dict(record["meta"])
+        blob_id = meta.file_id.hex()
+        self.store.save_incoming_file(blob_id, record)
+        try:
+            plain = await self._download_file(meta)
+        except AttachmentError:
+            self.store.delete_incoming_file(blob_id)
+            raise
+        rel = f"files/{blob_id}/{meta.name}"
+        dest = attachment_root(self.store.path) / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        partial = dest.with_name(dest.name + ".part")
+        partial.write_bytes(plain)
+        partial.replace(dest)
+        body = history_body(
+            name=meta.name,
+            mime=meta.mime,
+            size=meta.size,
+            sha256=meta.sha256,
+            rel_path=rel,
+            caption=str(record.get("caption") or ""),
+        )
+        fresh = not record.get("logged")
+        conv = (
+            f"group:{record['group']}"
+            if record.get("group")
+            else f"dm:{record['sender']}"
+        )
+        if fresh:
+            self.store.add_history(conv, str(record["sender"]), body)
+            record["logged"] = True
+            record["history"] = body
+            self.store.save_incoming_file(blob_id, record)
+        self.store.delete_incoming_file(blob_id)
+        try:
+            await self.request({"type": "blob_done", "id": blob_id}, "blob_done_ok")
+        except Exception:
+            self.last_error = "文件已收下，服务器清理将在下次重试"
+        if fresh:
+            await self.inbox.put(
+                Incoming(
+                    str(record["sender"]),
+                    display_text(body, self.store.path),
+                    record.get("group"),
+                    "file",
+                    attachment=attachment_view(self.store.path, body),
+                )
+            )
+
+    async def _download_file(self, meta: Any) -> bytes:
+        blob_id = meta.file_id.hex()
+        chunks: list[bytes] = []
+        for index in range(meta.chunks):
+            resp = await self.request(
+                {"type": "blob_fetch", "id": blob_id, "idx": index},
+                "blob_fetch_ok",
+            )
+            if resp.get("id") != blob_id or resp.get("idx") != index:
+                raise ProtocolError("分片编号对不上")
+            data = b64d(resp.get("data"))
+            if data is None:
+                raise ProtocolError("分片缺失")
+            chunks.append(data)
+        return open_bytes(meta, chunks)
+
     async def _decrypt_envelope(
         self, sender: str, payload: dict[str, Any]
-    ) -> tuple[str, str | None, str]:
+    ) -> tuple[str, str | None, str, Any]:
         ratchet_msg, init = decode_ratchet_payload(payload)
         new_identity = False
         consumed_opk: bytes | None = None
@@ -516,6 +876,7 @@ class ChatEngine:
             state = self.sessions[sender]
         plaintext, mk = decrypt(state, ratchet_msg)
         del mk
+        file_meta = None
         try:
             inner = json.loads(plaintext.decode("utf-8"))
             if not isinstance(inner, dict) or inner.get("v") != 1:
@@ -523,11 +884,26 @@ class ChatEngine:
             text = inner["text"]
             verified_group = inner.get("group")
             verified_kind = inner.get("kind", "chat")
+            if verified_kind not in {"chat", "group_meta", "file"}:
+                raise ValueError
             if not isinstance(text, str) or verified_group != payload.get("group"):
                 raise ValueError
             if verified_kind != (payload.get("kind") or "chat"):
                 raise ValueError
-        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            file_payload = inner.get("file")
+            if verified_kind == "file":
+                if not isinstance(file_payload, dict):
+                    raise ValueError
+                file_meta = meta_from_dict(file_payload)
+            elif file_payload is not None:
+                raise ValueError
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            KeyError,
+            ValueError,
+            AttachmentError,
+        ) as exc:
             raise GCMError("GCM 失败：消息语义元数据不一致") from exc
         if new_identity:
             self.sessions[sender] = state
@@ -548,7 +924,7 @@ class ChatEngine:
             except Exception:
                 # 明文已经认证成功且状态已提交；补池失败不能把消息伪装成解密失败。
                 self.last_error = "预密钥补充将在下次登录重试"
-        return text, verified_group, verified_kind
+        return text, verified_group, verified_kind, file_meta
 
     async def list_users(self) -> dict[str, Any]:
         return await self.request({"type": "list_users"}, "users")
@@ -605,7 +981,7 @@ def print_banner(engine: ChatEngine) -> None:
     console.print(Panel(body, title=PROJECT_NAME, border_style="cyan"))
     console.print(
         "[dim]/chat 名字  /fingerprint 名字  /group create 群名 成员…  "
-        "/group add 群名 新成员  /history  /users  /help  /quit[/dim]"
+        "/group add 群名 新成员  /file 路径  /history  /users  /help  /quit[/dim]"
     )
 
 
@@ -618,7 +994,7 @@ def _history_text(engine: ChatEngine) -> str:
         return "先选择会话"
     lines = []
     for sender, body, _ts in engine.store.get_history(conv):
-        lines.append(f"{sender}: {body}")
+        lines.append(f"{sender}: {display_text(body, engine.store.path)}")
     return "\n".join(lines) if lines else "这个会话还没有消息"
 
 
@@ -730,6 +1106,17 @@ async def handle_line(engine: ChatEngine, line: str) -> CommandResult:
         grid = "\n".join("  ".join(groups[i : i + 4]) for i in range(0, 16, 4))
         body = f"{name} 的 IK_sign 指纹\n用线下渠道核对这 16 组。不一致就不要继续聊。\n\n{grid}"
         return CommandResult(overlay=body, notice=f"{name} 指纹已显示")
+    if cmd == "/file":
+        pieces = line.split(maxsplit=1)
+        if len(pieces) != 2 or not pieces[1].strip():
+            raise ProtocolError("用法：/file 路径")
+        file_path = pieces[1].strip()
+        if engine.current_group:
+            await engine.send_file(file_path, group=engine.current_group)
+        else:
+            await engine.send_file(file_path)
+        engine.last_error = None
+        return CommandResult(notice=f"已发送文件 {Path(file_path).name}")
     if cmd == "/history":
         return CommandResult(overlay=_history_text(engine))
     if cmd == "/group" and len(parts) >= 2:

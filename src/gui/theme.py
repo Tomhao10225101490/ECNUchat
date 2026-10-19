@@ -280,7 +280,7 @@ def stylesheet(theme: Palette | str = "telegram") -> str:
     QWidget#header, QWidget#composer {{
         background: {p.bg_header};
     }}
-    QWidget#composer {{
+    QWidget#composer, QWidget#filePreview {{
         background: {p.bg_composer};
         border-top: 1px solid {p.hairline};
     }}

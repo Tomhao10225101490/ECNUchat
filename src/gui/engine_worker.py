@@ -10,6 +10,7 @@ from typing import Any
 
 from PySide6.QtCore import QThread, Signal
 
+from src.attachments import attachment_view, preview_text
 from src.client import ChatEngine
 from src.protocol import fingerprint
 
@@ -34,6 +35,7 @@ class EngineWorker(QThread):
     historyReady = Signal(str, object)
     searchReady = Signal(object)
     messageState = Signal(str, str, str)
+    fileProgress = Signal(str, int, int)
     actionResult = Signal(str, bool, object)
     connectionChanged = Signal(bool, str)
     fatalError = Signal(str)
@@ -93,6 +95,7 @@ class EngineWorker(QThread):
         db_path = config.db_path or f"data/{config.username}.db"
         self.connectionChanged.emit(False, "正在解锁本地保险库…")
         engine = ChatEngine.open(config.username, config.password, db_path)
+        engine.on_file_progress = self._emit_file_progress
         self.engine = engine
         outbox_before = set(engine.store.list_outbox_peers())
         self.connectionChanged.emit(False, "正在建立安全连接…")
@@ -124,7 +127,7 @@ class EngineWorker(QThread):
             {
                 "conv": conv,
                 "sender": sender,
-                "body": body,
+                "body": preview_text(body),
                 "ts": ts,
             }
             for conv, sender, body, ts in engine.store.recent_messages()
@@ -158,10 +161,14 @@ class EngineWorker(QThread):
                     "body": row[2],
                     "state": row[3],
                     "ts": row[4],
+                    "attachment": attachment_view(engine.store.path, row[2]),
                 }
                 for row in engine.store.pending_message_statuses()
             ],
         }
+
+    def _emit_file_progress(self, local_id: str, done: int, total: int) -> None:
+        self.fileProgress.emit(str(local_id), int(done), int(total))
 
     async def _pump_inbox(self) -> None:
         while not self._stopping:
@@ -201,7 +208,7 @@ class EngineWorker(QThread):
             try:
                 await self._handle(action, payload)
             except Exception as exc:
-                if action == "send":
+                if action in {"send", "send_file"}:
                     local_id = str(payload.get("local_id", ""))
                     if self.engine is not None:
                         self.engine.store.update_message_status(local_id, "failed")
@@ -214,10 +221,13 @@ class EngineWorker(QThread):
         engine = self.engine
         if action == "history":
             conv = str(payload["conv"])
-            rows = [
-                {"sender": s, "body": b, "ts": ts}
-                for s, b, ts in engine.store.get_history(conv, limit=1000)
-            ]
+            rows = []
+            for sender, body, ts in engine.store.get_history(conv, limit=1000):
+                row: dict[str, Any] = {"sender": sender, "body": body, "ts": ts}
+                view = attachment_view(engine.store.path, body)
+                if view is not None:
+                    row["attachment"] = view
+                rows.append(row)
             self.historyReady.emit(conv, rows)
         elif action == "search":
             rows = [
@@ -225,7 +235,7 @@ class EngineWorker(QThread):
                     "id": row[0],
                     "conv": row[1],
                     "sender": row[2],
-                    "body": row[3],
+                    "body": preview_text(row[3]),
                     "ts": row[4],
                 }
                 for row in engine.store.search_history(
@@ -237,6 +247,8 @@ class EngineWorker(QThread):
             self.searchReady.emit(rows)
         elif action == "send":
             await self._send(payload)
+        elif action == "send_file":
+            await self._send_file(payload)
         elif action == "open_chat":
             username = str(payload["username"])
             await engine.fetch_user(username)
@@ -284,6 +296,31 @@ class EngineWorker(QThread):
             await engine.send_text(text, group=conv[6:])
         else:
             raise ValueError("会话 ID 无效")
+        engine.store.update_message_status(local_id, "accepted")
+        self.messageState.emit(local_id, "accepted", "")
+        self.snapshot.emit(self._snapshot())
+
+    async def _send_file(self, payload: dict[str, Any]) -> None:
+        assert self.engine is not None
+        engine = self.engine
+        local_id = str(payload["local_id"])
+        conv = str(payload["conv"])
+        caption = str(payload.get("caption") or "")
+        label = caption or str(payload.get("name") or "文件")
+        engine.store.save_message_status(local_id, conv, label, "sending")
+        kwargs: dict[str, Any] = {
+            "caption": caption,
+            "local_id": local_id,
+            "filename": payload.get("name") or None,
+            "mime": payload.get("mime") or None,
+        }
+        if conv.startswith("dm:"):
+            kwargs["peer"] = conv[3:]
+        elif conv.startswith("group:"):
+            kwargs["group"] = conv[6:]
+        else:
+            raise ValueError("会话 ID 无效")
+        await engine.send_file(payload.get("path") or None, **kwargs)
         engine.store.update_message_status(local_id, "accepted")
         self.messageState.emit(local_id, "accepted", "")
         self.snapshot.emit(self._snapshot())

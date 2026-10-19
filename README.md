@@ -16,6 +16,7 @@ X25519 就是椭圆曲线 Diffie-Hellman；每条消息用 AES-256-GCM 加密并
 - [界面长什么样](#界面长什么样)
 - [五分钟跑起来](#五分钟跑起来)
 - [系统是怎么分层的](#系统是怎么分层的)
+- [图片、视频和文件](#图片视频和文件)
 - [每个人手上有哪些钥匙](#每个人手上有哪些钥匙)
 - [注册和登录在证明什么](#注册和登录在证明什么)
 - [第一条消息如何算出同一把 SK](#第一条消息如何算出同一把-sk)
@@ -148,9 +149,17 @@ Bob 和 Carol 各自收到发给自己的那一封。Carol 解不开 Alice 发�
 3. **密码模块**是 `src/x3dh.py`、`src/double_ratchet.py`、`src/prekeys.py`。这三个文件不许导入网络和数据库，输入输出都是字节，单测可以不连网。
 4. **服务器**是 `src/server.py` 加 `src/store.py` 里的 `ServerStore`。它保存公钥、签名、一次性预密钥池、群成员名单和离线信封，按用户名转发。它不解析出明文。
 
-网上跑的是带 `type` 的 JSON，单条超过 64KB 就拒绝。至少有这些类型：`register`、`login_challenge`、`login`、`upload_prekeys`、`fetch_bundle`、`envelope`、`error`。实际还会用到 `fetch_user`、`list_users`、`presence`、`group_create`、`group_add`、`group_info`、`group_update`。请求带 `request_id`，这样两个请求同时回来也不会拿错回包；聊天推送不带这个关联编号。
+网上跑的是带 `type` 的 JSON，单条超过 64KB 就拒绝。至少有这些类型：`register`、`login_challenge`、`login`、`upload_prekeys`、`fetch_bundle`、`envelope`、`error`。实际还会用到 `fetch_user`、`list_users`、`presence`、`group_create`、`group_add`、`group_info`、`group_update`，以及附件密文的 `blob_begin`、`blob_chunk`、`blob_finish`、`blob_fetch`、`blob_done`。请求带 `request_id`，这样两个请求同时回来也不会拿错回包；聊天推送不带这个关联编号。
 
 一条信封里给人看的头是明文的：当前棘轮公钥 `dh_pub`、本链序号 `n`、上一链发了多少条 `pn`，再加上 12 字节随机 nonce 和 base64 密文。本项目故意不再给头加一层加密，避免协议做跑偏。头公开不等于正文公开，因为没有消息钥匙就解不开 AES-256-GCM。
+
+## 图片、视频和文件
+
+文字还是一条棘轮消息。图片、视频和普通文件不塞进这封信，也不把 64KB 的帧上限抬高。客户端另外生成 32 字节文件钥匙，按 24KiB 一块做 AES-256-GCM。12 字节 nonce 的前 8 字节随机，后 4 字节是块序号；附加数据绑上文件编号、块序号和总块数，所以块不能对调，钥匙也不会拿到另一个文件上复用。明文 SHA-256、文件名、类型、大小和块数，跟这把钥匙一起放进现有内层 JSON（`kind` 为 `file`），再由这一条消息的 `MK` 加密。服务器只保存密文分片，日志里只有文件编号和长度。
+
+单文件上限是 32MiB，更大的在发送前就拒绝，避免把离线队列和内存撑满。24KiB 明文加上 16 字节认证标签，再做 base64，连同 JSON 头仍然小于 64KB，所以能走原来的 WebSocket 帧。群里同一份密文只上传一次，其他成员每人仍收一封自己的棘轮信封，信封里是同一把文件钥匙。收件人先验信封，再逐块验 GCM，拼完核对整文件摘要。任一块失败就整份丢掉，历史里不留半截文件。
+
+桌面端可以用回形针选文件，也可以粘贴图片或把文件拖进会话。终端用 `/file 路径`。收到的文件写在本机附件目录，历史里只留说明和摘要。
 
 ## 每个人手上有哪些钥匙
 

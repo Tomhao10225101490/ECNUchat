@@ -19,6 +19,7 @@ class FakeWorker(QObject):
     historyReady = Signal(str, object)
     searchReady = Signal(object)
     messageState = Signal(str, str, str)
+    fileProgress = Signal(str, int, int)
     actionResult = Signal(str, bool, object)
     connectionChanged = Signal(bool, str)
     fatalError = Signal(str)
@@ -246,4 +247,94 @@ def test_message_groups_only_show_avatar_on_the_first() -> None:
     assert group_flags[1][0] is False and group_flags[1][1] is False
     window.hide()
     qt.processEvents()
+
+
+def test_stage_send_and_paint_file_bubble(tmp_path) -> None:
+    from PySide6.QtGui import QImage
+
+    qt = app()
+    worker = FakeWorker()
+    window = MainWindow(worker, snapshot())
+    window.show()
+    window.open_conversation("dm:bob")
+    note = tmp_path / "课堂笔记.txt"
+    note.write_text("只在本机看到的字", encoding="utf-8")
+    window._stage_path(str(note))
+    qt.processEvents()
+    assert window.file_preview.isVisible()
+    assert "课堂笔记.txt" in window.file_preview.title.text()
+    window.file_preview.cleared.emit()
+    qt.processEvents()
+    assert window._staged is None
+    assert not window.file_preview.isVisible()
+
+    window._stage_path(str(note))
+    window.composer.setPlainText("看看附件")
+    window.send_current()
+    action, payload = worker.commands[-1]
+    assert action == "send_file"
+    assert payload["path"] == str(note)
+    assert payload["caption"] == "看看附件"
+    assert payload["local_id"] in window.bubbles
+    window._retry(payload["local_id"])
+    assert worker.commands[-1][0] == "send_file"
+    assert worker.commands[-1][1]["local_id"] == payload["local_id"]
+
+    image_path = tmp_path / "dot.png"
+    image = QImage(8, 8, QImage.Format.Format_RGB32)
+    image.fill(0xFF2266AA)
+    assert image.save(str(image_path))
+    window.show_history(
+        "dm:bob",
+        [
+            {
+                "sender": "alice",
+                "body": "看看",
+                "ts": time.time(),
+                "attachment": {
+                    "name": "dot.png",
+                    "mime": "image/png",
+                    "size": 12,
+                    "path": str(image_path),
+                    "media": "image",
+                    "caption": "看看",
+                    "sha256": "ab",
+                },
+            },
+            {
+                "sender": "bob",
+                "body": "",
+                "ts": time.time(),
+                "attachment": {
+                    "name": "clip.mp4",
+                    "mime": "video/mp4",
+                    "size": 4096,
+                    "path": str(tmp_path / "missing.mp4"),
+                    "media": "video",
+                    "caption": "",
+                    "sha256": "cd",
+                },
+            },
+            {
+                "sender": "bob",
+                "body": "",
+                "ts": time.time(),
+                "attachment": {
+                    "name": "spec.pdf",
+                    "mime": "application/pdf",
+                    "size": 99,
+                    "path": str(note),
+                    "media": "file",
+                    "caption": "",
+                    "sha256": "ef",
+                },
+            },
+        ],
+    )
+    qt.processEvents()
+    painted = [item for item in window.messages.items() if item.attachment]
+    assert [item.attachment["media"] for item in painted] == ["image", "video", "file"]
+    window.messages.viewport().repaint()
+    qt.processEvents()
+    window.hide()
 

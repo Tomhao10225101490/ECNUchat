@@ -184,6 +184,14 @@ class ClientStore:
                 state TEXT NOT NULL,
                 ts REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS file_jobs (
+                local_id TEXT PRIMARY KEY,
+                blob BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS incoming_files (
+                blob_id TEXT PRIMARY KEY,
+                blob BLOB NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_history_conv_id ON history(conv, id);
             CREATE INDEX IF NOT EXISTS idx_history_body ON history(body);
             """
@@ -258,7 +266,11 @@ class ClientStore:
         self.conn.commit()
 
     def save_session_with_outbox(
-        self, peer: str, state: RatchetState, payload: dict[str, Any]
+        self,
+        peer: str,
+        state: RatchetState,
+        payload: dict[str, Any],
+        file_job: tuple[str, dict[str, Any]] | None = None,
     ) -> None:
         state_blob = encrypt_blob(self._require_key(), _state_to_json(state))
         payload_blob = encrypt_blob(
@@ -267,6 +279,11 @@ class ClientStore:
                 "utf-8"
             ),
         )
+        job_blob = None
+        job_id = None
+        if file_job is not None:
+            job_id, record = file_job
+            job_blob = self._seal_json(record)
         with self.conn:
             self.conn.execute(
                 "INSERT OR REPLACE INTO sessions(peer, blob) VALUES(?, ?)",
@@ -276,6 +293,57 @@ class ClientStore:
                 "INSERT OR REPLACE INTO outbox(peer, blob) VALUES(?, ?)",
                 (peer, payload_blob),
             )
+            if job_id is not None:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO file_jobs(local_id, blob) VALUES(?, ?)",
+                    (job_id, job_blob),
+                )
+
+    def _seal_json(self, record: dict[str, Any]) -> bytes:
+        raw = json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        return encrypt_blob(self._require_key(), raw)
+
+    def _open_json(self, blob: bytes) -> dict[str, Any]:
+        value = json.loads(decrypt_blob(self._require_key(), blob).decode("utf-8"))
+        if not isinstance(value, dict):
+            raise RuntimeError("附件任务格式无效")
+        return value
+
+    def save_file_job(self, local_id: str, record: dict[str, Any]) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO file_jobs(local_id, blob) VALUES(?, ?)",
+                (local_id, self._seal_json(record)),
+            )
+
+    def load_file_job(self, local_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT blob FROM file_jobs WHERE local_id=?", (local_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return self._open_json(row[0])
+
+    def list_file_jobs(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute("SELECT blob FROM file_jobs").fetchall()
+        return [self._open_json(row[0]) for row in rows]
+
+    def save_incoming_file(self, blob_id: str, record: dict[str, Any]) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO incoming_files(blob_id, blob) VALUES(?, ?)",
+                (blob_id, self._seal_json(record)),
+            )
+
+    def delete_incoming_file(self, blob_id: str) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM incoming_files WHERE blob_id=?", (blob_id,))
+
+    def list_incoming_files(self) -> list[tuple[str, dict[str, Any]]]:
+        rows = self.conn.execute(
+            "SELECT blob_id, blob FROM incoming_files ORDER BY blob_id"
+        ).fetchall()
+        return [(str(row[0]), self._open_json(row[1])) for row in rows]
 
     def load_outbox(self, peer: str) -> dict[str, Any] | None:
         row = self.conn.execute(
@@ -374,7 +442,10 @@ class ClientStore:
                 """
                 INSERT INTO message_status(local_id, conv, body, state, ts)
                 VALUES(?,?,?,?,?)
-                ON CONFLICT(local_id) DO UPDATE SET state=excluded.state
+                ON CONFLICT(local_id) DO UPDATE SET
+                    conv=excluded.conv,
+                    body=excluded.body,
+                    state=excluded.state
                 """,
                 (local_id, conv, body, state, time.time()),
             )
@@ -501,6 +572,26 @@ class ServerStore:
                 group_name TEXT NOT NULL,
                 username TEXT NOT NULL,
                 PRIMARY KEY (group_name, username)
+            );
+            CREATE TABLE IF NOT EXISTS blobs (
+                id TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                chunks INTEGER NOT NULL,
+                recipients TEXT NOT NULL,
+                complete INTEGER NOT NULL DEFAULT 0,
+                created REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS blob_chunks (
+                blob_id TEXT NOT NULL,
+                idx INTEGER NOT NULL,
+                data BLOB NOT NULL,
+                PRIMARY KEY (blob_id, idx)
+            );
+            CREATE TABLE IF NOT EXISTS blob_downloads (
+                blob_id TEXT NOT NULL,
+                username TEXT NOT NULL,
+                PRIMARY KEY (blob_id, username)
             );
             """
         )
@@ -657,6 +748,98 @@ class ServerStore:
             (name, username),
         )
         self.conn.commit()
+
+    def blob_get(self, blob_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT owner, size, chunks, recipients, complete FROM blobs WHERE id=?",
+            (blob_id,),
+        ).fetchone()
+        if not row:
+            return None
+        recipients = json.loads(row[3])
+        return {
+            "owner": row[0],
+            "size": int(row[1]),
+            "chunks": int(row[2]),
+            "recipients": list(recipients),
+            "complete": bool(row[4]),
+        }
+
+    def blob_begin(
+        self,
+        blob_id: str,
+        owner: str,
+        size: int,
+        chunks: int,
+        recipients: list[str],
+    ) -> None:
+        encoded = json.dumps(recipients, ensure_ascii=False, separators=(",", ":"))
+        with self.conn:
+            current = self.blob_get(blob_id)
+            if current is not None:
+                return
+            self.conn.execute(
+                """
+                INSERT INTO blobs(id, owner, size, chunks, recipients, complete, created)
+                VALUES(?,?,?,?,?,0,?)
+                """,
+                (blob_id, owner, size, chunks, encoded, time.time()),
+            )
+
+    def blob_put_chunk(self, blob_id: str, index: int, data: bytes) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO blob_chunks(blob_id, idx, data) VALUES(?,?,?)
+                ON CONFLICT(blob_id, idx) DO UPDATE SET data=excluded.data
+                """,
+                (blob_id, index, data),
+            )
+
+    def blob_chunk(self, blob_id: str, index: int) -> bytes | None:
+        row = self.conn.execute(
+            "SELECT data FROM blob_chunks WHERE blob_id=? AND idx=?",
+            (blob_id, index),
+        ).fetchone()
+        if not row:
+            return None
+        return bytes(row[0])
+
+    def blob_chunk_count(self, blob_id: str) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM blob_chunks WHERE blob_id=?",
+            (blob_id,),
+        ).fetchone()
+        return int(row[0] if row else 0)
+
+    def blob_mark_complete(self, blob_id: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE blobs SET complete=1 WHERE id=?",
+                (blob_id,),
+            )
+
+    def blob_mark_download(self, blob_id: str, username: str) -> bool:
+        """记录收件人已取完。所有声明过的收件人都取完后删掉密文。"""
+        with self.conn:
+            info = self.blob_get(blob_id)
+            if info is None:
+                return False
+            self.conn.execute(
+                "INSERT OR IGNORE INTO blob_downloads(blob_id, username) VALUES(?,?)",
+                (blob_id, username),
+            )
+            rows = self.conn.execute(
+                "SELECT username FROM blob_downloads WHERE blob_id=?",
+                (blob_id,),
+            ).fetchall()
+            got = {row[0] for row in rows}
+            if set(info["recipients"]) <= got:
+                self.conn.execute("DELETE FROM blob_chunks WHERE blob_id=?", (blob_id,))
+                self.conn.execute("DELETE FROM blob_downloads WHERE blob_id=?", (blob_id,))
+                self.conn.execute("DELETE FROM blobs WHERE id=?", (blob_id,))
+                return True
+            return False
 
     def close(self) -> None:
         self.conn.close()

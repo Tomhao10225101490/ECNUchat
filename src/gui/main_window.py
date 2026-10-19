@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QEasingCurve, QEvent, QPoint, Qt, QTimer, QVariantAnimation
-from PySide6.QtGui import QAction, QCloseEvent, QGuiApplication, QKeySequence
+from PySide6.QtCore import QEasingCurve, QEvent, QPoint, Qt, QTimer, QUrl, QVariantAnimation, Signal
+from PySide6.QtGui import (
+    QAction,
+    QCloseEvent,
+    QDesktopServices,
+    QGuiApplication,
+    QImageReader,
+    QKeySequence,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
@@ -23,6 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 from src import PROJECT_ABSTRACT, PROJECT_NAME
+from src.attachments import MAX_FILE_BYTES, format_size, guess_mime, media_kind
 from src.gui.chat_view import ConvItem, ConversationList, MessageList, group_flags
 from src.gui.engine_worker import EngineWorker
 from src.gui.logic import (
@@ -104,6 +115,56 @@ class ConnectionBanner(QWidget):
 from PySide6.QtWidgets import QMainWindow  # noqa: E402
 
 
+class FilePreviewBar(QWidget):
+    """发送前的文件条：缩略图、名字、大小，可以取消。"""
+
+    cleared = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("filePreview")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 8, 12, 0)
+        layout.setSpacing(10)
+        self.thumb = QLabel()
+        self.thumb.setFixedSize(48, 48)
+        self.thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title = QLabel()
+        self.title.setObjectName("name")
+        self.meta = QLabel()
+        self.meta.setObjectName("secondary")
+        text = QVBoxLayout()
+        text.setSpacing(0)
+        text.addWidget(self.title)
+        text.addWidget(self.meta)
+        self.cancel = QPushButton("取消")
+        self.cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cancel.clicked.connect(self.cleared.emit)
+        layout.addWidget(self.thumb)
+        layout.addLayout(text, 1)
+        layout.addWidget(self.cancel)
+        self.hide()
+
+    def show_file(self, name: str, size_text: str, pixmap: QPixmap | None, kind: str) -> None:
+        self.title.setText(name)
+        self.meta.setText(size_text)
+        if pixmap is not None and not pixmap.isNull():
+            self.thumb.setPixmap(
+                pixmap.scaled(
+                    48,
+                    48,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+            self.thumb.setText("")
+        else:
+            self.thumb.setPixmap(QPixmap())
+            self.thumb.setText("视频" if kind == "video" else "文件")
+        self.show()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, worker: EngineWorker, initial: dict[str, Any]) -> None:
         super().__init__()
@@ -133,6 +194,7 @@ class MainWindow(QMainWindow):
         self._theme_from = self._palette
         self._fp: BlurDialog | None = None
         self._fp_value = ""
+        self._staged: dict[str, Any] | None = None
         self.setWindowTitle(f"{PROJECT_NAME} — {self.username}")
         self.resize(1180, 760)
         self.setMinimumSize(420, 560)
@@ -312,6 +374,8 @@ class MainWindow(QMainWindow):
         self.messages.copyRequested.connect(self._copy_item)
         self.messages.replyRequested.connect(self._reply_to)
         self.messages.deleteRequested.connect(self._delete_item)
+        self.messages.openRequested.connect(self._open_attachment)
+        self.messages.filesDropped.connect(self._on_files_dropped)
         self.new_button = NewMessageButton(self.chat_body)
         self.new_button.clicked.connect(self._jump_bottom)
         chat_layout.addWidget(self.chat_body, 1)
@@ -340,7 +404,11 @@ class MainWindow(QMainWindow):
         composer_layout.addWidget(self.attach_button, alignment=Qt.AlignmentFlag.AlignBottom)
         composer_layout.addWidget(self.input_shell, 1)
         composer_layout.addWidget(self.send_button, alignment=Qt.AlignmentFlag.AlignBottom)
+        self.file_preview = FilePreviewBar()
+        self.file_preview.cleared.connect(self._clear_staged)
+        chat_layout.addWidget(self.file_preview)
         chat_layout.addWidget(self.composer_bar)
+        self.composer.installEventFilter(self)
         self.splitter.addWidget(self.chat)
         self.splitter.setSizes([300, 860])
         self.splitter.setStretchFactor(0, 0)
@@ -415,6 +483,9 @@ class MainWindow(QMainWindow):
     def eventFilter(self, watched, event):
         if watched is self.chat_body and event.type() == QEvent.Type.Resize:
             self._place_overlays()
+        if watched is self.composer and event.type() == QEvent.Type.KeyPress:
+            if event.matches(QKeySequence.StandardKey.Paste) and self._paste_image():
+                return True
         return super().eventFilter(watched, event)
 
     def _place_overlays(self) -> None:
@@ -437,6 +508,7 @@ class MainWindow(QMainWindow):
         self.worker.actionResult.connect(self.on_action_result)
         self.worker.connectionChanged.connect(self.on_connection)
         self.worker.fatalError.connect(self.on_fatal)
+        self.worker.fileProgress.connect(self.on_file_progress)
 
     def apply_theme(self, theme: str, *, persist: bool = True, animate: bool = True) -> None:
         if theme not in PALETTES:
@@ -677,23 +749,48 @@ class MainWindow(QMainWindow):
         items: list[ChatItem] = []
         bubbles: dict[str, MessageBubble] = {}
         self._append_rows(items, rows, bubbles)
+        extra: list[dict[str, Any]] = []
         for pending in self.snapshot_data.get("pending", []):
             if pending.get("conv") != conv:
                 continue
             local_id = str(pending["local_id"])
-            self._append_rows(
-                items,
-                [
-                    {
-                        "sender": self.username,
-                        "body": pending["body"],
-                        "ts": pending["ts"],
-                        "state": pending["state"],
-                        "local_id": local_id,
-                    }
-                ],
-                bubbles,
+            matched = None
+            for item in items:
+                if item.local_id == local_id:
+                    matched = item
+                    break
+                if (
+                    matched is None
+                    and item.kind == "message"
+                    and item.mine
+                    and not item.local_id
+                    and item.raw == str(pending.get("body") or "")
+                ):
+                    matched = item
+            if matched is not None:
+                matched.state = str(pending.get("state") or matched.state)
+                matched.local_id = local_id
+                matched.key = local_id
+                pending_attachment = pending.get("attachment")
+                if matched.attachment is None and isinstance(pending_attachment, dict):
+                    matched.attachment = pending_attachment
+                    matched.body = str(pending_attachment.get("caption") or matched.body)
+                if matched.attachment and matched.state == "sending":
+                    matched.progress = max(0.0, matched.progress)
+                bubbles[local_id] = MessageBubble(matched, self._on_bubble_state, self)
+                continue
+            extra.append(
+                {
+                    "sender": self.username,
+                    "body": pending["body"],
+                    "ts": pending["ts"],
+                    "state": pending["state"],
+                    "local_id": local_id,
+                    "attachment": pending.get("attachment"),
+                }
             )
+        if extra:
+            self._append_rows(items, extra, bubbles)
         finalize_groups(items, is_group=conv.startswith("group:"))
         self.bubbles = bubbles
         self.messages.set_messages(items)
@@ -713,31 +810,36 @@ class MainWindow(QMainWindow):
             raw = str(row.get("body", ""))
             ts = float(row.get("ts") or time.time())
             local_id = str(row.get("local_id") or "")
+            attachment = row.get("attachment") if isinstance(row.get("attachment"), dict) else None
+            shown = str(attachment.get("caption") or "") if attachment else raw
             if hidden_key(conv, sender, ts, raw) in self._hidden:
                 continue
-            kind = classify_row(sender, raw, str(row.get("kind") or ""))
+            kind = classify_row(sender, shown, str(row.get("kind") or ""))
             day = day_label(ts)
             if not items or items[-1].kind == "date" or getattr(self, "_last_day", None) != day:
                 if not items or items[-1].body != day or items[-1].kind != "date":
                     if not any(item.kind == "date" and item.body == day for item in items):
                         items.append(ChatItem(kind="date", body=day, ts=ts, key=f"date:{day}:{len(items)}"))
-            author, quote, text = ("", "", raw)
+            author, quote, text = ("", "", shown)
             if kind == "message":
-                author, quote, text = decode_reply(raw)
+                author, quote, text = decode_reply(shown)
+            state = str(row.get("state") or "accepted")
             item = ChatItem(
                 sender=sender,
                 mine=sender == self.username and kind == "message",
                 ts=ts,
                 kind=kind,
-                body=text if kind == "message" else raw,
+                body=text if kind == "message" else shown,
                 raw=raw,
-                state=str(row.get("state") or "accepted"),
+                state=state,
                 local_id=local_id,
                 reply_author=author,
                 reply_text=quote,
-                hint=security_hint(raw) or "",
+                hint=security_hint(shown) or "",
                 key=local_id or f"{ts:.3f}:{sender}:{len(items)}:{raw[:12]}",
                 anim=1.0,
+                attachment=attachment,
+                progress=0.0 if attachment and state == "sending" else -1.0,
             )
             items.append(item)
             if local_id:
@@ -753,6 +855,7 @@ class MainWindow(QMainWindow):
         kind: str = "chat",
         local_id: str | None = None,
         animate: bool = True,
+        attachment: dict[str, Any] | None = None,
     ) -> MessageBubble:
         mapped = classify_row(sender, body, "error" if kind == "error" else kind)
         if kind == "error":
@@ -774,6 +877,8 @@ class MainWindow(QMainWindow):
             hint=security_hint(body) or "",
             key=local_id or uuid.uuid4().hex,
             anim=0.0 if animate and not self._reduce_motion else 1.0,
+            attachment=attachment,
+            progress=0.0 if attachment and state == "sending" else -1.0,
         )
         items = [existing for existing in self.messages.items() if existing.kind != "typing"]
         day = day_label(timestamp)
@@ -858,6 +963,9 @@ class MainWindow(QMainWindow):
         fade.start()
 
     def send_current(self) -> None:
+        if self._staged:
+            self._send_staged()
+            return
         text = self.composer.toPlainText()
         if not self.current_conv or not text.strip():
             if not self.current_conv and text.strip():
@@ -890,6 +998,16 @@ class MainWindow(QMainWindow):
         if state == "failed":
             self.show_toast(f"发送失败：{error}", error=True)
 
+    def on_file_progress(self, local_id: str, done: int, total: int) -> None:
+        bubble = self.bubbles.get(local_id)
+        if bubble is None or total <= 0:
+            return
+        bubble.item.progress = max(0.0, min(1.0, done / total))
+        self.messages.delegate.invalidate()
+        row = self._row_of(bubble.item)
+        if row >= 0:
+            self.messages.notify_row(row)
+
     def on_incoming(self, item: dict[str, Any]) -> None:
         if item.get("kind") == "presence":
             return
@@ -899,11 +1017,26 @@ class MainWindow(QMainWindow):
         group = item.get("group")
         sender = str(item.get("sender") or "")
         conv = f"group:{group}" if group else (f"dm:{sender}" if sender and sender != "系统" else "")
-        body = str(item.get("text") or item.get("error") or "")
+        attachment = item.get("attachment") if isinstance(item.get("attachment"), dict) else None
+        if item.get("error"):
+            attachment = None
+            body = str(item.get("error") or "")
+        elif attachment:
+            body = str(attachment.get("caption") or "")
+        else:
+            body = str(item.get("text") or "")
         kind = "error" if item.get("error") else str(item.get("kind") or "chat")
         if conv and conv == self.current_conv:
             self.set_peer_typing(False)
-            self.append_message(sender, body, time.time(), mine=False, kind=kind, animate=True)
+            self.append_message(
+                sender,
+                body,
+                time.time(),
+                mine=False,
+                kind=kind,
+                animate=True,
+                attachment=attachment,
+            )
         elif conv:
             if conv not in self._mutes:
                 self.unread[conv] = self.unread.get(conv, 0) + 1
@@ -1137,12 +1270,12 @@ class MainWindow(QMainWindow):
         self.toast_timer.start(3200)
 
     def _refresh_send(self) -> None:
-        has_text = bool(self.composer.toPlainText().strip())
+        has_text = bool(self.composer.toPlainText().strip() or self._staged)
         self.send_button.set_active(has_text, animate=not self._reduce_motion)
         self.send_button.setToolTip("发送" if has_text else "语音")
 
     def _send_or_mic(self) -> None:
-        if self.composer.toPlainText().strip():
+        if self.composer.toPlainText().strip() or self._staged:
             self.send_current()
         else:
             self.show_toast("按住说话还没做，先发文字吧")
@@ -1162,9 +1295,227 @@ class MainWindow(QMainWindow):
         self._refresh_send()
 
     def _attach(self) -> None:
-        path, _selected = QFileDialog.getOpenFileName(self, "选择附件")
+        path, _selected = QFileDialog.getOpenFileName(
+            self,
+            "选择附件",
+            "",
+            "所有文件 (*.*);;图片 (*.png *.jpg *.jpeg *.gif *.webp *.bmp);;视频 (*.mp4 *.mov *.mkv *.webm *.avi)",
+        )
         if path:
-            self.show_toast("这一版只加密文字，文件还发不出去")
+            self._stage_path(path)
+
+    def _on_files_dropped(self, paths: object) -> None:
+        chosen = [str(path) for path in paths] if isinstance(paths, list) else []
+        if len(chosen) > 1:
+            self.show_toast("一次发一个文件")
+        if chosen:
+            self._stage_path(chosen[0])
+
+    def _stage_path(self, path: str) -> None:
+        file_path = Path(path)
+        if not file_path.is_file():
+            self.show_toast("找不到这个文件", error=True)
+            return
+        size = file_path.stat().st_size
+        if size > MAX_FILE_BYTES:
+            self.show_toast("文件超过 32MiB，发送前已拒绝", error=True)
+            return
+        mime = guess_mime(file_path.name)
+        kind = media_kind(mime)
+        pixmap = None
+        if kind == "image":
+            reader = QImageReader(str(file_path))
+            reader.setAutoTransform(True)
+            image = reader.read()
+            if not image.isNull():
+                pixmap = QPixmap.fromImage(image)
+        self._staged = {
+            "path": str(file_path),
+            "name": file_path.name,
+            "size": size,
+            "mime": mime,
+            "media": kind,
+        }
+        self.file_preview.show_file(file_path.name, format_size(size), pixmap, kind)
+        self._refresh_send()
+
+    def _clear_staged(self) -> None:
+        self._staged = None
+        self.file_preview.hide()
+        self._refresh_send()
+
+    def _paste_image(self) -> bool:
+        clipboard = QGuiApplication.clipboard()
+        mime = clipboard.mimeData()
+        if mime is None or not mime.hasImage():
+            return False
+        if mime.hasText() and mime.text().strip():
+            return False
+        image = clipboard.image()
+        if image.isNull():
+            return False
+        folder = Path(tempfile.gettempdir()) / "ecnuchat-paste"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{uuid.uuid4().hex}.png"
+        if not image.save(str(path), "PNG"):
+            return False
+        self._stage_path(str(path))
+        return True
+
+    def _send_staged(self) -> None:
+        staged = self._staged
+        if staged is None:
+            return
+        if not self.current_conv:
+            self.show_toast("先选择一个聊天")
+            return
+        caption = self.composer.toPlainText().strip()
+        if self.reply_bar.author:
+            caption = encode_reply(
+                self.reply_bar.author,
+                self.reply_bar.quote,
+                caption or str(staged["name"]),
+            )
+            self.reply_bar.clear_reply()
+        if len(caption.encode("utf-8")) > 2000:
+            self.show_toast("附件说明过长", error=True)
+            return
+        self.composer.clear()
+        self.emoji_panel.hide()
+        local_id = uuid.uuid4().hex
+        attachment = {
+            "name": staged["name"],
+            "mime": staged["mime"],
+            "size": staged["size"],
+            "path": staged["path"],
+            "media": staged["media"],
+            "caption": caption,
+            "sha256": "",
+        }
+        self.append_message(
+            self.username,
+            caption,
+            time.time(),
+            mine=True,
+            state="sending",
+            local_id=local_id,
+            attachment=attachment,
+        )
+        path = str(staged["path"])
+        name = str(staged["name"])
+        mime = str(staged["mime"])
+        self._clear_staged()
+        self.worker.submit(
+            "send_file",
+            local_id=local_id,
+            conv=self.current_conv,
+            path=path,
+            caption=caption,
+            name=name,
+            mime=mime,
+        )
+        self._refresh_send()
+
+    def _open_attachment(self, item: ChatItem) -> None:
+        attachment = item.attachment or {}
+        path = str(attachment.get("path") or "")
+        if not path or not Path(path).is_file():
+            self.show_toast("文件不在本机", error=True)
+            return
+        kind = str(attachment.get("media") or "file")
+        if kind == "image":
+            self._show_image(path, str(attachment.get("name") or "图片"))
+        elif kind == "video":
+            self._show_video(path, str(attachment.get("name") or "视频"))
+        else:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _show_image(self, path: str, title: str) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(720, 540)
+        layout = QVBoxLayout(dialog)
+        label = QLabel()
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pixmap = QPixmap(path)
+        if not pixmap.isNull():
+            screen = self.screen()
+            limit = 960
+            if screen is not None:
+                limit = int(screen.availableGeometry().width() * 0.7)
+            label.setPixmap(
+                pixmap.scaled(
+                    limit,
+                    int(limit * 0.75),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+        layout.addWidget(label)
+        dialog.exec()
+
+    def _show_video(self, path: str, title: str) -> None:
+        try:
+            from PySide6.QtCore import QObject
+            from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
+        except Exception:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(760, 480)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(0, 0, 0, 0)
+        screen = QLabel("正在打开视频")
+        screen.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        screen.setStyleSheet("background:#111111;color:#dddddd;")
+        screen.setMinimumSize(480, 270)
+        layout.addWidget(screen)
+        player = QMediaPlayer(dialog)
+        audio = QAudioOutput(dialog)
+        sink = QVideoSink(dialog)
+        player.setAudioOutput(audio)
+        player.setVideoSink(sink)
+        latest: dict[str, QPixmap] = {}
+
+        def paint_latest() -> None:
+            pix = latest.get("frame")
+            if pix is None or pix.isNull():
+                return
+            screen.setPixmap(
+                pix.scaled(
+                    max(1, screen.width()),
+                    max(1, screen.height()),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.FastTransformation,
+                )
+            )
+
+        def on_frame(frame) -> None:
+            image = frame.toImage()
+            if image.isNull():
+                return
+            latest["frame"] = QPixmap.fromImage(image)
+            paint_latest()
+
+        def on_error(_code, text: str) -> None:
+            if "frame" not in latest:
+                screen.setText(text or "视频打不开")
+
+        class _Refit(QObject):
+            def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
+                if watched is screen and event.type() == QEvent.Type.Resize:
+                    paint_latest()
+                return False
+
+        refit = _Refit(dialog)
+        screen.installEventFilter(refit)
+        sink.videoFrameChanged.connect(on_frame)
+        player.errorOccurred.connect(on_error)
+        player.setSource(QUrl.fromLocalFile(path))
+        player.play()
+        dialog.finished.connect(player.stop)
+        dialog.exec()
 
     def _more_menu(self) -> None:
         from PySide6.QtWidgets import QMenu
@@ -1218,6 +1569,19 @@ class MainWindow(QMainWindow):
         if bubble is None or not self.current_conv:
             return
         bubble.set_state("sending")
+        attachment = bubble.item.attachment
+        if attachment:
+            bubble.item.progress = 0.0
+            self.worker.submit(
+                "send_file",
+                local_id=local_id,
+                conv=self.current_conv,
+                path=str(attachment.get("path") or ""),
+                caption=str(attachment.get("caption") or bubble.item.body),
+                name=str(attachment.get("name") or ""),
+                mime=str(attachment.get("mime") or ""),
+            )
+            return
         self.worker.submit("send", local_id=local_id, conv=self.current_conv, text=bubble.item.raw)
 
     def _copy_item(self, item: ChatItem) -> None:
@@ -1225,9 +1589,10 @@ class MainWindow(QMainWindow):
         self.show_toast("已复制")
 
     def _reply_to(self, item: ChatItem) -> None:
-        if not item.body:
+        quote = item.body or str((item.attachment or {}).get("name") or "")
+        if not quote:
             return
-        self.reply_bar.set_reply(item.sender or "对方", item.body)
+        self.reply_bar.set_reply(item.sender or "对方", quote)
         self.composer.setFocus()
 
     def _delete_item(self, item: ChatItem) -> None:

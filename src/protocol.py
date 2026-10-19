@@ -30,6 +30,11 @@ PROTOCOL_TYPES = (
     "upload_prekeys",
     "fetch_bundle",
     "envelope",
+    "blob_begin",
+    "blob_chunk",
+    "blob_finish",
+    "blob_fetch",
+    "blob_done",
     "error",
 )
 

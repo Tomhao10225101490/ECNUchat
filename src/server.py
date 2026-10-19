@@ -7,12 +7,14 @@ import asyncio
 import contextvars
 import logging
 import os
+import re
 import sys
 from typing import Any
 
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from src.attachments import AttachmentError, cipher_len, expected_chunks
 from src.prekeys import verify_spk
 from src.protocol import (
     MAX_GROUP_MEMBERS,
@@ -141,6 +143,16 @@ class ChatServer:
             await self.on_group_add(ws, username, msg)
         elif typ == "group_info":
             await self.on_group_info(ws, msg)
+        elif typ == "blob_begin":
+            await self.on_blob_begin(ws, username, msg)
+        elif typ == "blob_chunk":
+            await self.on_blob_chunk(ws, username, msg)
+        elif typ == "blob_finish":
+            await self.on_blob_finish(ws, username, msg)
+        elif typ == "blob_fetch":
+            await self.on_blob_fetch(ws, username, msg)
+        elif typ == "blob_done":
+            await self.on_blob_done(ws, username, msg)
         else:
             await ws.send(dumps(error_msg(f"未知类型 {typ}")))
         return username
@@ -439,6 +451,194 @@ class ChatServer:
                 }
             )
         )
+
+    def _blob_id(self, msg: dict[str, Any]) -> str | None:
+        blob_id = msg.get("id")
+        if isinstance(blob_id, str) and re.fullmatch(r"[0-9a-f]{32}", blob_id):
+            return blob_id
+        return None
+
+    async def on_blob_begin(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
+        blob_id = self._blob_id(msg)
+        if blob_id is None:
+            await ws.send(dumps(error_msg("文件编号无效")))
+            return
+        size = msg.get("size")
+        chunks = msg.get("chunks")
+        if (
+            isinstance(size, bool)
+            or not isinstance(size, int)
+            or isinstance(chunks, bool)
+            or not isinstance(chunks, int)
+        ):
+            await ws.send(dumps(error_msg("文件大小无效")))
+            return
+        try:
+            expect = expected_chunks(size)
+        except AttachmentError:
+            await ws.send(dumps(error_msg("文件超过 32MiB")))
+            return
+        if chunks != expect:
+            await ws.send(dumps(error_msg("分片数量不对")))
+            return
+        recipients = msg.get("recipients")
+        if (
+            not isinstance(recipients, list)
+            or not recipients
+            or len(recipients) > MAX_GROUP_MEMBERS
+        ):
+            await ws.send(dumps(error_msg("收件人无效")))
+            return
+        clean: list[str] = []
+        for name in recipients:
+            if not isinstance(name, str):
+                await ws.send(dumps(error_msg("收件人无效")))
+                return
+            try:
+                validate_username(name)
+            except ProtocolError:
+                await ws.send(dumps(error_msg("收件人无效")))
+                return
+            if not self.store.user_exists(name):
+                await ws.send(dumps(error_msg(f"收件人 {name} 未注册")))
+                return
+            clean.append(name)
+        clean = sorted(set(clean))
+        current = self.store.blob_get(blob_id)
+        if current is not None:
+            if (
+                current["owner"] != username
+                or current["size"] != size
+                or current["chunks"] != chunks
+                or set(current["recipients"]) != set(clean)
+            ):
+                await ws.send(dumps(error_msg("文件参数不一致")))
+                return
+        else:
+            self.store.blob_begin(blob_id, username, size, chunks, clean)
+        log.info(
+            "blob_begin user=%s id=%s bytes=%s chunks=%s",
+            username,
+            blob_id,
+            size,
+            chunks,
+        )
+        await ws.send(dumps({"type": "blob_begin_ok", "id": blob_id}))
+
+    async def on_blob_chunk(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
+        blob_id = self._blob_id(msg)
+        if blob_id is None:
+            await ws.send(dumps(error_msg("文件编号无效")))
+            return
+        info = self.store.blob_get(blob_id)
+        if info is None or info["owner"] != username:
+            await ws.send(dumps(error_msg("无权上传")))
+            return
+        index = msg.get("idx")
+        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < info["chunks"]:
+            await ws.send(dumps(error_msg("分片序号无效")))
+            return
+        encoded = msg.get("data")
+        data = b64d(encoded) if isinstance(encoded, str) else None
+        if data is None:
+            await ws.send(dumps(error_msg("分片无效")))
+            return
+        try:
+            expect = cipher_len(info["size"], info["chunks"], index)
+        except AttachmentError:
+            await ws.send(dumps(error_msg("分片无效")))
+            return
+        if len(data) != expect:
+            await ws.send(dumps(error_msg("分片长度不对")))
+            return
+        if info["complete"]:
+            old = self.store.blob_chunk(blob_id, index)
+            if old != data:
+                await ws.send(dumps(error_msg("文件已完成，不能改分片")))
+                return
+        else:
+            self.store.blob_put_chunk(blob_id, index, data)
+        log.info(
+            "blob_chunk user=%s id=%s idx=%s bytes=%s",
+            username,
+            blob_id,
+            index,
+            len(data),
+        )
+        await ws.send(dumps({"type": "blob_chunk_ok", "id": blob_id, "idx": index}))
+
+    async def on_blob_finish(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
+        blob_id = self._blob_id(msg)
+        if blob_id is None:
+            await ws.send(dumps(error_msg("文件编号无效")))
+            return
+        info = self.store.blob_get(blob_id)
+        if info is None or info["owner"] != username:
+            await ws.send(dumps(error_msg("无权上传")))
+            return
+        if not info["complete"]:
+            if self.store.blob_chunk_count(blob_id) != info["chunks"]:
+                await ws.send(dumps(error_msg("分片不齐")))
+                return
+            for index in range(info["chunks"]):
+                if self.store.blob_chunk(blob_id, index) is None:
+                    await ws.send(dumps(error_msg("分片不齐")))
+                    return
+            self.store.blob_mark_complete(blob_id)
+        log.info("blob_finish user=%s id=%s bytes=%s", username, blob_id, info["size"])
+        await ws.send(dumps({"type": "blob_finish_ok", "id": blob_id}))
+
+    async def on_blob_fetch(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
+        blob_id = self._blob_id(msg)
+        if blob_id is None:
+            await ws.send(dumps(error_msg("文件编号无效")))
+            return
+        info = self.store.blob_get(blob_id)
+        if info is None or not info["complete"]:
+            await ws.send(dumps(error_msg("文件尚未传完")))
+            return
+        if username not in info["recipients"]:
+            await ws.send(dumps(error_msg("无权下载")))
+            return
+        index = msg.get("idx")
+        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < info["chunks"]:
+            await ws.send(dumps(error_msg("分片序号无效")))
+            return
+        data = self.store.blob_chunk(blob_id, index)
+        if data is None:
+            await ws.send(dumps(error_msg("分片缺失")))
+            return
+        frame = dumps(
+            {
+                "type": "blob_fetch_ok",
+                "id": blob_id,
+                "idx": index,
+                "data": b64e(data),
+            }
+        )
+        check_size(frame)
+        log.info(
+            "blob_fetch user=%s id=%s idx=%s bytes=%s",
+            username,
+            blob_id,
+            index,
+            len(data),
+        )
+        await ws.send(frame)
+
+    async def on_blob_done(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
+        blob_id = self._blob_id(msg)
+        if blob_id is None:
+            await ws.send(dumps(error_msg("文件编号无效")))
+            return
+        info = self.store.blob_get(blob_id)
+        if info is not None and username not in info["recipients"]:
+            await ws.send(dumps(error_msg("无权下载")))
+            return
+        if info is not None:
+            self.store.blob_mark_download(blob_id, username)
+        log.info("blob_done user=%s id=%s", username, blob_id)
+        await ws.send(dumps({"type": "blob_done_ok", "id": blob_id}))
 
     async def _fanout_control(self, members: list[str], raw: str) -> None:
         for m in members:
