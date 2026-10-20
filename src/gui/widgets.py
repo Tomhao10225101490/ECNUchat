@@ -27,12 +27,10 @@ from PySide6.QtGui import (
     QImage,
     QInputMethodEvent,
     QKeyEvent,
-    QLinearGradient,
     QPainter,
     QPainterPath,
     QPaintEvent,
     QPalette,
-    QPen,
     QPixmap,
 )
 from PySide6.QtWidgets import (
@@ -50,7 +48,7 @@ from PySide6.QtWidgets import (
 
 from src.gui.icons import paint_icon
 from src.gui.logic import composer_enter_action, composer_target_height
-from src.gui.theme import FONT_FAMILIES, RADIUS_BUBBLE, RADIUS_BUTTON, Palette
+from src.gui.theme import FONT_FAMILIES, RADIUS_BUTTON, Palette
 
 
 def ui_font(px: int, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
@@ -62,13 +60,23 @@ def ui_font(px: int, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
     return font
 
 
+AVATAR_COLORS = (
+    "#E17076",
+    "#7BC862",
+    "#E5CA77",
+    "#65AADD",
+    "#EE7AAE",
+    "#A695E7",
+    "#6EC9CB",
+    "#FAA774",
+)
+AVATAR_RING = "#17212B"
+
+
 def avatar_colors(name: str) -> tuple[QColor, QColor]:
     digest = hashlib.sha256((name or "?").encode("utf-8")).digest()
-    hue = digest[0] / 255 * 360
-    hue2 = (hue + 32 + digest[1] % 28) % 360
-    first = QColor.fromHsv(int(hue) % 360, 148, 206)
-    second = QColor.fromHsv(int(hue2) % 360, 168, 158)
-    return first, second
+    color = QColor(AVATAR_COLORS[digest[0] % len(AVATAR_COLORS)])
+    return color, color
 
 
 def avatar_letter(name: str, group: bool = False) -> str:
@@ -80,18 +88,6 @@ def avatar_letter(name: str, group: bool = False) -> str:
     return text[:1].upper()
 
 
-_PRESET_COLORS = (
-    ("#5B8DEF", "#2F5BD0"),
-    ("#34C759", "#1F8A3B"),
-    ("#FF9F0A", "#C93400"),
-    ("#BF5AF2", "#7A2FC2"),
-    ("#FF375F", "#A10E32"),
-    ("#64D2FF", "#0A6F96"),
-    ("#FFD60A", "#A07D00"),
-    ("#AC8E68", "#5C4632"),
-)
-
-
 def preset_colors(token: str) -> tuple[QColor, QColor] | None:
     if not str(token).startswith("preset:"):
         return None
@@ -99,10 +95,10 @@ def preset_colors(token: str) -> tuple[QColor, QColor] | None:
         index = int(str(token).split(":", 1)[1])
     except ValueError:
         return None
-    if index < 0 or index >= len(_PRESET_COLORS):
+    if index < 0 or index >= len(AVATAR_COLORS):
         return None
-    left, right = _PRESET_COLORS[index]
-    return QColor(left), QColor(right)
+    color = QColor(AVATAR_COLORS[index])
+    return color, color
 
 
 def image_from_avatar(token: str) -> QImage | None:
@@ -129,12 +125,13 @@ def paint_avatar(
     online_color: str = "#31D158",
     pixel: int = 15,
     avatar: str = "",
+    ring: str = "",
 ) -> None:
     painter.save()
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     photo = image_from_avatar(avatar)
     colors = preset_colors(avatar)
-    start, end = colors or avatar_colors("group:" + name if group else name)
+    start, _end = colors or avatar_colors("group:" + name if group else name)
     painter.setPen(Qt.PenStyle.NoPen)
     if photo is not None:
         painter.setBrush(QColor("#D0D5DD"))
@@ -145,20 +142,18 @@ def paint_avatar(
         painter.drawImage(rect, photo)
         painter.setClipping(False)
     else:
-        gradient = QLinearGradient(rect.topLeft(), rect.bottomRight())
-        gradient.setColorAt(0, start)
-        gradient.setColorAt(1, end)
-        painter.setBrush(gradient)
+        painter.setBrush(start)
         painter.drawEllipse(rect)
         painter.setPen(QColor("#FFFFFF"))
         font = ui_font(max(12, int(pixel)), QFont.Weight.DemiBold)
         painter.setFont(font)
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, avatar_letter(name, group))
     if online:
+        painter.setPen(Qt.PenStyle.NoPen)
         radius = max(4.5, rect.width() * 0.14)
         center_x = rect.right() - radius * 0.55
         center_y = rect.bottom() - radius * 0.55
-        painter.setBrush(QColor("#FFFFFF"))
+        painter.setBrush(QColor(ring or AVATAR_RING))
         painter.drawEllipse(QPointF(center_x, center_y), radius + 1.7, radius + 1.7)
         painter.setBrush(QColor(online_color))
         painter.drawEllipse(QPointF(center_x, center_y), radius, radius)
@@ -174,6 +169,7 @@ class AvatarWidget(QWidget):
         self.group = False
         self.avatar = ""
         self.online_color = "#31D158"
+        self.ring = ""
 
     def set_person(
         self,
@@ -200,6 +196,7 @@ class AvatarWidget(QWidget):
             online_color=self.online_color,
             pixel=max(13, int(self.width() * 0.38)),
             avatar=self.avatar,
+            ring=self.ring,
         )
 
 
@@ -301,7 +298,8 @@ class NavButton(IconButton):
         self._badge = 0
         self._accent = "#3390EC"
         self._soft = "#1A3C5C"
-        self._muted = "#8B9BB4"
+        self._muted = "#708499"
+        self._badge_color = "#3390EC"
 
     def set_active(self, active: bool) -> None:
         self.active = active
@@ -311,30 +309,28 @@ class NavButton(IconButton):
         self._badge = count
         self.update()
 
-    def apply_nav(self, accent: str, soft: str, muted: str, hover: str) -> None:
+    def apply_nav(self, accent: str, soft: str, muted: str, hover: str, badge: str = "#3390EC") -> None:
         self._accent = accent
         self._soft = soft
         self._muted = muted
+        self._badge_color = badge
         self.apply_colors(accent if self.active else muted, hover)
 
     def paintEvent(self, event: QPaintEvent) -> None:
         self._fg = self._accent if self.active else self._muted
-        if self.active:
-            painter = QPainter(self)
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(self._soft))
-            painter.drawRoundedRect(QRectF(6, 4, self.width() - 12, self.height() - 8), 12, 12)
-            painter.setBrush(QColor(self._accent))
-            painter.drawRoundedRect(QRectF(4, 14, 3, self.height() - 28), 1.5, 1.5)
-            painter.end()
         super().paintEvent(event)
         if self._badge > 0:
             painter = QPainter(self)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor("#FF3B30"))
-            painter.drawEllipse(QRectF(self.width() - 16, 8, 10, 10))
+            painter.setBrush(QColor(self._badge_color))
+            badge = QRectF(self.width() - 18, 6, 16, 16)
+            painter.drawEllipse(badge)
+            painter.setPen(QColor("#FFFFFF"))
+            painter.setFont(ui_font(9, QFont.Weight.DemiBold))
+            label = "9+" if self._badge > 9 else str(self._badge)
+            painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, label)
             painter.end()
 
 
@@ -567,7 +563,7 @@ class ComposerEdit(QTextEdit):
         self.setAcceptRichText(False)
         self.setFrameStyle(QFrame.Shape.NoFrame)
         self.setFont(ui_font(15))
-        self.setPlaceholderText("输入消息…")
+        self.setPlaceholderText("消息")
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.document().setDocumentMargin(0)
@@ -710,7 +706,7 @@ class ReplyBar(QWidget):
 
 
 class InputShell(QWidget):
-    """看得见边框的圆角输入区，焦点时描边过渡到主题色。"""
+    """圆角输入区，只有填充，没有描边。"""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -764,16 +760,10 @@ class InputShell(QWidget):
     def paintEvent(self, _event: QPaintEvent) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        border = _mix(self._border, self._accent, self._focus)
-        rect = QRectF(1, 1, self.width() - 2, self.height() - 2)
+        rect = QRectF(0, 0, self.width(), self.height())
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(self._fill))
-        painter.drawRoundedRect(rect, RADIUS_BUBBLE, RADIUS_BUBBLE)
-        pen = QPen(QColor(border))
-        pen.setWidthF(1.0 + self._focus)
-        painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), RADIUS_BUBBLE, RADIUS_BUBBLE)
+        painter.drawRoundedRect(rect, 21, 21)
 
 
 def _mix(start: str, end: str, t: float) -> str:
@@ -840,33 +830,11 @@ class EmptyState(QWidget):
         if palette is None:
             return
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-        cx = self.width() / 2
-        cy = self.height() / 2 - 36
-        painter.setPen(Qt.PenStyle.NoPen)
-        blob = QColor(palette.accent)
-        blob.setAlpha(28 if not palette.light else 36)
-        painter.setBrush(blob)
-        painter.drawEllipse(QRectF(cx - 74, cy - 58, 148, 148))
-        bubble = QColor(palette.bubble_in if palette.light else palette.bubble_out)
-        painter.setBrush(bubble)
-        painter.drawRoundedRect(QRectF(cx - 78, cy - 18, 92, 48), 16, 16)
-        painter.setBrush(QColor(palette.bubble_out))
-        painter.drawRoundedRect(QRectF(cx - 8, cy + 22, 96, 40), 16, 16)
-        dpr = self.devicePixelRatioF()
-        paint_icon(painter, "lock", QRectF(cx - 11, cy - 46, 22, 22), palette.accent, dpr)
-        painter.setPen(QColor(palette.text))
-        painter.setFont(ui_font(17, QFont.Weight.DemiBold))
-        title = "选择一个聊天开始加密对话"
-        painter.drawText(QRectF(24, cy + 84, self.width() - 48, 28), Qt.AlignmentFlag.AlignCenter, title)
-        painter.setPen(QColor(palette.text_secondary))
-        painter.setFont(ui_font(13))
-        painter.drawText(
-            QRectF(24, cy + 114, self.width() - 48, 22),
-            Qt.AlignmentFlag.AlignCenter,
-            "消息只在本机解密，服务器看不到正文",
-        )
+        color = "#FFFFFF" if palette.name == "telegram_light" else palette.text_secondary
+        painter.setPen(QColor(color))
+        painter.setFont(ui_font(15))
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "选择一个聊天")
 
 
 class EmojiPanel(QFrame):
@@ -882,7 +850,7 @@ class EmojiPanel(QFrame):
         super().__init__(parent)
         from PySide6.QtWidgets import QPushButton
 
-        self.setObjectName("card")
+        self.setObjectName("popup")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(2)
@@ -932,7 +900,7 @@ class NewMessageButton(QAbstractButton):
             self.hide()
 
     def apply_palette(self, palette: Palette) -> None:
-        self._fill = palette.bg_card
+        self._fill = palette.bg_menu
         self._text = palette.text
         self._accent = palette.accent
         self.update()
@@ -959,7 +927,7 @@ class NewMessageButton(QAbstractButton):
         painter.setBrush(shadow)
         painter.drawRoundedRect(QRectF(2, 3, self.width() - 4, self.height() - 4), 18, 18)
         painter.setBrush(QColor(self._fill))
-        painter.setPen(QPen(QColor(self._accent), 1))
+        painter.setPen(Qt.PenStyle.NoPen)
         painter.drawRoundedRect(QRectF(1, 1, self.width() - 2, self.height() - 4), 16, 16)
         painter.setPen(QColor(self._accent))
         painter.setFont(ui_font(13, QFont.Weight.DemiBold))
@@ -1043,7 +1011,7 @@ class BlurDialog(QFrame):
     def apply_palette(self, palette: Palette) -> None:
         self._palette = palette
         self.card.setStyleSheet(
-            f"QFrame#card {{ background: {palette.bg_card}; border: 1px solid {palette.border}; border-radius: 12px; }}"
+            f"QFrame#card {{ background: {palette.bg_menu}; border: none; border-radius: 10px; }}"
         )
 
     def present(self) -> None:

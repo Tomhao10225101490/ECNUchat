@@ -106,16 +106,12 @@ class ConversationDelegate(QStyledItemDelegate):
         selected = index.row() == self.view.currentIndex().row()
         hovered = index.row() == self.view.hover_row and not selected
         if hovered:
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(self.palette.bg_hover))
-            painter.drawRoundedRect(rect.adjusted(8, 2, -8, -2), 12, 12)
+            painter.fillRect(rect, QColor(self.palette.bg_hover))
         if selected:
             selection = self.view.selection_rect_for(index.row(), rect)
             if selection is not None:
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QColor(self.palette.bg_selected))
                 painter.setClipRect(rect)
-                painter.drawRoundedRect(selection, 12, 12)
+                painter.fillRect(selection, QColor(self.palette.bg_selected))
                 painter.setClipping(False)
         text_color = self.palette.text_selected if selected else self.palette.text
         muted = self.palette.text_selected if selected else self.palette.text_secondary
@@ -131,6 +127,7 @@ class ConversationDelegate(QStyledItemDelegate):
             online_color=self.palette.online,
             pixel=18,
             avatar=item.avatar,
+            ring=self.palette.bg_selected if selected else self.palette.bg_side,
         )
         left = 76
         right_pad = 16
@@ -181,9 +178,12 @@ class ConversationDelegate(QStyledItemDelegate):
         if item.unread:
             badge = QRectF(rect.right() - right_pad - badge_w, rect.y() + 38, badge_w, 18)
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(self.palette.unread))
+            if selected:
+                painter.setBrush(QColor("#FFFFFF"))
+            else:
+                painter.setBrush(QColor(self.palette.unread))
             painter.drawRoundedRect(badge, 9, 9)
-            painter.setPen(QColor("#FFFFFF"))
+            painter.setPen(QColor(self.palette.unread if selected else "#FFFFFF"))
             painter.setFont(self.font_badge)
             painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, label)
         painter.restore()
@@ -298,7 +298,7 @@ class ConversationList(QListView):
             rect_a = self.visualRect(self._model.index(self._from_row))
             if rect_a.isValid():
                 y = rect_a.y() + (rect_b.y() - rect_a.y()) * self._progress
-        self._sel_rect = QRectF(8, y + 2, max(10, self.viewport().width() - 16), ROW_HEIGHT - 4)
+        self._sel_rect = QRectF(0, y, max(10, self.viewport().width()), ROW_HEIGHT)
         self.viewport().update()
 
     def selection_rect_for(self, _row: int, row_rect: QRect) -> QRectF | None:
@@ -621,6 +621,7 @@ class MessageDelegate(QStyledItemDelegate):
                 group=False,
                 online_color=self.palette.online,
                 pixel=14,
+                ring=self.palette.bg_chat,
             )
         if item.show_name:
             painter.setFont(self.font_name)

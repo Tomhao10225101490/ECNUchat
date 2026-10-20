@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src import PROJECT_ABSTRACT, PROJECT_NAME
+from src import PROJECT_NAME
 from src.gui.app_pages import DropboxBoard, MomentBoard, MomentComposer, PeoplePanel, ProfileSettings
 from src.gui.chat_view import ConvItem, ConversationList, MessageList, group_flags
 from src.gui.engine_worker import EngineWorker
@@ -42,6 +42,7 @@ from src.gui.logic import (
     security_hint,
 )
 from src.gui.theme import PALETTES, THEME_LABELS, THEME_ORDER, Palette, lerp_palette, next_theme, stylesheet
+import src.gui.widgets as gui_widgets
 from src.gui.widgets import (
     ElideLabel,
     AvatarWidget,
@@ -213,8 +214,12 @@ class MainWindow(QMainWindow):
         self.sidebar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.sidebar.setMinimumWidth(260)
         side = QVBoxLayout(self.sidebar)
-        side.setContentsMargins(12, 12, 8, 8)
-        side.setSpacing(8)
+        side.setContentsMargins(0, 0, 0, 0)
+        side.setSpacing(0)
+        top = QWidget()
+        top_layout = QVBoxLayout(top)
+        top_layout.setContentsMargins(14, 10, 10, 6)
+        top_layout.setSpacing(8)
         header = QHBoxLayout()
         self.side_title = QLabel("聊天")
         self.side_title.setObjectName("title")
@@ -224,11 +229,11 @@ class MainWindow(QMainWindow):
         self.compose_button.setToolTip("新建")
         self.compose_button.clicked.connect(self._compose_menu)
         header.addWidget(self.compose_button)
-        side.addLayout(header)
-
-        search_row = QHBoxLayout()
+        top_layout.addLayout(header)
         self.search_icon = IconButton("search", 32, 16)
+        self.search_icon.hide()
         self.search = QLineEdit()
+        self.search.setObjectName("searchField")
         self.search.setPlaceholderText("搜索")
         self.search.setClearButtonEnabled(True)
         self.search_timer = QTimer(self)
@@ -236,9 +241,8 @@ class MainWindow(QMainWindow):
         self.search_timer.setInterval(200)
         self.search_timer.timeout.connect(self.perform_search)
         self.search.textChanged.connect(lambda: self.search_timer.start())
-        search_row.addWidget(self.search_icon)
-        search_row.addWidget(self.search, 1)
-        side.addLayout(search_row)
+        top_layout.addWidget(self.search)
+        side.addWidget(top)
 
         self.page_chat = QWidget()
         chat_page = QVBoxLayout(self.page_chat)
@@ -288,15 +292,13 @@ class MainWindow(QMainWindow):
         )
         self.page_box = QWidget()
         box_layout = QVBoxLayout(self.page_box)
-        box_layout.setContentsMargins(0, 8, 8, 8)
-        box_hint = QLabel("先打开一个会话，再把不超过 24KB 的文件投进去。右边是本机已经解开的文件。")
-        box_hint.setWordWrap(True)
-        box_hint.setObjectName("secondary")
+        box_layout.setContentsMargins(8, 4, 8, 8)
+        box_layout.setSpacing(0)
         box_button = QPushButton("投递到当前会话")
-        box_button.setObjectName("primary")
+        box_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        box_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         box_button.clicked.connect(self._attach)
-        box_layout.addWidget(box_hint)
-        box_layout.addWidget(box_button)
+        box_layout.addWidget(box_button, alignment=Qt.AlignmentFlag.AlignLeft)
         box_layout.addStretch(1)
 
         self.page_settings = self._build_settings()
@@ -330,7 +332,7 @@ class MainWindow(QMainWindow):
         self.header = QWidget()
         self.header.setObjectName("header")
         self.header.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.header.setFixedHeight(64)
+        self.header.setFixedHeight(56)
         header_layout = QHBoxLayout(self.header)
         header_layout.setContentsMargins(12, 8, 12, 8)
         header_layout.setSpacing(10)
@@ -340,12 +342,13 @@ class MainWindow(QMainWindow):
         self.back_button.hide()
         header_layout.addWidget(self.back_button)
         self.header_avatar = AvatarWidget(40)
+        self.header_avatar.hide()
         header_layout.addWidget(self.header_avatar)
         titles = QVBoxLayout()
         titles.setSpacing(0)
-        self.chat_title = ElideLabel("选择一个会话")
+        self.chat_title = ElideLabel("")
         self.chat_title.setObjectName("title")
-        self.chat_subtitle = ElideLabel("消息只在本机解密")
+        self.chat_subtitle = ElideLabel("")
         self.chat_subtitle.setObjectName("secondary")
         typing_row = QHBoxLayout()
         typing_row.setSpacing(6)
@@ -360,10 +363,12 @@ class MainWindow(QMainWindow):
         titles.addWidget(self.chat_title)
         titles.addLayout(typing_row)
         header_layout.addLayout(titles, 1)
-        self.info_button = QPushButton("身份指纹")
+        self.info_button = QPushButton("指纹")
         self.info_button.setObjectName("ghost")
         self.info_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.info_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.info_button.setEnabled(False)
+        self.info_button.hide()
         self.info_button.clicked.connect(self.show_fingerprint)
         header_layout.addWidget(self.info_button)
         self.more_button = IconButton("more", 36, 18)
@@ -407,6 +412,7 @@ class MainWindow(QMainWindow):
         composer_layout.addWidget(self.attach_button, alignment=Qt.AlignmentFlag.AlignBottom)
         composer_layout.addWidget(self.input_shell, 1)
         composer_layout.addWidget(self.send_button, alignment=Qt.AlignmentFlag.AlignBottom)
+        self.composer_bar.hide()
         chat_layout.addWidget(self.composer_bar)
         self.moment_board = MomentBoard()
         self.moment_board.likeClicked.connect(
@@ -463,22 +469,29 @@ class MainWindow(QMainWindow):
     def _build_settings(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(4, 8, 8, 8)
-        layout.setSpacing(12)
+        layout.setContentsMargins(0, 4, 0, 12)
+        layout.setSpacing(2)
         hint = QLabel("主题")
-        hint.setObjectName("secondary")
+        hint.setObjectName("section")
+        hint.setContentsMargins(16, 4, 16, 0)
         layout.addWidget(hint)
+        theme_row = QHBoxLayout()
+        theme_row.setContentsMargins(12, 0, 12, 4)
+        theme_row.setSpacing(2)
         self.theme_buttons: dict[str, QPushButton] = {}
         for name in THEME_ORDER:
             button = QPushButton(THEME_LABELS[name])
             button.setCursor(Qt.CursorShape.PointingHandCursor)
-            button.setFixedHeight(40)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.setFixedHeight(32)
             button.clicked.connect(lambda _checked=False, theme=name: self.apply_theme(theme))
             self.theme_buttons[name] = button
-            layout.addWidget(button)
+            theme_row.addWidget(button)
+        theme_row.addStretch(1)
+        layout.addLayout(theme_row)
         row = QHBoxLayout()
+        row.setContentsMargins(16, 6, 16, 6)
         label = QLabel("减少动态效果")
-        label.setObjectName("secondary")
         self.motion_switch = ToggleSwitch()
         self.motion_switch.setChecked(self._reduce_motion)
         self.motion_switch.toggled.connect(self.set_reduce_motion)
@@ -486,18 +499,14 @@ class MainWindow(QMainWindow):
         row.addStretch(1)
         row.addWidget(self.motion_switch)
         layout.addLayout(row)
-        about = QLabel(PROJECT_NAME)
-        about.setWordWrap(True)
-        about.setObjectName("name")
-        abstract = QLabel(PROJECT_ABSTRACT)
-        abstract.setWordWrap(True)
-        abstract.setObjectName("caption")
-        layout.addWidget(about)
-        layout.addWidget(abstract)
         self.profile_settings = ProfileSettings()
         self.profile_settings.profileSaved.connect(self._save_profile)
         self.profile_settings.privacySaved.connect(self._save_privacy)
         layout.addWidget(self.profile_settings)
+        about = QLabel(PROJECT_NAME)
+        about.setObjectName("caption")
+        about.setContentsMargins(16, 18, 16, 0)
+        layout.addWidget(about)
         layout.addStretch(1)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -577,8 +586,11 @@ class MainWindow(QMainWindow):
         self.new_button.apply_palette(palette)
         self.send_button.apply_palette(palette)
         self.motion_switch.apply_palette(palette)
+        gui_widgets.AVATAR_RING = palette.bg_side
         self.self_avatar.online_color = palette.online
         self.header_avatar.online_color = palette.online
+        self.self_avatar.ring = palette.bg_nav
+        self.header_avatar.ring = palette.bg_header
         self.self_avatar.update()
         self.header_avatar.update()
         self.typing_dots.set_color(palette.text_secondary)
@@ -593,17 +605,17 @@ class MainWindow(QMainWindow):
             (self.nav_box, self.page_box.isVisible()),
             (self.nav_settings, self.page_settings.isVisible()),
         ):
-            nav.apply_nav(palette.accent, palette.accent_soft, muted, hover)
+            nav.apply_nav(palette.accent, palette.accent_soft, muted, hover, palette.unread)
             nav.set_active(active)
         self.profile_settings.apply_palette(palette.accent, palette.accent_text)
         for name, button in self.theme_buttons.items():
             if name == self.theme or (palette.name == name):
                 button.setStyleSheet(
-                    f"QPushButton {{ background:{palette.accent}; color:{palette.accent_text}; border-radius:10px; }}"
+                    f"QPushButton {{ background:{palette.accent_soft}; color:{palette.accent}; border:none; border-radius:8px; font-weight:600; }}"
                 )
             else:
                 button.setStyleSheet(
-                    f"QPushButton {{ background:{palette.bg_input}; color:{palette.text}; border:1px solid {palette.border}; border-radius:10px; }}"
+                    f"QPushButton {{ background:transparent; color:{palette.text_secondary}; border:none; border-radius:8px; }}"
                 )
         if self._fp is not None:
             self._fp.apply_palette(palette)
@@ -623,8 +635,6 @@ class MainWindow(QMainWindow):
             self.main_stack.setCurrentWidget(self.chat)
         self.compose_button.setVisible(index in (0, 1))
         self.search.setVisible(index in (0, 1))
-        self.search_icon.setVisible(index in (0, 1))
-        self.search.setPlaceholderText("搜索用户名或昵称" if index == 1 else "搜索")
         if index in (2, 3, 4) and not self._compact:
             self.splitter.setSizes([400, 740])
         if self._palette:
@@ -809,9 +819,15 @@ class MainWindow(QMainWindow):
 
     def update_header(self) -> None:
         if not self.current_conv:
-            self.chat_title.setText("选择一个会话")
-            self.chat_subtitle.setText("消息只在本机解密")
+            self.chat_title.setText("")
+            self.chat_subtitle.setText("")
+            self.header_avatar.hide()
+            self.info_button.hide()
+            self.composer_bar.hide()
             return
+        self.header_avatar.show()
+        self.info_button.show()
+        self.composer_bar.show()
         conv = self.current_conv
         if conv.startswith("dm:"):
             peer = conv[3:]
@@ -831,7 +847,7 @@ class MainWindow(QMainWindow):
             name = conv[6:]
             members = self.snapshot_data.get("groups", {}).get(name, [])
             self.chat_title.setText(name)
-            self.chat_subtitle.setText(f"{len(members)} 位成员 · 逐成员双棘轮加密")
+            self.chat_subtitle.setText(f"{len(members)} 位成员")
             self.header_avatar.set_person(name, group=True)
         self._sync_typing_visibility()
 
@@ -1223,7 +1239,7 @@ class MainWindow(QMainWindow):
             self._fp_title = QLabel()
             self._fp_title.setObjectName("title")
             self._fp_title.setWordWrap(True)
-            self._fp_hint = QLabel("请用线下渠道核对这 16 组。不一致就不要继续聊。")
+            self._fp_hint = QLabel("线下核对这 16 组。")
             self._fp_hint.setObjectName("secondary")
             self._fp_hint.setWordWrap(True)
             self._fp_body = QLabel()
@@ -1303,12 +1319,11 @@ class MainWindow(QMainWindow):
 
     def show_toast(self, text: str, error: bool = False) -> None:
         palette = self._palette
-        bg = palette.danger_bg if error else palette.bg_card
+        bg = palette.danger_bg if error else palette.bg_menu
         fg = palette.danger_text if error else palette.text
-        border = palette.danger if error else palette.border
         self.toast.setText(text)
         self.toast.setStyleSheet(
-            f"background:{bg};color:{fg};border:1px solid {border};border-radius:12px;padding:10px 16px;font-size:13px;"
+            f"background:{bg};color:{fg};border:none;border-radius:10px;padding:8px 14px;font-size:13px;"
         )
         self.toast.adjustSize()
         self.toast.move(

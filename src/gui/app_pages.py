@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.gui.widgets import AvatarWidget
+from src.gui.widgets import AVATAR_COLORS, AvatarWidget
 from src.social import POST_VISIBILITIES
 
 
@@ -53,16 +53,28 @@ def _clock(ts: float) -> str:
 
 def _section(text: str) -> QLabel:
     label = QLabel(text)
-    label.setObjectName("caption")
+    label.setObjectName("section")
+    label.setContentsMargins(12, 10, 12, 2)
     return label
 
 
-def _card() -> tuple[QFrame, QVBoxLayout]:
+def _button(text: str, kind: str = "") -> QPushButton:
+    button = QPushButton(text)
+    button.setCursor(Qt.CursorShape.PointingHandCursor)
+    button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    if kind:
+        button.setProperty("kind", kind)
+        button.style().unpolish(button)
+        button.style().polish(button)
+    return button
+
+
+def _row() -> tuple[QFrame, QVBoxLayout]:
     frame = QFrame()
-    frame.setObjectName("card")
+    frame.setObjectName("row")
     layout = QVBoxLayout(frame)
-    layout.setContentsMargins(12, 10, 12, 10)
-    layout.setSpacing(6)
+    layout.setContentsMargins(12, 8, 8, 8)
+    layout.setSpacing(2)
     return frame, layout
 
 
@@ -100,8 +112,8 @@ class PeoplePanel(QWidget):
         super().__init__(parent)
         self._host = QWidget()
         self._body = QVBoxLayout(self._host)
-        self._body.setContentsMargins(0, 0, 4, 12)
-        self._body.setSpacing(8)
+        self._body.setContentsMargins(0, 0, 0, 12)
+        self._body.setSpacing(0)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(_scroll(self._host))
@@ -144,14 +156,15 @@ class PeoplePanel(QWidget):
             self._body.addWidget(_section("未通过"))
             for item in rejected:
                 self._body.addWidget(self._rejected_card(item))
-        self._body.addWidget(_section("好友" if friends else "还没有好友"))
-        if not friends and not incoming and not results:
-            empty = QLabel("搜索用户名发出申请。对方同意之前，单聊发不出去。")
-            empty.setWordWrap(True)
+        if friends:
+            self._body.addWidget(_section("好友"))
+            for item in friends:
+                self._body.addWidget(self._friend_card(item))
+        elif not incoming and not results:
+            empty = QLabel("还没有好友")
             empty.setObjectName("secondary")
+            empty.setContentsMargins(12, 8, 12, 8)
             self._body.addWidget(empty)
-        for item in friends:
-            self._body.addWidget(self._friend_card(item))
         if blocked:
             self._body.addWidget(_section("黑名单"))
             for item in blocked:
@@ -182,14 +195,14 @@ class PeoplePanel(QWidget):
         return row
 
     def _incoming_card(self, item: dict[str, Any]) -> QWidget:
-        frame, layout = _card()
+        frame, layout = _row()
         username = str(item["username"])
         greeting = str(item.get("greeting") or "请求添加你为好友")
         layout.addLayout(self._person_row(item, greeting))
         buttons = QHBoxLayout()
-        accept = QPushButton("同意")
+        accept = _button("同意")
         accept.setObjectName(f"accept-{username}")
-        reject = QPushButton("拒绝")
+        reject = _button("拒绝", "quiet")
         reject.setObjectName(f"reject-{username}")
         accept.clicked.connect(lambda _checked=False, name=username: self.acceptClicked.emit(name))
         reject.clicked.connect(lambda _checked=False, name=username: self.rejectClicked.emit(name))
@@ -201,35 +214,34 @@ class PeoplePanel(QWidget):
         return frame
 
     def _outgoing_card(self, item: dict[str, Any]) -> QWidget:
-        frame, layout = _card()
+        frame, layout = _row()
         username = str(item["username"])
         layout.addLayout(self._person_row(item, str(item.get("greeting") or "等待对方同意")))
-        cancel = QPushButton("取消申请")
+        cancel = _button("取消申请", "quiet")
         cancel.setObjectName(f"cancel-{username}")
         cancel.clicked.connect(lambda _checked=False, name=username: self.cancelClicked.emit(name))
         layout.addWidget(cancel, alignment=Qt.AlignmentFlag.AlignLeft)
         return frame
 
     def _rejected_card(self, item: dict[str, Any]) -> QWidget:
-        frame, layout = _card()
+        frame, layout = _row()
         username = str(item["username"])
         layout.addLayout(self._person_row(item, "对方没有通过"))
-        again = QPushButton("再次申请")
+        again = _button("再次申请")
         again.setObjectName(f"again-{username}")
         again.clicked.connect(lambda _checked=False, name=username: self.addClicked.emit(name))
         layout.addWidget(again, alignment=Qt.AlignmentFlag.AlignLeft)
         return frame
 
     def _friend_card(self, item: dict[str, Any]) -> QWidget:
-        frame, layout = _card()
+        frame, layout = _row()
         username = str(item["username"])
         bio = str(item.get("bio") or item.get("username") or "")
         layout.addLayout(self._person_row(item, bio))
         buttons = QHBoxLayout()
-        message = QPushButton("发消息")
-        message.setObjectName("primary")
-        remove = QPushButton("删除")
-        block = QPushButton("拉黑")
+        message = _button("发消息")
+        remove = _button("删除", "quiet")
+        block = _button("拉黑", "danger")
         message.clicked.connect(lambda _checked=False, name=username: self.messageClicked.emit(name))
         remove.clicked.connect(lambda _checked=False, name=username: self.removeClicked.emit(name))
         block.clicked.connect(lambda _checked=False, name=username: self.blockClicked.emit(name))
@@ -241,17 +253,17 @@ class PeoplePanel(QWidget):
         return frame
 
     def _blocked_card(self, item: dict[str, Any]) -> QWidget:
-        frame, layout = _card()
+        frame, layout = _row()
         username = str(item["username"])
         layout.addLayout(self._person_row(item, "已拉黑"))
-        unblock = QPushButton("取消拉黑")
+        unblock = _button("取消拉黑")
         unblock.setObjectName(f"unblock-{username}")
         unblock.clicked.connect(lambda _checked=False, name=username: self.unblockClicked.emit(name))
         layout.addWidget(unblock, alignment=Qt.AlignmentFlag.AlignLeft)
         return frame
 
     def _result_card(self, item: dict[str, Any]) -> QWidget:
-        frame, layout = _card()
+        frame, layout = _row()
         username = str(item["username"])
         relation = str(item.get("relation") or "none")
         labels = {
@@ -264,17 +276,17 @@ class PeoplePanel(QWidget):
         }
         layout.addLayout(self._person_row(item, labels.get(relation, relation)))
         if relation == "none":
-            add = QPushButton("添加")
+            add = _button("添加")
             add.setObjectName(f"add-{username}")
             add.clicked.connect(lambda _checked=False, name=username: self.addClicked.emit(name))
             layout.addWidget(add, alignment=Qt.AlignmentFlag.AlignLeft)
         elif relation == "incoming":
-            accept = QPushButton("同意")
+            accept = _button("同意")
             accept.setObjectName(f"accept-{username}")
             accept.clicked.connect(lambda _checked=False, name=username: self.acceptClicked.emit(name))
             layout.addWidget(accept, alignment=Qt.AlignmentFlag.AlignLeft)
         elif relation == "friend":
-            message = QPushButton("发消息")
+            message = _button("发消息")
             message.clicked.connect(lambda _checked=False, name=username: self.messageClicked.emit(name))
             layout.addWidget(message, alignment=Qt.AlignmentFlag.AlignLeft)
         return frame
@@ -286,13 +298,10 @@ class MomentComposer(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 4, 4, 8)
+        layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(8)
-        hint = QLabel("朋友圈保存在服务器上，好友看到的赞和评论才是同一份。聊天和投递的文件仍然只在你和对方的设备上解开。")
-        hint.setWordWrap(True)
-        hint.setObjectName("secondary")
-        layout.addWidget(hint)
         self.body = QTextEdit()
+        self.body.setObjectName("plain")
         self.body.setPlaceholderText("这一刻的想法…")
         self.body.setFixedHeight(96)
         layout.addWidget(self.body)
@@ -304,10 +313,9 @@ class MomentComposer(QWidget):
         self.image_label.setObjectName("caption")
         layout.addWidget(self.image_label)
         row = QHBoxLayout()
-        self.image_button = QPushButton("加图片")
-        self.clear_image = QPushButton("去掉图片")
-        self.publish = QPushButton("发布")
-        self.publish.setObjectName("primary")
+        self.image_button = _button("加图片", "quiet")
+        self.clear_image = _button("去掉图片", "quiet")
+        self.publish = _button("发布")
         self.image_button.clicked.connect(self._pick)
         self.clear_image.clicked.connect(self._clear_image)
         self.publish.clicked.connect(self._publish)
@@ -362,20 +370,11 @@ class MomentBoard(QWidget):
         self.setObjectName("chat")
         self._host = QWidget()
         self._body = QVBoxLayout(self._host)
-        self._body.setContentsMargins(28, 20, 28, 24)
-        self._body.setSpacing(12)
+        self._body.setContentsMargins(0, 0, 0, 0)
+        self._body.setSpacing(0)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        title = QLabel("朋友圈")
-        title.setObjectName("title")
-        title.setContentsMargins(28, 18, 28, 0)
-        note = QLabel("这里的文字和图片在服务器上，用来让点赞、评论对每个好友保持一致。")
-        note.setObjectName("secondary")
-        note.setWordWrap(True)
-        note.setContentsMargins(28, 0, 28, 0)
-        outer.addWidget(title)
-        outer.addWidget(note)
         outer.addWidget(_scroll(self._host), 1)
         self.set_moments([])
 
@@ -385,15 +384,16 @@ class MomentBoard(QWidget):
         self._moments = list(moments)
         _clear(self._body)
         if not moments:
-            empty = QLabel("好友和你还没有发布。")
+            empty = QLabel("还没有动态")
             empty.setObjectName("secondary")
+            empty.setContentsMargins(16, 18, 16, 8)
             self._body.addWidget(empty)
         for item in moments:
             self._body.addWidget(self._card(item))
         self._body.addStretch(1)
 
     def _card(self, item: dict[str, Any]) -> QWidget:
-        frame, layout = _card()
+        frame, layout = _row()
         moment_id = str(item.get("id") or "")
         head = QHBoxLayout()
         avatar = AvatarWidget(36)
@@ -404,7 +404,7 @@ class MomentBoard(QWidget):
         text = QVBoxLayout()
         text.setSpacing(0)
         name = QLabel(str(item.get("display_name") or item.get("author") or ""))
-        name.setObjectName("name")
+        name.setObjectName("link")
         meta = "仅自己可见" if item.get("visibility") == "private" else "好友可见"
         when = QLabel(f"{_clock(float(item.get('created') or 0))} · {meta}")
         when.setObjectName("caption")
@@ -430,13 +430,13 @@ class MomentBoard(QWidget):
             waiting.setObjectName("caption")
             layout.addWidget(waiting)
         likes = list(item.get("likes") or [])
-        like = QPushButton(("已赞" if item.get("liked") else "赞") + f" {len(likes)}")
+        like = _button(("已赞" if item.get("liked") else "赞") + f" {len(likes)}")
         like.setObjectName(f"like-{moment_id}")
         like.clicked.connect(lambda _checked=False, mid=moment_id: self.likeClicked.emit(mid))
         actions = QHBoxLayout()
         actions.addWidget(like)
         if item.get("mine"):
-            delete = QPushButton("删除")
+            delete = _button("删除", "quiet")
             delete.setObjectName(f"delete-{moment_id}")
             delete.clicked.connect(lambda _checked=False, mid=moment_id: self.deleteClicked.emit(mid))
             actions.addWidget(delete)
@@ -450,7 +450,7 @@ class MomentBoard(QWidget):
         comment_row = QHBoxLayout()
         edit = QLineEdit()
         edit.setPlaceholderText("评论")
-        send = QPushButton("发送")
+        send = _button("发送")
         send.setObjectName(f"comment-{moment_id}")
 
         def submit(mid: str = moment_id, box: QLineEdit = edit) -> None:
@@ -474,22 +474,13 @@ class DropboxBoard(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("chat")
+        self._host = QWidget()
+        self._body = QVBoxLayout(self._host)
+        self._body.setContentsMargins(0, 0, 0, 0)
+        self._body.setSpacing(0)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        title = QLabel("投递箱")
-        title.setObjectName("title")
-        title.setContentsMargins(28, 18, 28, 0)
-        note = QLabel("文件和聊天一样走双棘轮。单文件不超过 24KB，服务器只看得到密文。")
-        note.setObjectName("secondary")
-        note.setWordWrap(True)
-        note.setContentsMargins(28, 0, 28, 8)
-        self._host = QWidget()
-        self._body = QVBoxLayout(self._host)
-        self._body.setContentsMargins(28, 8, 28, 24)
-        self._body.setSpacing(8)
-        outer.addWidget(title)
-        outer.addWidget(note)
         outer.addWidget(_scroll(self._host), 1)
         self.set_items([])
 
@@ -499,16 +490,16 @@ class DropboxBoard(QWidget):
         self._items = list(items)
         _clear(self._body)
         if not items:
-            empty = QLabel("还没有文件。在聊天里点回形针，就能投进当前会话。")
-            empty.setWordWrap(True)
+            empty = QLabel("还没有文件")
             empty.setObjectName("secondary")
+            empty.setContentsMargins(16, 18, 16, 8)
             self._body.addWidget(empty)
         for item in items:
             self._body.addWidget(self._card(item))
         self._body.addStretch(1)
 
     def _card(self, item: dict[str, Any]) -> QWidget:
-        frame, layout = _card()
+        frame, layout = _row()
         direction = "收到" if item.get("direction") == "in" else "发出"
         name = QLabel(str(item.get("name") or "file"))
         name.setObjectName("name")
@@ -521,7 +512,7 @@ class DropboxBoard(QWidget):
         layout.addWidget(name)
         layout.addWidget(meta)
         path = str(item.get("path") or "")
-        open_button = QPushButton("打开")
+        open_button = _button("打开")
         open_button.clicked.connect(lambda _checked=False, target=path: self.openRequested.emit(target))
         layout.addWidget(open_button, alignment=Qt.AlignmentFlag.AlignLeft)
         return frame
@@ -534,10 +525,11 @@ class ProfileSettings(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setContentsMargins(16, 0, 16, 8)
         layout.setSpacing(8)
+        self._accent = "#3390EC"
         title = QLabel("资料")
-        title.setObjectName("secondary")
+        title.setObjectName("section")
         layout.addWidget(title)
         head = QHBoxLayout()
         self.avatar = AvatarWidget(56)
@@ -553,34 +545,35 @@ class ProfileSettings(QWidget):
         head.addLayout(fields, 1)
         layout.addLayout(head)
         presets = QHBoxLayout()
-        presets.setSpacing(6)
+        presets.setSpacing(8)
         self.preset_buttons: list[QPushButton] = []
         self.avatar_token = ""
         for index in range(8):
-            button = QPushButton(str(index + 1))
-            button.setFixedSize(32, 32)
+            button = QPushButton("")
+            button.setFixedSize(22, 22)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             button.clicked.connect(lambda _checked=False, i=index: self._choose_preset(i))
             self.preset_buttons.append(button)
             presets.addWidget(button)
         presets.addStretch(1)
         layout.addLayout(presets)
         photo_row = QHBoxLayout()
-        photo = QPushButton("上传头像")
+        photo = _button("上传头像", "quiet")
         photo.clicked.connect(self._pick_avatar)
-        save = QPushButton("保存资料")
-        save.setObjectName("primary")
+        save = _button("保存资料")
         save.clicked.connect(self._save_profile)
         photo_row.addWidget(photo)
         photo_row.addWidget(save)
         photo_row.addStretch(1)
         layout.addLayout(photo_row)
-        self.profile_hint = QLabel("头像会压成很小的 JPEG，才能跟好友列表一起发出去。")
+        self.profile_hint = QLabel("")
         self.profile_hint.setWordWrap(True)
         self.profile_hint.setObjectName("caption")
         layout.addWidget(self.profile_hint)
 
         privacy_title = QLabel("隐私")
-        privacy_title.setObjectName("secondary")
+        privacy_title.setObjectName("section")
         layout.addWidget(privacy_title)
         self.approval = self._switch_row(layout, "加我需要同意")
         self.show_online = self._switch_row(layout, "对好友显示在线")
@@ -589,25 +582,20 @@ class ProfileSettings(QWidget):
         self.show_online.setChecked(True)
         self.searchable.setChecked(True)
         self.moments = QComboBox()
-        self.moments.addItem("朋友圈：好友可见全部", "friends")
-        self.moments.addItem("朋友圈：只看最近三天", "three_days")
-        self.moments.addItem("朋友圈：不让好友看", "none")
+        self.moments.addItem("好友可见全部", "friends")
+        self.moments.addItem("只看最近三天", "three_days")
+        self.moments.addItem("不让好友看", "none")
         layout.addWidget(self.moments)
-        save_privacy = QPushButton("保存隐私")
-        save_privacy.setObjectName("primary")
+        save_privacy = _button("保存隐私")
         save_privacy.clicked.connect(self._save_privacy)
-        layout.addWidget(save_privacy)
-        note = QLabel("关掉「加我需要同意」后，别人的申请会直接成为好友。")
-        note.setWordWrap(True)
-        note.setObjectName("caption")
-        layout.addWidget(note)
+        layout.addWidget(save_privacy, alignment=Qt.AlignmentFlag.AlignLeft)
+        self._paint_presets()
 
     def _switch_row(self, layout: QVBoxLayout, text: str):
         from src.gui.widgets import ToggleSwitch
 
         row = QHBoxLayout()
         label = QLabel(text)
-        label.setObjectName("secondary")
         switch = ToggleSwitch()
         row.addWidget(label)
         row.addStretch(1)
@@ -618,7 +606,8 @@ class ProfileSettings(QWidget):
     def _choose_preset(self, index: int) -> None:
         self.avatar_token = f"preset:{index}"
         self.avatar.set_person(self.name_edit.text() or "我", avatar=self.avatar_token)
-        self.profile_hint.setText(f"已选择头像样式 {index + 1}")
+        self.profile_hint.setText("")
+        self._paint_presets()
 
     def _pick_avatar(self) -> None:
         from PySide6.QtWidgets import QFileDialog
@@ -637,7 +626,8 @@ class ProfileSettings(QWidget):
             self.profile_hint.setText(str(exc))
             return
         self.avatar.set_person(self.name_edit.text() or "我", avatar=self.avatar_token)
-        self.profile_hint.setText("头像已准备好，点保存资料")
+        self.profile_hint.setText("")
+        self._paint_presets()
 
     def _save_profile(self) -> None:
         self.profileSaved.emit(self.name_edit.text().strip(), self.bio_edit.text().strip(), self.avatar_token)
@@ -662,6 +652,7 @@ class ProfileSettings(QWidget):
         self.bio_edit.setText(bio)
         self.avatar_token = avatar
         self.avatar.set_person(name or "我", online=True, avatar=avatar)
+        self._paint_presets()
 
     def set_privacy(self, privacy: dict[str, Any]) -> None:
         if any(widget.hasFocus() for widget in (self.approval, self.show_online, self.searchable, self.moments)):
@@ -674,11 +665,16 @@ class ProfileSettings(QWidget):
         self.moments.setCurrentIndex(index)
 
     def apply_palette(self, accent: str, text: str) -> None:
+        self._accent = accent
+        self._accent_text = text
+        self._paint_presets()
+
+    def _paint_presets(self) -> None:
         for index, button in enumerate(self.preset_buttons):
+            color = AVATAR_COLORS[index]
             selected = self.avatar_token == f"preset:{index}"
-            if selected:
-                button.setStyleSheet(
-                    f"QPushButton {{ background:{accent}; color:{text}; border-radius:16px; padding:0; }}"
-                )
-            else:
-                button.setStyleSheet("QPushButton { border-radius:16px; padding:0; }")
+            border = self._accent if selected else "transparent"
+            button.setStyleSheet(
+                "QPushButton { background:%s; border:2px solid %s; border-radius:11px; padding:0; min-width:0; }"
+                % (color, border)
+            )

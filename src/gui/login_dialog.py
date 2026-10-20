@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPaintEvent
+from PySide6.QtCore import QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QPainter, QPaintEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -17,30 +17,24 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src import PROJECT_ABSTRACT, PROJECT_NAME
+from src import PROJECT_NAME
 from src.gui.engine_worker import ConnectionConfig
 from src.gui.icons import paint_icon
-from src.gui.theme import PALETTES, RADIUS_CARD
 from src.gui.widgets import ui_font
 
 
 class _Logo(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.setFixedSize(64, 64)
+        self.setFixedSize(72, 72)
 
     def paintEvent(self, _event: QPaintEvent) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        gradient = QLinearGradient(0, 0, 64, 64)
-        gradient.setColorAt(0, QColor("#4BA0F5"))
-        gradient.setColorAt(1, QColor("#2B5278"))
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(gradient)
-        painter.drawRoundedRect(0, 0, 64, 64, RADIUS_CARD, RADIUS_CARD)
-        from PySide6.QtCore import QRectF
-
-        paint_icon(painter, "lock", QRectF(18, 18, 28, 28), "#FFFFFF", self.devicePixelRatioF())
+        painter.setBrush(QColor("#3390EC"))
+        painter.drawEllipse(0, 0, 72, 72)
+        paint_icon(painter, "send", QRectF(22, 22, 28, 28), "#FFFFFF", self.devicePixelRatioF())
 
 
 class LoginDialog(QDialog):
@@ -49,20 +43,17 @@ class LoginDialog(QDialog):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(PROJECT_NAME)
-        self.setMinimumSize(520, 640)
-        self.resize(560, 680)
-        palette = PALETTES["telegram"]
-        self._accent = palette.accent
+        self.setMinimumSize(420, 560)
+        self.resize(480, 640)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(36, 32, 36, 28)
-        root.setSpacing(0)
-
-        card = QWidget()
-        card.setObjectName("card")
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(28, 28, 28, 24)
-        card_layout.setSpacing(14)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.addStretch(1)
+        column = QWidget()
+        column.setFixedWidth(320)
+        card_layout = QVBoxLayout(column)
+        card_layout.setContentsMargins(0, 0, 0, 0)
+        card_layout.setSpacing(10)
 
         card_layout.addWidget(_Logo(), alignment=Qt.AlignmentFlag.AlignHCenter)
 
@@ -72,13 +63,9 @@ class LoginDialog(QDialog):
         title.setObjectName("title")
         from PySide6.QtGui import QFont
 
-        title.setFont(ui_font(17, QFont.Weight.DemiBold))
+        title.setFont(ui_font(20, QFont.Weight.DemiBold))
         card_layout.addWidget(title)
-        abstract = QLabel(PROJECT_ABSTRACT)
-        abstract.setWordWrap(True)
-        abstract.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        abstract.setObjectName("secondary")
-        card_layout.addWidget(abstract)
+        card_layout.addSpacing(12)
 
         def field(caption: str, widget: QWidget) -> None:
             label = QLabel(caption)
@@ -87,10 +74,10 @@ class LoginDialog(QDialog):
             card_layout.addWidget(widget)
 
         self.username = QLineEdit("alice")
-        self.username.setPlaceholderText("3–20 位字母、数字或下划线")
+        self.username.setPlaceholderText("用户名")
         self.password = QLineEdit("password123")
         self.password.setEchoMode(QLineEdit.EchoMode.Password)
-        self.password.setPlaceholderText("只用来解开本机保险库")
+        self.password.setPlaceholderText("口令")
         self.host = QLineEdit("127.0.0.1")
         self.port = QSpinBox()
         self.port.setRange(1, 65535)
@@ -112,7 +99,7 @@ class LoginDialog(QDialog):
         card_layout.addWidget(self.show_password)
         field("服务器", endpoint)
 
-        self.status = QLabel("身份私钥只保存在本机，加密后落盘")
+        self.status = QLabel("")
         self.status.setObjectName("secondary")
         self.status.setWordWrap(True)
         card_layout.addWidget(self.status)
@@ -121,24 +108,26 @@ class LoginDialog(QDialog):
         self.progress.setTextVisible(False)
         self.progress.hide()
         card_layout.addWidget(self.progress)
-        self.connect_button = QPushButton("进入安全聊天室")
+        self.connect_button = QPushButton("登录")
         self.connect_button.setObjectName("primary")
         self.connect_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.connect_button.setFixedHeight(44)
+        self.connect_button.setFixedHeight(42)
         self.connect_button.clicked.connect(self._submit)
         card_layout.addWidget(self.connect_button)
         self.password.returnPressed.connect(self._submit)
         self.username.returnPressed.connect(self.password.setFocus)
-        root.addWidget(card)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(column)
+        row.addStretch(1)
+        root.addLayout(row)
+        root.addStretch(1)
 
     def paintEvent(self, event: QPaintEvent) -> None:
-        painter = QPainter(self)
-        gradient = QLinearGradient(0, 0, 0, self.height())
-        gradient.setColorAt(0, QColor("#0E1621"))
-        gradient.setColorAt(1, QColor("#17212B"))
-        painter.fillRect(self.rect(), gradient)
-        painter.end()
         super().paintEvent(event)
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#17212B"))
+        painter.end()
 
     def _submit(self) -> None:
         username = self.username.text().strip()
@@ -153,7 +142,7 @@ class LoginDialog(QDialog):
             port=self.port.value(),
             db_path=f"data/{username}.db",
         )
-        self.set_busy(True, "正在派生保险库密钥并连接…")
+        self.set_busy(True, "正在连接…")
         self.connectRequested.emit(config)
 
     def set_busy(self, busy: bool, text: str = "") -> None:

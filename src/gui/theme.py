@@ -74,7 +74,7 @@ PALETTES: dict[str, Palette] = {
         name="telegram",
         light=False,
         bg="#0E1621",
-        bg_nav="#0B121A",
+        bg_nav="#17212B",
         bg_side="#17212B",
         bg_chat="#0E1621",
         bg_header="#17212B",
@@ -82,17 +82,17 @@ PALETTES: dict[str, Palette] = {
         bg_input="#242F3D",
         bg_hover="#202B36",
         bg_selected="#2B5278",
-        bg_card="#1B2836",
+        bg_card="#17212B",
         bg_menu="#1E2C3A",
         bubble_out="#2B5278",
         bubble_in="#182533",
         text="#F2F6FA",
         text_out="#FFFFFF",
         text_selected="#FFFFFF",
-        text_secondary="#8B9BB4",
-        text_tertiary="#6D7F95",
+        text_secondary="#708499",
+        text_tertiary="#5C6E80",
         meta_out="#C5D7EA",
-        meta_in="#8B9BB4",
+        meta_in="#708499",
         accent="#3390EC",
         accent_hover="#4BA0F5",
         accent_soft="#1A3C5C",
@@ -104,11 +104,11 @@ PALETTES: dict[str, Palette] = {
         warning_text="#FFD27A",
         danger_bg="#3F1E24",
         danger_text="#FFB4B6",
-        unread="#FF3B30",
-        border="#314558",
-        hairline="#243140",
+        unread="#3390EC",
+        border="#242F3D",
+        hairline="#101921",
         system_bg="#182533",
-        system_text="#8B9BB4",
+        system_text="#708499",
         security_bg="#3A2228",
         scroll="#6A8298",
         overlay="#0E1621",
@@ -159,26 +159,26 @@ PALETTES: dict[str, Palette] = {
     "telegram_light": _p(
         name="telegram_light",
         light=True,
-        bg="#F4F7FB",
+        bg="#FFFFFF",
         bg_nav="#FFFFFF",
         bg_side="#FFFFFF",
-        bg_chat="#E7EEF6",
+        bg_chat="#8EABCB",
         bg_header="#FFFFFF",
         bg_composer="#FFFFFF",
-        bg_input="#F4F7FB",
-        bg_hover="#F2F5F8",
+        bg_input="#F4F4F5",
+        bg_hover="#F4F4F5",
         bg_selected="#3390EC",
         bg_card="#FFFFFF",
         bg_menu="#FFFFFF",
-        bubble_out="#3390EC",
+        bubble_out="#EEFFDE",
         bubble_in="#FFFFFF",
-        text="#1B2836",
-        text_out="#FFFFFF",
+        text="#000000",
+        text_out="#000000",
         text_selected="#FFFFFF",
-        text_secondary="#708499",
-        text_tertiary="#8AA0B4",
-        meta_out="#E7F3FF",
-        meta_in="#8AA0B4",
+        text_secondary="#707579",
+        text_tertiary="#8A9499",
+        meta_out="#5C9E55",
+        meta_in="#8A9499",
         accent="#3390EC",
         accent_hover="#4BA0F5",
         accent_soft="#E5F2FF",
@@ -190,11 +190,11 @@ PALETTES: dict[str, Palette] = {
         warning_text="#7A5A10",
         danger_bg="#FDECEC",
         danger_text="#A32020",
-        unread="#FF3B30",
-        border="#E1E8EF",
-        hairline="#E6EDF3",
-        system_bg="#D5E2EE",
-        system_text="#60788C",
+        unread="#3390EC",
+        border="#E6E6E6",
+        hairline="#E6E6E6",
+        system_bg="#6E96B8",
+        system_text="#FFFFFF",
         security_bg="#FDECEC",
         scroll="#B7C6D4",
         overlay="#F4F7FB",
@@ -203,9 +203,9 @@ PALETTES: dict[str, Palette] = {
 
 THEME_ORDER = ("telegram", "wechat", "telegram_light")
 THEME_LABELS = {
-    "telegram": "Telegram 蓝",
-    "wechat": "微信绿",
-    "telegram_light": "浅色 Telegram",
+    "telegram": "夜间",
+    "wechat": "微信",
+    "telegram_light": "日间",
 }
 
 
@@ -288,9 +288,24 @@ def stylesheet(theme: Palette | str = "telegram") -> str:
         border-bottom: 1px solid {p.hairline};
     }}
     QWidget#card, QFrame#card {{
-        background: {p.bg_card};
-        border: 1px solid {p.hairline};
-        border-radius: {RADIUS_CARD}px;
+        background: transparent;
+        border: none;
+    }}
+    QFrame#row {{
+        background: transparent;
+        border: none;
+        border-bottom: 1px solid {p.hairline};
+    }}
+    QFrame#hair {{
+        background: {p.hairline};
+        min-height: 1px;
+        max-height: 1px;
+        border: none;
+    }}
+    QFrame#popup {{
+        background: {p.bg_menu};
+        border: none;
+        border-radius: 12px;
     }}
     QLabel#title {{
         font-size: 17px;
@@ -310,20 +325,47 @@ def stylesheet(theme: Palette | str = "telegram") -> str:
         background: transparent;
     }}
     QLabel#caption {{
-        font-size: 12px;
+        font-size: 13px;
         color: {p.text_tertiary};
+        background: transparent;
+    }}
+    QLabel#section {{
+        font-size: 14px;
+        font-weight: 600;
+        color: {p.accent};
+        background: transparent;
+        padding-top: 12px;
+    }}
+    QLabel#link {{
+        font-size: 15px;
+        font-weight: 600;
+        color: {p.accent};
         background: transparent;
     }}
     QLineEdit, QSpinBox, QTextEdit#search {{
         background: {p.bg_input};
-        border: 1px solid {p.border};
-        border-radius: {RADIUS_BUTTON}px;
+        border: none;
+        border-radius: 10px;
         padding: 8px 12px;
         selection-background-color: {p.accent};
         selection-color: {p.accent_text};
     }}
-    QLineEdit:focus, QSpinBox:focus {{
-        border: 1px solid {p.accent};
+    QLineEdit#searchField {{
+        background: {p.bg_input};
+        border: none;
+        border-radius: 18px;
+        padding: 7px 14px;
+        min-height: 20px;
+    }}
+    QLineEdit:focus, QSpinBox:focus, QLineEdit#searchField:focus {{
+        border: none;
+    }}
+    QTextEdit#plain {{
+        background: {p.bg_input};
+        border: none;
+        border-radius: 10px;
+        padding: 8px 10px;
+        color: {p.text};
     }}
     QTextEdit {{
         background: transparent;
@@ -345,22 +387,24 @@ def stylesheet(theme: Palette | str = "telegram") -> str:
         border: none;
     }}
     QPushButton {{
-        background: {p.bg_hover};
+        background: transparent;
+        color: {p.accent};
         border: none;
-        border-radius: {RADIUS_BUTTON}px;
-        padding: 8px 14px;
-        font-size: 13px;
-        font-weight: 600;
+        border-radius: 6px;
+        padding: 4px 8px;
+        font-size: 14px;
+        font-weight: 500;
     }}
     QPushButton:hover {{
-        background: {p.border};
+        background: {p.accent_soft};
     }}
     QPushButton#primary {{
         background: {p.accent};
         color: {p.accent_text};
-        border-radius: {RADIUS_BUTTON}px;
-        padding: 10px 16px;
+        border-radius: 10px;
+        padding: 8px 16px;
         font-size: 15px;
+        font-weight: 600;
     }}
     QPushButton#primary:hover {{
         background: {p.accent_hover};
@@ -372,10 +416,26 @@ def stylesheet(theme: Palette | str = "telegram") -> str:
     QPushButton#ghost {{
         background: transparent;
         color: {p.accent};
-        border-radius: {RADIUS_BUTTON}px;
+        border-radius: 6px;
+        padding: 4px 8px;
     }}
     QPushButton#ghost:hover {{
         background: {p.accent_soft};
+    }}
+    QPushButton[kind="quiet"] {{
+        color: {p.text_secondary};
+        background: transparent;
+    }}
+    QPushButton[kind="quiet"]:hover {{
+        color: {p.text};
+        background: {p.bg_hover};
+    }}
+    QPushButton[kind="danger"] {{
+        color: {p.danger};
+        background: transparent;
+    }}
+    QPushButton[kind="danger"]:hover {{
+        background: {p.danger_bg};
     }}
     QMenu {{
         background: {p.bg_menu};
@@ -458,8 +518,8 @@ def stylesheet(theme: Palette | str = "telegram") -> str:
     }}
     QComboBox {{
         background: {p.bg_input};
-        border: 1px solid {p.border};
-        border-radius: {RADIUS_BUTTON}px;
+        border: none;
+        border-radius: 10px;
         padding: 6px 10px;
         min-height: 28px;
     }}
