@@ -161,6 +161,15 @@ class EngineWorker(QThread):
                 }
                 for row in engine.store.pending_message_statuses()
             ],
+            "friends": list(engine.friends),
+            "incoming": list(engine.incoming_requests),
+            "outgoing": list(engine.outgoing_requests),
+            "blocked": list(engine.blocked_users),
+            "rejected": list(engine.rejected_requests),
+            "profile": dict(engine.profile),
+            "privacy": dict(engine.privacy),
+            "moments": list(engine.moments),
+            "dropbox": engine.store.list_dropbox(),
         }
 
     async def _pump_inbox(self) -> None:
@@ -201,7 +210,7 @@ class EngineWorker(QThread):
             try:
                 await self._handle(action, payload)
             except Exception as exc:
-                if action == "send":
+                if action in {"send", "send_file"}:
                     local_id = str(payload.get("local_id", ""))
                     if self.engine is not None:
                         self.engine.store.update_message_status(local_id, "failed")
@@ -268,6 +277,72 @@ class EngineWorker(QThread):
                 engine.store.save_ui_value(str(key), str(value))
         elif action == "refresh":
             self.snapshot.emit(self._snapshot())
+        elif action == "refresh_social":
+            await engine.refresh_social()
+            self.actionResult.emit(action, True, "")
+            self.snapshot.emit(self._snapshot())
+        elif action == "friend_request":
+            await engine.friend_request(
+                str(payload["username"]), str(payload.get("greeting") or "")
+            )
+            self.actionResult.emit(action, True, str(payload["username"]))
+            self.snapshot.emit(self._snapshot())
+        elif action == "friend_respond":
+            await engine.friend_respond(
+                str(payload["username"]), bool(payload.get("accept"))
+            )
+            self.actionResult.emit(action, True, str(payload["username"]))
+            self.snapshot.emit(self._snapshot())
+        elif action == "friend_remove":
+            await engine.friend_remove(str(payload["username"]))
+            self.actionResult.emit(action, True, str(payload["username"]))
+            self.snapshot.emit(self._snapshot())
+        elif action == "friend_block":
+            await engine.friend_block(str(payload["username"]))
+            self.actionResult.emit(action, True, str(payload["username"]))
+            self.snapshot.emit(self._snapshot())
+        elif action == "search_users":
+            found = await engine.search_users(str(payload.get("query") or ""))
+            self.actionResult.emit(action, True, found)
+        elif action == "profile_set":
+            saved = await engine.profile_set(
+                str(payload.get("display_name") or ""),
+                str(payload.get("bio") or ""),
+                str(payload.get("avatar") or ""),
+            )
+            self.actionResult.emit(action, True, saved)
+            self.snapshot.emit(self._snapshot())
+        elif action == "privacy_set":
+            saved = await engine.privacy_set(
+                require_approval=bool(payload.get("require_approval", True)),
+                moments_visibility=str(payload.get("moments_visibility") or "friends"),
+                show_online=bool(payload.get("show_online", True)),
+                searchable=bool(payload.get("searchable", True)),
+            )
+            self.actionResult.emit(action, True, saved)
+            self.snapshot.emit(self._snapshot())
+        elif action == "moment_post":
+            await engine.moment_post(
+                str(payload.get("body") or ""),
+                str(payload.get("image") or ""),
+                str(payload.get("visibility") or "friends"),
+            )
+            self.actionResult.emit(action, True, "")
+            self.snapshot.emit(self._snapshot())
+        elif action == "moment_delete":
+            await engine.moment_delete(str(payload["id"]))
+            self.actionResult.emit(action, True, str(payload["id"]))
+            self.snapshot.emit(self._snapshot())
+        elif action == "moment_like":
+            await engine.moment_like(str(payload["id"]))
+            self.actionResult.emit(action, True, str(payload["id"]))
+            self.snapshot.emit(self._snapshot())
+        elif action == "moment_comment":
+            await engine.moment_comment(str(payload["id"]), str(payload.get("body") or ""))
+            self.actionResult.emit(action, True, str(payload["id"]))
+            self.snapshot.emit(self._snapshot())
+        elif action == "send_file":
+            await self._send_file(payload)
         else:
             raise ValueError(f"未知 GUI 操作：{action}")
 
@@ -282,6 +357,29 @@ class EngineWorker(QThread):
             await engine.send_text(text, peer=conv[3:])
         elif conv.startswith("group:"):
             await engine.send_text(text, group=conv[6:])
+        else:
+            raise ValueError("会话 ID 无效")
+        engine.store.update_message_status(local_id, "accepted")
+        self.messageState.emit(local_id, "accepted", "")
+        self.snapshot.emit(self._snapshot())
+
+    async def _send_file(self, payload: dict[str, Any]) -> None:
+        import base64
+
+        assert self.engine is not None
+        engine = self.engine
+        local_id = str(payload["local_id"])
+        conv = str(payload["conv"])
+        name = str(payload["name"])
+        raw = base64.b64decode(str(payload["data"]))
+        caption = str(payload.get("caption") or "")
+        label = f"[文件] {name}"
+        shown = f"{caption}\n{label}" if caption else label
+        engine.store.save_message_status(local_id, conv, shown, "sending")
+        if conv.startswith("dm:"):
+            await engine.send_file(name, raw, peer=conv[3:], caption=caption)
+        elif conv.startswith("group:"):
+            await engine.send_file(name, raw, group=conv[6:], caption=caption)
         else:
             raise ValueError("会话 ID 无效")
         engine.store.update_message_status(local_id, "accepted")

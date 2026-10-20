@@ -247,3 +247,51 @@ def test_message_groups_only_show_avatar_on_the_first() -> None:
     window.hide()
     qt.processEvents()
 
+
+def test_incoming_friend_request_can_be_accepted() -> None:
+    from PySide6.QtWidgets import QPushButton
+
+    qt = app()
+    worker = FakeWorker()
+    data = snapshot()
+    data["friends"] = []
+    data["incoming"] = [
+        {
+            "username": "carol",
+            "display_name": "卡罗尔",
+            "bio": "",
+            "avatar": "preset:2",
+            "online": False,
+            "greeting": "加个好友",
+        }
+    ]
+    data["outgoing"] = []
+    data["blocked"] = []
+    data["rejected"] = []
+    window = MainWindow(worker, data)
+    window.show()
+    window._show_page(1)
+    qt.processEvents()
+    button = window.people_panel.findChild(QPushButton, "accept-carol")
+    assert button is not None
+    button.click()
+    qt.processEvents()
+    action, payload = worker.commands[-1]
+    assert action == "friend_respond"
+    assert payload == {"username": "carol", "accept": True}
+
+    window.open_conversation("dm:carol")
+    window.composer.setPlainText("还没成为好友")
+    window.send_current()
+    assert not any(
+        command == "send" and item.get("text") == "还没成为好友"
+        for command, item in worker.commands
+    )
+    window._show_page(2)
+    qt.processEvents()
+    assert window.moment_board.isVisible()
+    window._show_page(3)
+    qt.processEvents()
+    assert window.drop_board.isVisible()
+    window.hide()
+

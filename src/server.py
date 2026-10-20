@@ -1,4 +1,7 @@
-"""转发服务器：只保存公钥、预密钥和离线信封，不接触口令、私钥、明文、消息密钥。"""
+"""转发服务器：聊天只保存公钥、预密钥和离线信封，不接触口令、私钥、消息密钥。
+
+好友、资料、隐私和朋友圈存在这里，那一层不是端到端加密。
+"""
 
 from __future__ import annotations
 
@@ -27,6 +30,7 @@ from src.protocol import (
     validate_group_name,
     validate_username,
 )
+from src.social_api import handle_social
 from src.store import ServerStore
 
 # 日志里禁止明文、私钥、SK、RK、CK、MK。聊天内容只允许 base64。
@@ -36,7 +40,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("e2ee-server")
 
-UNSOLICITED_TYPES = {"envelope", "presence"}
+UNSOLICITED_TYPES = {"envelope", "presence", "social_update", "moment_update"}
 
 
 class RequestSocket:
@@ -134,13 +138,15 @@ class ChatServer:
         elif typ == "envelope":
             await self.on_envelope(ws, username, msg)
         elif typ == "list_users":
-            await self.on_list_users(ws)
+            await self.on_list_users(ws, username)
         elif typ == "group_create":
             await self.on_group_create(ws, username, msg)
         elif typ == "group_add":
             await self.on_group_add(ws, username, msg)
         elif typ == "group_info":
             await self.on_group_info(ws, msg)
+        elif await handle_social(self, ws, username, msg):
+            return username
         else:
             await ws.send(dumps(error_msg(f"未知类型 {typ}")))
         return username
@@ -242,8 +248,13 @@ class ChatServer:
         await self._broadcast_presence()
 
     async def _broadcast_presence(self) -> None:
-        raw = dumps({"type": "presence", "online": sorted(self.online)})
-        for sock in list(self.online.values()):
+        hidden = self.store.hidden_online_users()
+        visible = sorted(name for name in self.online if name not in hidden)
+        for username, sock in list(self.online.items()):
+            online = visible
+            if username in hidden:
+                online = sorted(set(visible) | {username})
+            raw = dumps({"type": "presence", "online": online})
             try:
                 await sock.send(raw)
             except Exception:
@@ -327,9 +338,13 @@ class ChatServer:
             )
         )
 
-    async def on_list_users(self, ws: Any) -> None:
-        users = self.store.list_users()
-        online = sorted(self.online.keys())
+    async def on_list_users(self, ws: Any, username: str) -> None:
+        users = sorted(set(self.store.directory_for(username)) | {username})
+        online = sorted(
+            name
+            for name in self.online
+            if name == username or name not in self.store.hidden_online_users()
+        )
         await ws.send(dumps({"type": "users", "users": users, "online": online}))
 
     async def on_envelope(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
@@ -352,6 +367,9 @@ class ChatServer:
             if username not in members or dst not in members:
                 await ws.send(dumps(error_msg("发送方或收件人不在该群")))
                 return
+        elif not self.store.are_friends(username, dst):
+            await ws.send(dumps(error_msg("需要对方同意好友申请后才能发消息")))
+            return
         outgoing = dumps(
             {"type": "envelope", "from": src, "to": dst, "payload": payload}
         )
@@ -395,6 +413,9 @@ class ChatServer:
             if not self.store.user_exists(m):
                 await ws.send(dumps(error_msg(f"成员 {m} 未注册")))
                 return
+            if m != username and not self.store.are_friends(username, m):
+                await ws.send(dumps(error_msg(f"{m} 还不是好友，先等对方同意申请")))
+                return
         # 成员表是服务器状态。EuroS&P 2018 指出当时几个系统的群管理
         # 没有端到端保护；这里同样没有。群正文的加密在客户端逐人棘轮里。
         self.store.create_group(name, members)
@@ -413,6 +434,9 @@ class ChatServer:
             return
         if not self.store.user_exists(newbie):
             await ws.send(dumps(error_msg("新成员未注册")))
+            return
+        if not self.store.are_friends(username, newbie):
+            await ws.send(dumps(error_msg("只能把好友拉进群")))
             return
         if newbie in members:
             await ws.send(dumps(error_msg("已在群内")))

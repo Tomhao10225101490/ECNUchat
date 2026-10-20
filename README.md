@@ -105,7 +105,21 @@ python3 -m src.client --user carol --password password123 --host 127.0.0.1 --por
 
 第一次启动会在本机生成身份钥匙、签名预密钥和 20 把一次性预密钥。公钥上传，私钥留下。
 
-Alice 和 Bob 的终端单聊：
+Alice 和 Bob 的终端单聊要先成为好友。默认必须对方同意，同意之前单聊发不出去：
+
+```text
+/friend add bob 你好
+```
+
+Bob 那边：
+
+```text
+/friend accept alice
+/chat alice
+你好爱丽丝
+```
+
+Alice 再打开会话：
 
 ```text
 /chat bob
@@ -118,9 +132,12 @@ Bob 回复 `你好爱丽丝` 时，发生第一次由回复触发的 DH 棘轮�
 三人小群：
 
 ```text
+/friend add carol 一起建群
 /group create 三人组 bob carol
 群里大家好
 ```
+
+Carol 需要先同意 Alice 的好友申请。群创建人必须已经和每个被拉进来的人是好友；群里其他两人之间不必互相是好友。
 
 Bob 和 Carol 各自收到发给自己的那一封。Carol 解不开 Alice 发给 Bob 的单聊信封。
 
@@ -139,6 +156,14 @@ Bob 和 Carol 各自收到发给自己的那一封。Carol 解不开 Alice 发�
 
 终端底部那一行带边框的输入框里打字，回车发送。输入框为空时，Tab 或上下键切换会话。窄终端会自动收起侧栏。
 
+## 好友、隐私、朋友圈和投递箱
+
+桌面端左侧有聊天、联系人、朋友圈、投递箱和设置。联系人页能搜索用户、发出申请、同意、拒绝、取消、删除和拉黑。对方还没同意时，单聊发不出去；两边同时申请会直接成为好友。设置里可以关掉「加我需要同意」，之后的申请会自动通过。也可以改昵称、简介、八种头像或一张很小的 JPEG，并设置朋友圈范围、是否显示在线、是否允许被搜索。
+
+朋友圈可以发文字和一张小图，好友可以点赞、评论，作者可以删除。可见范围是好友、最近三天或完全不给好友看；单条也可以只给自己看。这些内容存在服务器上，这样每个人看到的赞和评论才是同一份。它不是端到端加密，也不使用新的密码算法。
+
+投递箱走原来的双棘轮信封。回形针或 `/file 路径` 把不超过 24KB 的文件放进密文，服务器仍然只转发密文。解开之后记在本机投递箱里。聊天记录里显示 `[文件] 文件名`。
+
 ## 系统是怎么分层的
 
 ![客户端、服务器和收件人的分工](docs/images/architecture.png)
@@ -148,9 +173,9 @@ Bob 和 Carol 各自收到发给自己的那一封。Carol 解不开 Alice 发�
 1. **界面层**只负责看和点。桌面端在 `src/gui/`，终端端在 `src/ui.py`。Qt 主线程不计算共享秘密，也不保存链钥匙。耗时的口令派生和网络收发放在独立线程里的 asyncio 循环中，所以解锁数据库时窗口还能动。
 2. **会话引擎**是 `src/client.py` 里的 `ChatEngine`。它决定何时注册、何时拉预密钥包、何时为某个朋友建立棘轮、何时把群消息拆成多封信。桌面端和终端端调用的是同一个引擎。
 3. **密码模块**是 `src/x3dh.py`、`src/double_ratchet.py`、`src/prekeys.py`。这三个文件不许导入网络和数据库，输入输出都是字节，单测可以不连网。
-4. **服务器**是 `src/server.py` 加 `src/store.py` 里的 `ServerStore`。它保存公钥、签名、一次性预密钥池、群成员名单和离线信封，按用户名转发。它不解析出明文。
+4. **服务器**是 `src/server.py` 加 `src/store.py` 里的 `ServerStore`。它保存公钥、签名、一次性预密钥池、群成员名单和离线信封，按用户名转发。它不解析聊天明文。好友、资料、隐私和朋友圈另存在服务器上，见下一节。
 
-网上跑的是带 `type` 的 JSON，单条超过 64KB 就拒绝。至少有这些类型：`register`、`login_challenge`、`login`、`upload_prekeys`、`fetch_bundle`、`envelope`、`error`。实际还会用到 `fetch_user`、`list_users`、`presence`、`group_create`、`group_add`、`group_info`、`group_update`。请求带 `request_id`，这样两个请求同时回来也不会拿错回包；聊天推送不带这个关联编号。
+网上跑的是带 `type` 的 JSON，单条超过 64KB 就拒绝。至少有这些类型：`register`、`login_challenge`、`login`、`upload_prekeys`、`fetch_bundle`、`envelope`、`error`。实际还会用到 `fetch_user`、`list_users`、`presence`、`group_create`、`group_add`、`group_info`、`group_update`，以及好友、资料、隐私和朋友圈的 `friend_*`、`profile_*`、`privacy_*`、`moment_*`。请求带 `request_id`，这样两个请求同时回来也不会拿错回包；聊天推送和 `social_update`、`moment_update` 不带这个关联编号。
 
 一条信封里给人看的头是明文的：当前棘轮公钥 `dh_pub`、本链序号 `n`、上一链发了多少条 `pn`，再加上 12 字节随机 nonce 和 base64 密文。本项目故意不再给头加一层加密，避免协议做跑偏。头公开不等于正文公开，因为没有消息钥匙就解不开 AES-256-GCM。
 

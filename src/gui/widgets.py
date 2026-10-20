@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import time
 
@@ -23,10 +24,12 @@ from PySide6.QtGui import (
     QColor,
     QFont,
     QFontMetrics,
+    QImage,
     QInputMethodEvent,
     QKeyEvent,
     QLinearGradient,
     QPainter,
+    QPainterPath,
     QPaintEvent,
     QPalette,
     QPen,
@@ -77,6 +80,45 @@ def avatar_letter(name: str, group: bool = False) -> str:
     return text[:1].upper()
 
 
+_PRESET_COLORS = (
+    ("#5B8DEF", "#2F5BD0"),
+    ("#34C759", "#1F8A3B"),
+    ("#FF9F0A", "#C93400"),
+    ("#BF5AF2", "#7A2FC2"),
+    ("#FF375F", "#A10E32"),
+    ("#64D2FF", "#0A6F96"),
+    ("#FFD60A", "#A07D00"),
+    ("#AC8E68", "#5C4632"),
+)
+
+
+def preset_colors(token: str) -> tuple[QColor, QColor] | None:
+    if not str(token).startswith("preset:"):
+        return None
+    try:
+        index = int(str(token).split(":", 1)[1])
+    except ValueError:
+        return None
+    if index < 0 or index >= len(_PRESET_COLORS):
+        return None
+    left, right = _PRESET_COLORS[index]
+    return QColor(left), QColor(right)
+
+
+def image_from_avatar(token: str) -> QImage | None:
+    text = str(token or "")
+    if not text.startswith("jpeg:"):
+        return None
+    try:
+        raw = base64.b64decode(text[5:], validate=True)
+    except Exception:
+        return None
+    image = QImage()
+    if not image.loadFromData(raw, "JPEG") or image.isNull():
+        return None
+    return image
+
+
 def paint_avatar(
     painter: QPainter,
     rect: QRectF,
@@ -86,20 +128,32 @@ def paint_avatar(
     group: bool = False,
     online_color: str = "#31D158",
     pixel: int = 15,
+    avatar: str = "",
 ) -> None:
     painter.save()
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    start, end = avatar_colors("group:" + name if group else name)
-    gradient = QLinearGradient(rect.topLeft(), rect.bottomRight())
-    gradient.setColorAt(0, start)
-    gradient.setColorAt(1, end)
+    photo = image_from_avatar(avatar)
+    colors = preset_colors(avatar)
+    start, end = colors or avatar_colors("group:" + name if group else name)
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(gradient)
-    painter.drawEllipse(rect)
-    painter.setPen(QColor("#FFFFFF"))
-    font = ui_font(max(12, int(pixel)), QFont.Weight.DemiBold)
-    painter.setFont(font)
-    painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, avatar_letter(name, group))
+    if photo is not None:
+        painter.setBrush(QColor("#D0D5DD"))
+        painter.drawEllipse(rect)
+        clip = QPainterPath()
+        clip.addEllipse(rect)
+        painter.setClipPath(clip)
+        painter.drawImage(rect, photo)
+        painter.setClipping(False)
+    else:
+        gradient = QLinearGradient(rect.topLeft(), rect.bottomRight())
+        gradient.setColorAt(0, start)
+        gradient.setColorAt(1, end)
+        painter.setBrush(gradient)
+        painter.drawEllipse(rect)
+        painter.setPen(QColor("#FFFFFF"))
+        font = ui_font(max(12, int(pixel)), QFont.Weight.DemiBold)
+        painter.setFont(font)
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, avatar_letter(name, group))
     if online:
         radius = max(4.5, rect.width() * 0.14)
         center_x = rect.right() - radius * 0.55
@@ -118,12 +172,21 @@ class AvatarWidget(QWidget):
         self.name = ""
         self.online = False
         self.group = False
+        self.avatar = ""
         self.online_color = "#31D158"
 
-    def set_person(self, name: str, *, online: bool = False, group: bool = False) -> None:
+    def set_person(
+        self,
+        name: str,
+        *,
+        online: bool = False,
+        group: bool = False,
+        avatar: str = "",
+    ) -> None:
         self.name = name
         self.online = online
         self.group = group
+        self.avatar = avatar
         self.update()
 
     def paintEvent(self, _event: QPaintEvent) -> None:
@@ -136,6 +199,7 @@ class AvatarWidget(QWidget):
             group=self.group,
             online_color=self.online_color,
             pixel=max(13, int(self.width() * 0.38)),
+            avatar=self.avatar,
         )
 
 

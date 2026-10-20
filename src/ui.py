@@ -71,7 +71,21 @@ def apply_theme(name: str) -> None:
 BOX = "#6ab3f3"
 
 HELP_TEXT = """命令
+  /friend add 名字 [验证]  发好友申请。对方同意后才能单聊
+  /friend accept 名字      同意申请
+  /friend reject 名字      拒绝申请
+  /friend remove 名字      删除好友，或取消自己发出的申请
+  /friend block 名字       拉黑。取消拉黑用 /friend remove
+  /friends                 好友、申请、未通过、黑名单
+  /search 关键字           按用户名或昵称搜索
   /chat 名字              打开单聊
+  /file 路径              把不超过 24KB 的文件投进当前会话
+  /moment 正文            发一条朋友圈。/moment 查看
+  /profile 昵称           改昵称。/bio 正文 改简介
+  /privacy approval on|off 是否需要同意才加好友
+  /privacy moments friends|three_days|none
+  /privacy online on|off  是否对好友显示在线
+  /privacy search on|off  是否允许被搜索
   /fingerprint 名字       16 组身份指纹，线下核对
   /group create 群名 成员…
   /group add 群名 新成员

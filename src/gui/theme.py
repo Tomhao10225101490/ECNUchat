@@ -456,4 +456,24 @@ def stylesheet(theme: Palette | str = "telegram") -> str:
         background: {p.hairline};
         width: 1px;
     }}
+    QComboBox {{
+        background: {p.bg_input};
+        border: 1px solid {p.border};
+        border-radius: {RADIUS_BUTTON}px;
+        padding: 6px 10px;
+        min-height: 28px;
+    }}
+    QComboBox QAbstractItemView {{
+        background: {p.bg_menu};
+        color: {p.text};
+        selection-background-color: {p.accent_soft};
+        border: 1px solid {p.border};
+    }}
+    QScrollArea {{
+        background: transparent;
+        border: none;
+    }}
+    QScrollArea > QWidget > QWidget {{
+        background: transparent;
+    }}
     """

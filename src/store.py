@@ -1,4 +1,4 @@
-"""SQLite 存储：服务器存公钥与离线信封；客户端用口令封装私钥和棘轮状态。"""
+"""SQLite 存储：服务器存公钥、离线信封和社交状态；客户端用口令封装私钥和棘轮状态。"""
 
 from __future__ import annotations
 
@@ -183,6 +183,15 @@ class ClientStore:
                 body TEXT NOT NULL,
                 state TEXT NOT NULL,
                 ts REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS dropbox (
+                id TEXT PRIMARY KEY,
+                peer TEXT NOT NULL,
+                name TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                created REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_history_conv_id ON history(conv, id);
             CREATE INDEX IF NOT EXISTS idx_history_body ON history(body);
@@ -457,6 +466,41 @@ class ClientStore:
         ).fetchone()
         return str(row[0]) if row else default
 
+    def add_dropbox(
+        self,
+        item_id: str,
+        peer: str,
+        name: str,
+        direction: str,
+        size: int,
+        path: str,
+    ) -> None:
+        self.conn.execute(
+            """INSERT OR REPLACE INTO dropbox(id, peer, name, direction, size, path, created)
+               VALUES(?,?,?,?,?,?,?)""",
+            (item_id, peer, name, direction, size, path, time.time()),
+        )
+        self.conn.commit()
+
+    def list_dropbox(self, limit: int = 40) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """SELECT id, peer, name, direction, size, path, created
+               FROM dropbox ORDER BY created DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [
+            {
+                "id": row[0],
+                "peer": row[1],
+                "name": row[2],
+                "direction": row[3],
+                "size": row[4],
+                "path": row[5],
+                "created": row[6],
+            }
+            for row in rows
+        ]
+
     def close(self) -> None:
         self.conn.close()
 
@@ -502,6 +546,52 @@ class ServerStore:
                 username TEXT NOT NULL,
                 PRIMARY KEY (group_name, username)
             );
+            CREATE TABLE IF NOT EXISTS profiles (
+                username TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                bio TEXT NOT NULL,
+                avatar TEXT NOT NULL,
+                updated REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS privacy (
+                username TEXT PRIMARY KEY,
+                require_approval INTEGER NOT NULL,
+                moments_visibility TEXT NOT NULL,
+                show_online INTEGER NOT NULL,
+                searchable INTEGER NOT NULL,
+                updated REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS friendships (
+                user_lo TEXT NOT NULL,
+                user_hi TEXT NOT NULL,
+                status TEXT NOT NULL,
+                requested_by TEXT NOT NULL,
+                greeting TEXT NOT NULL,
+                updated REAL NOT NULL,
+                PRIMARY KEY (user_lo, user_hi)
+            );
+            CREATE TABLE IF NOT EXISTS moments (
+                id TEXT PRIMARY KEY,
+                author TEXT NOT NULL,
+                body TEXT NOT NULL,
+                image TEXT NOT NULL,
+                visibility TEXT NOT NULL,
+                created REAL NOT NULL,
+                deleted INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS moment_likes (
+                moment_id TEXT NOT NULL,
+                username TEXT NOT NULL,
+                created REAL NOT NULL,
+                PRIMARY KEY (moment_id, username)
+            );
+            CREATE TABLE IF NOT EXISTS moment_comments (
+                id TEXT PRIMARY KEY,
+                moment_id TEXT NOT NULL,
+                author TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created REAL NOT NULL
+            );
             """
         )
         self.conn.commit()
@@ -536,6 +626,19 @@ class ServerStore:
                     "INSERT INTO one_time_prekeys(username, opk_pub) VALUES(?,?)",
                     (username, pub),
                 )
+            now = time.time()
+            self.conn.execute(
+                """INSERT INTO profiles(username, display_name, bio, avatar, updated)
+                   VALUES(?,?,?,?,?)""",
+                (username, username, "", "", now),
+            )
+            self.conn.execute(
+                """INSERT INTO privacy(
+                       username, require_approval, moments_visibility,
+                       show_online, searchable, updated
+                   ) VALUES(?,?,?,?,?,?)""",
+                (username, 1, "friends", 1, 1, now),
+            )
 
     def get_user(self, username: str) -> tuple[bytes, bytes] | None:
         row = self.conn.execute(
@@ -657,6 +760,309 @@ class ServerStore:
             (name, username),
         )
         self.conn.commit()
+
+    def get_profile(self, username: str) -> dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT display_name, bio, avatar, updated FROM profiles WHERE username=?",
+            (username,),
+        ).fetchone()
+        if row is None:
+            return {
+                "username": username,
+                "display_name": username,
+                "bio": "",
+                "avatar": "",
+                "updated": 0,
+            }
+        return {
+            "username": username,
+            "display_name": row[0],
+            "bio": row[1],
+            "avatar": row[2],
+            "updated": row[3],
+        }
+
+    def set_profile(self, username: str, display_name: str, bio: str, avatar: str) -> dict[str, Any]:
+        now = time.time()
+        self.conn.execute(
+            """INSERT INTO profiles(username, display_name, bio, avatar, updated)
+               VALUES(?,?,?,?,?)
+               ON CONFLICT(username) DO UPDATE SET
+                 display_name=excluded.display_name,
+                 bio=excluded.bio,
+                 avatar=excluded.avatar,
+                 updated=excluded.updated""",
+            (username, display_name, bio, avatar, now),
+        )
+        self.conn.commit()
+        return self.get_profile(username)
+
+    def get_privacy(self, username: str) -> dict[str, Any]:
+        row = self.conn.execute(
+            """SELECT require_approval, moments_visibility, show_online, searchable
+               FROM privacy WHERE username=?""",
+            (username,),
+        ).fetchone()
+        if row is None:
+            return {
+                "require_approval": True,
+                "moments_visibility": "friends",
+                "show_online": True,
+                "searchable": True,
+            }
+        return {
+            "require_approval": bool(row[0]),
+            "moments_visibility": row[1],
+            "show_online": bool(row[2]),
+            "searchable": bool(row[3]),
+        }
+
+    def set_privacy(
+        self,
+        username: str,
+        *,
+        require_approval: bool,
+        moments_visibility: str,
+        show_online: bool,
+        searchable: bool,
+    ) -> dict[str, Any]:
+        now = time.time()
+        self.conn.execute(
+            """INSERT INTO privacy(
+                   username, require_approval, moments_visibility,
+                   show_online, searchable, updated
+               ) VALUES(?,?,?,?,?,?)
+               ON CONFLICT(username) DO UPDATE SET
+                 require_approval=excluded.require_approval,
+                 moments_visibility=excluded.moments_visibility,
+                 show_online=excluded.show_online,
+                 searchable=excluded.searchable,
+                 updated=excluded.updated""",
+            (
+                username,
+                1 if require_approval else 0,
+                moments_visibility,
+                1 if show_online else 0,
+                1 if searchable else 0,
+                now,
+            ),
+        )
+        self.conn.commit()
+        return self.get_privacy(username)
+
+    def hidden_online_users(self) -> set[str]:
+        rows = self.conn.execute(
+            "SELECT username FROM privacy WHERE show_online=0"
+        ).fetchall()
+        return {row[0] for row in rows}
+
+    def relation(self, left: str, right: str) -> dict[str, Any] | None:
+        from src.social import pair_key
+
+        user_lo, user_hi = pair_key(left, right)
+        row = self.conn.execute(
+            """SELECT status, requested_by, greeting, updated
+               FROM friendships WHERE user_lo=? AND user_hi=?""",
+            (user_lo, user_hi),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "user_lo": user_lo,
+            "user_hi": user_hi,
+            "status": row[0],
+            "requested_by": row[1],
+            "greeting": row[2],
+            "updated": row[3],
+        }
+
+    def save_relation(
+        self,
+        left: str,
+        right: str,
+        *,
+        status: str,
+        requested_by: str,
+        greeting: str,
+    ) -> None:
+        from src.social import pair_key
+
+        user_lo, user_hi = pair_key(left, right)
+        self.conn.execute(
+            """INSERT INTO friendships(user_lo, user_hi, status, requested_by, greeting, updated)
+               VALUES(?,?,?,?,?,?)
+               ON CONFLICT(user_lo, user_hi) DO UPDATE SET
+                 status=excluded.status,
+                 requested_by=excluded.requested_by,
+                 greeting=excluded.greeting,
+                 updated=excluded.updated""",
+            (user_lo, user_hi, status, requested_by, greeting, time.time()),
+        )
+        self.conn.commit()
+
+    def delete_relation(self, left: str, right: str) -> None:
+        from src.social import pair_key
+
+        user_lo, user_hi = pair_key(left, right)
+        self.conn.execute(
+            "DELETE FROM friendships WHERE user_lo=? AND user_hi=?",
+            (user_lo, user_hi),
+        )
+        self.conn.commit()
+
+    def relations_of(self, username: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """SELECT user_lo, user_hi, status, requested_by, greeting, updated
+               FROM friendships WHERE user_lo=? OR user_hi=?
+               ORDER BY updated DESC""",
+            (username, username),
+        ).fetchall()
+        found = []
+        for user_lo, user_hi, status, requested_by, greeting, updated in rows:
+            other = user_hi if username == user_lo else user_lo
+            found.append(
+                {
+                    "username": other,
+                    "status": status,
+                    "requested_by": requested_by,
+                    "greeting": greeting,
+                    "updated": updated,
+                }
+            )
+        return found
+
+    def are_friends(self, left: str, right: str) -> bool:
+        if left == right:
+            return False
+        rel = self.relation(left, right)
+        return rel is not None and rel["status"] == "accepted"
+
+    def friend_names(self, username: str) -> list[str]:
+        return sorted(
+            row["username"]
+            for row in self.relations_of(username)
+            if row["status"] == "accepted"
+        )
+
+    def directory_for(self, viewer: str, query: str = "") -> list[str]:
+        needle = query.strip().lower()
+        friends = set(self.friend_names(viewer))
+        names = []
+        for username in self.list_users():
+            if username == viewer:
+                continue
+            privacy = self.get_privacy(username)
+            visible = privacy["searchable"] or username in friends
+            if not visible:
+                continue
+            profile = self.get_profile(username)
+            haystack = f"{username} {profile['display_name']}".lower()
+            if needle and needle not in haystack:
+                continue
+            names.append(username)
+        return names
+
+    def insert_moment(
+        self,
+        moment_id: str,
+        author: str,
+        body: str,
+        image: str,
+        visibility: str,
+    ) -> None:
+        self.conn.execute(
+            """INSERT INTO moments(id, author, body, image, visibility, created, deleted)
+               VALUES(?,?,?,?,?,?,0)""",
+            (moment_id, author, body, image, visibility, time.time()),
+        )
+        self.conn.commit()
+
+    def get_moment_row(self, moment_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """SELECT id, author, body, image, visibility, created, deleted
+               FROM moments WHERE id=?""",
+            (moment_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0],
+            "author": row[1],
+            "body": row[2],
+            "image": row[3],
+            "visibility": row[4],
+            "created": row[5],
+            "deleted": bool(row[6]),
+        }
+
+    def mark_moment_deleted(self, moment_id: str) -> None:
+        self.conn.execute("UPDATE moments SET deleted=1 WHERE id=?", (moment_id,))
+        self.conn.commit()
+
+    def toggle_like(self, moment_id: str, username: str) -> bool:
+        existing = self.conn.execute(
+            "SELECT 1 FROM moment_likes WHERE moment_id=? AND username=?",
+            (moment_id, username),
+        ).fetchone()
+        if existing:
+            self.conn.execute(
+                "DELETE FROM moment_likes WHERE moment_id=? AND username=?",
+                (moment_id, username),
+            )
+            liked = False
+        else:
+            self.conn.execute(
+                "INSERT INTO moment_likes(moment_id, username, created) VALUES(?,?,?)",
+                (moment_id, username, time.time()),
+            )
+            liked = True
+        self.conn.commit()
+        return liked
+
+    def add_comment(self, comment_id: str, moment_id: str, author: str, body: str) -> None:
+        self.conn.execute(
+            """INSERT INTO moment_comments(id, moment_id, author, body, created)
+               VALUES(?,?,?,?,?)""",
+            (comment_id, moment_id, author, body, time.time()),
+        )
+        self.conn.commit()
+
+    def moment_likes(self, moment_id: str) -> list[str]:
+        rows = self.conn.execute(
+            "SELECT username FROM moment_likes WHERE moment_id=? ORDER BY created",
+            (moment_id,),
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def moment_comments(self, moment_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """SELECT id, author, body, created FROM moment_comments
+               WHERE moment_id=? ORDER BY created""",
+            (moment_id,),
+        ).fetchall()
+        return [
+            {"id": row[0], "author": row[1], "body": row[2], "created": row[3]}
+            for row in rows
+        ]
+
+    def recent_moments(self, limit: int = 40) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """SELECT id, author, body, image, visibility, created, deleted
+               FROM moments WHERE deleted=0 ORDER BY created DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [
+            {
+                "id": row[0],
+                "author": row[1],
+                "body": row[2],
+                "image": row[3],
+                "visibility": row[4],
+                "created": row[5],
+                "deleted": bool(row[6]),
+            }
+            for row in rows
+        ]
 
     def close(self) -> None:
         self.conn.close()

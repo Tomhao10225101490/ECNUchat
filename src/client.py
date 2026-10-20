@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import uuid
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import websockets
@@ -47,6 +49,7 @@ from src.protocol import (
     loads,
     validate_username,
 )
+from src.social import clean_file_payload, clean_filename
 from src.store import ClientStore
 from src.x3dh import (
     X3DHError,
@@ -92,6 +95,15 @@ class ChatEngine:
     directory: list[str] = field(default_factory=list)
     connected: bool = False
     ui_theme: str = "telegram"
+    friends: list[dict[str, Any]] = field(default_factory=list)
+    incoming_requests: list[dict[str, Any]] = field(default_factory=list)
+    outgoing_requests: list[dict[str, Any]] = field(default_factory=list)
+    blocked_users: list[dict[str, Any]] = field(default_factory=list)
+    profile: dict[str, Any] = field(default_factory=dict)
+    privacy: dict[str, Any] = field(default_factory=dict)
+    moments: list[dict[str, Any]] = field(default_factory=list)
+    rejected_requests: list[dict[str, Any]] = field(default_factory=list)
+    _send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     ws: Any = None
     _waiters: dict[str, asyncio.Future] = field(default_factory=dict)
     _incoming_raw: asyncio.Queue = field(default_factory=asyncio.Queue)
@@ -174,7 +186,8 @@ class ChatEngine:
         request_obj["request_id"] = request_id
         fut = self._arm(request_id)
         try:
-            await self.send_json(request_obj)
+            async with self._send_lock:
+                await self.send_json(request_obj)
             result = await asyncio.wait_for(fut, timeout=15)
         finally:
             self._disarm(request_id)
@@ -208,6 +221,10 @@ class ChatEngine:
             await self._retry_pending_prekeys()
         except Exception:
             self.last_error = "预密钥补充将在下次登录重试"
+        try:
+            await self.refresh_social()
+        except Exception:
+            self.last_error = "好友和朋友圈将在下次同步"
 
     async def _retry_outboxes(self) -> None:
         """重连后重发原始加密信封，不再次推进双棘轮。"""
@@ -279,7 +296,7 @@ class ChatEngine:
                 if waiter is not None and not waiter.done():
                     waiter.set_result(msg)
                     delivered = True
-                if typ in {"envelope", "group_update", "presence"} or (
+                if typ in {"envelope", "group_update", "presence", "social_update", "moment_update"} or (
                     typ == "error" and not delivered
                 ):
                     await self._incoming_raw.put(msg)
@@ -315,6 +332,15 @@ class ChatEngine:
         elif typ == "presence":
             self.online_users = set(msg.get("online") or [])
             await self.inbox.put(Incoming("", "", None, "presence"))
+        elif typ == "social_update":
+            self._apply_social(msg)
+            await self.inbox.put(Incoming("系统", "", None, "social"))
+        elif typ == "moment_update":
+            try:
+                await self.refresh_moments()
+            except Exception:
+                self.last_error = "朋友圈刷新失败"
+            await self.inbox.put(Incoming("系统", "", None, "moment"))
         elif typ == "error":
             self.last_error = msg.get("message")
             await self.inbox.put(Incoming("", "", None, "sys", self.last_error))
@@ -412,8 +438,59 @@ class ChatEngine:
         await self._send_one(dest, text, group=None, kind="chat")
         self.store.add_history(f"dm:{dest}", self.username, text)
 
+    async def send_file(
+        self,
+        filename: str,
+        data: bytes,
+        *,
+        peer: str | None = None,
+        group: str | None = None,
+        caption: str = "",
+    ) -> None:
+        """把文件放进双棘轮信封。服务器只转发密文，投递箱只在本机解开。"""
+        payload = clean_file_payload(
+            {"name": filename, "data": base64.b64encode(data).decode("ascii")}
+        )
+        assert payload is not None
+        label = f"[文件] {payload['name']}"
+        shown = f"{caption.strip()}\n{label}" if caption.strip() else label
+        if group:
+            members = self.groups.get(group) or []
+            others = [m for m in members if m != self.username]
+            if not others:
+                raise ProtocolError("群里没有其他成员")
+            self.store.add_history(f"group:{group}", self.username, shown)
+            delivered = 0
+            try:
+                for other in others:
+                    await self._send_one(
+                        other, caption, group=group, kind="chat", file=payload
+                    )
+                    delivered += 1
+            except Exception:
+                self.store.add_history(
+                    f"group:{group}",
+                    "系统",
+                    f"文件仅送达 {delivered}/{len(others)} 人，可稍后重试",
+                )
+                raise
+            self._write_dropbox(group, payload["name"], payload["data"], "out")
+            return
+        dest = peer or self.current_peer
+        if not dest:
+            raise ProtocolError("先用 /chat 名字 选择对端")
+        await self._send_one(dest, caption, group=None, kind="chat", file=payload)
+        self.store.add_history(f"dm:{dest}", self.username, shown)
+        self._write_dropbox(dest, payload["name"], payload["data"], "out")
+
     async def _send_one(
-        self, peer: str, text: str, *, group: str | None, kind: str
+        self,
+        peer: str,
+        text: str,
+        *,
+        group: str | None,
+        kind: str,
+        file: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         lock = self._peer_locks.setdefault(peer, asyncio.Lock())
         async with lock:
@@ -433,11 +510,10 @@ class ChatEngine:
                     self.pending_x3dh.pop(peer, None)
             state = await self._ensure_session_for_send(peer)
             x3dh = self.pending_x3dh.get(peer)
-            inner = json.dumps(
-                {"v": 1, "text": text, "group": group, "kind": kind},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
+            body: dict[str, Any] = {"v": 1, "text": text, "group": group, "kind": kind}
+            if file is not None:
+                body["file"] = clean_file_payload(file)
+            inner = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             msg, _mk = encrypt(state, inner)
             # 消息钥匙用后即弃：MK 不进棘轮状态，也不进日志。
             # 这是 CRYPTO 2022 对称棘轮的一次性消息钥匙，不是把 MK 留到下一世代。
@@ -465,7 +541,7 @@ class ChatEngine:
         payload = env["payload"]
         group = payload.get("group")
         try:
-            text, verified_group, verified_kind = await self._decrypt_envelope(
+            text, verified_group, verified_kind, file_payload = await self._decrypt_envelope(
                 sender, payload
             )
             group = verified_group
@@ -487,6 +563,18 @@ class ChatEngine:
         self.last_error = None
         conv = f"group:{group}" if group else f"dm:{sender}"
         who = "系统" if verified_kind == "group_meta" else sender
+        if file_payload is not None:
+            label = f"[文件] {file_payload['name']}"
+            text = f"{text}\n{label}" if text else label
+            try:
+                self._write_dropbox(
+                    group or sender,
+                    file_payload["name"],
+                    file_payload["data"],
+                    "in",
+                )
+            except Exception:
+                self.last_error = "文件已解密，但没有写进投递箱"
         self.store.add_history(conv, who, text)
         await self.inbox.put(Incoming(who, text, group, verified_kind))
 
@@ -497,9 +585,19 @@ class ChatEngine:
             self.store.add_history(conv, "系统", phrase)
         self.inbox.put_nowait(Incoming(sender, "", group, "error", phrase))
 
+    def _write_dropbox(self, peer: str, name: str, data_b64: str, direction: str) -> None:
+        raw = base64.b64decode(data_b64)
+        item_id = uuid.uuid4().hex
+        safe = clean_filename(name)
+        folder = Path(self.store.path).parent / "dropbox" / self.username
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{item_id}_{safe}"
+        path.write_bytes(raw)
+        self.store.add_dropbox(item_id, peer, safe, direction, len(raw), str(path))
+
     async def _decrypt_envelope(
         self, sender: str, payload: dict[str, Any]
-    ) -> tuple[str, str | None, str]:
+    ) -> tuple[str, str | None, str, dict[str, str] | None]:
         ratchet_msg, init = decode_ratchet_payload(payload)
         new_identity = False
         consumed_opk: bytes | None = None
@@ -553,7 +651,10 @@ class ChatEngine:
                 raise ValueError
             if verified_kind != (payload.get("kind") or "chat"):
                 raise ValueError
-        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            file_payload = None
+            if inner.get("file") is not None:
+                file_payload = clean_file_payload(inner.get("file"))
+        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, ValueError, ProtocolError) as exc:
             raise GCMError("GCM 失败：消息语义元数据不一致") from exc
         if new_identity:
             self.sessions[sender] = state
@@ -574,7 +675,144 @@ class ChatEngine:
             except Exception:
                 # 明文已经认证成功且状态已提交；补池失败不能把消息伪装成解密失败。
                 self.last_error = "预密钥补充将在下次登录重试"
-        return text, verified_group, verified_kind
+        return text, verified_group, verified_kind, file_payload
+
+    def _apply_social(self, msg: dict[str, Any]) -> None:
+        self.friends = list(msg.get("friends") or [])
+        self.incoming_requests = list(msg.get("incoming") or [])
+        self.outgoing_requests = list(msg.get("outgoing") or [])
+        self.blocked_users = list(msg.get("blocked") or [])
+        self.rejected_requests = list(msg.get("rejected") or [])
+
+    def friend_names(self) -> set[str]:
+        return {str(item.get("username")) for item in self.friends}
+
+    async def refresh_social(self) -> None:
+        state = await self.request({"type": "friend_list"}, "friend_state")
+        self._apply_social(state)
+        profile = await self.request({"type": "profile_get"}, "profile")
+        self.profile = dict(profile.get("profile") or {})
+        privacy = await self.request({"type": "privacy_get"}, "privacy")
+        self.privacy = dict(privacy.get("privacy") or {})
+        await self.refresh_moments()
+
+    async def refresh_moments(self) -> None:
+        feed = await self.request({"type": "moment_feed"}, "moment_feed")
+        moments = list(feed.get("moments") or [])
+        loaded = 0
+        for item in moments:
+            if not item.get("has_image") or loaded >= 8:
+                continue
+            try:
+                detail = await self.request(
+                    {"type": "moment_get", "id": item.get("id")}, "moment_item"
+                )
+            except Exception:
+                continue
+            image = str((detail.get("moment") or {}).get("image") or "")
+            if image:
+                item["image"] = image
+                loaded += 1
+        self.moments = moments
+
+    async def friend_request(self, username: str, greeting: str = "") -> dict[str, Any]:
+        state = await self.request(
+            {"type": "friend_request", "to": username, "greeting": greeting},
+            "friend_state",
+        )
+        self._apply_social(state)
+        return state
+
+    async def friend_respond(self, username: str, accept: bool) -> dict[str, Any]:
+        state = await self.request(
+            {"type": "friend_respond", "username": username, "accept": bool(accept)},
+            "friend_state",
+        )
+        self._apply_social(state)
+        return state
+
+    async def friend_remove(self, username: str) -> dict[str, Any]:
+        state = await self.request(
+            {"type": "friend_remove", "username": username},
+            "friend_state",
+        )
+        self._apply_social(state)
+        return state
+
+    async def friend_block(self, username: str) -> dict[str, Any]:
+        state = await self.request(
+            {"type": "friend_block", "username": username},
+            "friend_state",
+        )
+        self._apply_social(state)
+        return state
+
+    async def search_users(self, query: str) -> dict[str, Any]:
+        return await self.request({"type": "user_search", "query": query}, "user_search")
+
+    async def profile_set(self, display_name: str, bio: str, avatar: str) -> dict[str, Any]:
+        result = await self.request(
+            {
+                "type": "profile_set",
+                "display_name": display_name,
+                "bio": bio,
+                "avatar": avatar,
+            },
+            "profile",
+        )
+        self.profile = dict(result.get("profile") or {})
+        return self.profile
+
+    async def privacy_set(
+        self,
+        *,
+        require_approval: bool,
+        moments_visibility: str,
+        show_online: bool,
+        searchable: bool,
+    ) -> dict[str, Any]:
+        result = await self.request(
+            {
+                "type": "privacy_set",
+                "require_approval": bool(require_approval),
+                "moments_visibility": moments_visibility,
+                "show_online": bool(show_online),
+                "searchable": bool(searchable),
+            },
+            "privacy",
+        )
+        self.privacy = dict(result.get("privacy") or {})
+        return self.privacy
+
+    async def moment_post(
+        self, body: str, image: str = "", visibility: str = "friends"
+    ) -> dict[str, Any]:
+        result = await self.request(
+            {
+                "type": "moment_post",
+                "body": body,
+                "image": image,
+                "visibility": visibility,
+            },
+            "moment_ok",
+        )
+        await self.refresh_moments()
+        return result
+
+    async def moment_delete(self, moment_id: str) -> None:
+        await self.request({"type": "moment_delete", "id": moment_id}, "moment_ok")
+        await self.refresh_moments()
+
+    async def moment_like(self, moment_id: str) -> None:
+        await self.request({"type": "moment_like", "id": moment_id}, "moment_ok")
+        await self.refresh_moments()
+
+    async def moment_comment(self, moment_id: str, body: str) -> None:
+        await self.request(
+            {"type": "moment_comment", "id": moment_id, "body": body},
+            "moment_ok",
+        )
+        await self.refresh_moments()
 
     async def list_users(self) -> dict[str, Any]:
         return await self.request({"type": "list_users"}, "users")
@@ -770,6 +1008,117 @@ async def handle_line(engine: ChatEngine, line: str) -> CommandResult:
         engine.current_group = parts[1]
         engine.current_peer = None
         return CommandResult(notice=f"已打开群 {parts[1]}")
+    if cmd == "/friend" and len(parts) >= 3:
+        action, name = parts[1], parts[2]
+        validate_username(name)
+        if action == "add":
+            greeting = line.split(maxsplit=3)[3] if len(parts) > 3 else ""
+            await engine.friend_request(name, greeting)
+            if name in engine.friend_names():
+                return CommandResult(notice=f"{name} 已是好友")
+            return CommandResult(notice=f"已向 {name} 发出好友申请")
+        if action == "accept":
+            await engine.friend_respond(name, True)
+            return CommandResult(notice=f"已同意 {name}")
+        if action == "reject":
+            await engine.friend_respond(name, False)
+            return CommandResult(notice=f"已拒绝 {name}")
+        if action in {"remove", "cancel"}:
+            await engine.friend_remove(name)
+            return CommandResult(notice=f"已解除与 {name} 的关系")
+        if action == "block":
+            await engine.friend_block(name)
+            return CommandResult(notice=f"已拉黑 {name}")
+        raise ProtocolError("用法：/friend add|accept|reject|remove|block 名字")
+    if cmd == "/friends":
+        rows = ["好友"]
+        rows.extend(
+            f"  {item['username']}  {item.get('display_name') or ''}" for item in engine.friends
+        )
+        if engine.incoming_requests:
+            rows.append("待我同意")
+            rows.extend(
+                f"  {item['username']}  {item.get('greeting') or ''}"
+                for item in engine.incoming_requests
+            )
+        if engine.outgoing_requests:
+            rows.append("等待对方同意")
+            rows.extend(f"  {item['username']}" for item in engine.outgoing_requests)
+        if engine.rejected_requests:
+            rows.append("对方未通过")
+            rows.extend(f"  {item['username']}" for item in engine.rejected_requests)
+        if engine.blocked_users:
+            rows.append("已拉黑")
+            rows.extend(f"  {item['username']}" for item in engine.blocked_users)
+        return CommandResult(overlay="\n".join(rows))
+    if cmd == "/search" and len(parts) >= 2:
+        found = await engine.search_users(line.split(maxsplit=1)[1])
+        rows = ["用户          关系"]
+        for item in found.get("users") or []:
+            rows.append(f"{item['username']:<14}{item.get('relation') or ''}")
+        return CommandResult(overlay="\n".join(rows) if len(rows) > 1 else "没有匹配的用户")
+    if cmd == "/profile":
+        if len(parts) == 1:
+            profile = engine.profile
+            body = (
+                f"{profile.get('display_name') or engine.username}\n"
+                f"{profile.get('bio') or '还没有简介'}"
+            )
+            return CommandResult(overlay=body)
+        name = line.split(maxsplit=1)[1]
+        await engine.profile_set(name, str(engine.profile.get("bio") or ""), str(engine.profile.get("avatar") or ""))
+        return CommandResult(notice=f"昵称已改为 {engine.profile.get('display_name')}")
+    if cmd == "/bio":
+        bio = line.split(maxsplit=1)[1] if len(parts) > 1 else ""
+        await engine.profile_set(
+            str(engine.profile.get("display_name") or engine.username),
+            bio,
+            str(engine.profile.get("avatar") or ""),
+        )
+        return CommandResult(notice="简介已更新")
+    if cmd == "/privacy" and len(parts) == 3:
+        privacy = {
+            "require_approval": bool(engine.privacy.get("require_approval", True)),
+            "moments_visibility": str(engine.privacy.get("moments_visibility") or "friends"),
+            "show_online": bool(engine.privacy.get("show_online", True)),
+            "searchable": bool(engine.privacy.get("searchable", True)),
+        }
+        key, value = parts[1], parts[2]
+        flag = value in {"on", "1", "true", "yes"}
+        if key == "approval":
+            privacy["require_approval"] = flag
+        elif key == "online":
+            privacy["show_online"] = flag
+        elif key == "search":
+            privacy["searchable"] = flag
+        elif key == "moments" and value in {"friends", "three_days", "none"}:
+            privacy["moments_visibility"] = value
+        else:
+            raise ProtocolError("用法：/privacy approval|online|search on|off，或 /privacy moments friends|three_days|none")
+        await engine.privacy_set(**privacy)
+        return CommandResult(notice="隐私设置已保存")
+    if cmd == "/moment":
+        if len(parts) == 1:
+            await engine.refresh_moments()
+            if not engine.moments:
+                return CommandResult(notice="朋友圈还是空的")
+            rows = []
+            for item in engine.moments:
+                rows.append(
+                    f"{item.get('display_name') or item.get('author')}  {item.get('body') or '[图片]'}"
+                )
+            return CommandResult(overlay="\n".join(rows))
+        await engine.moment_post(line.split(maxsplit=1)[1])
+        return CommandResult(notice="已发布到朋友圈")
+    if cmd == "/file" and len(parts) >= 2:
+        path = Path(line.split(maxsplit=1)[1])
+        data = path.read_bytes()
+        if engine.current_group:
+            await engine.send_file(path.name, data, group=engine.current_group)
+        else:
+            await engine.send_file(path.name, data)
+        engine.last_error = None
+        return CommandResult(notice=f"已投递 {path.name}")
     raise ProtocolError("无法识别的命令，输入 /help 查看")
 
 

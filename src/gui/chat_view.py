@@ -46,6 +46,7 @@ class ConvItem:
     muted: bool = False
     kind: str = "dm"
     clock: str = ""
+    avatar: str = ""
 
 
 class ConversationModel(QAbstractListModel):
@@ -129,6 +130,7 @@ class ConversationDelegate(QStyledItemDelegate):
             group=item.kind == "group",
             online_color=self.palette.online,
             pixel=18,
+            avatar=item.avatar,
         )
         left = 76
         right_pad = 16

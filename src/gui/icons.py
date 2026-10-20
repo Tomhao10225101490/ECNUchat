@@ -86,6 +86,19 @@ _PATHS: dict[str, str] = {
         '<path d="M22 21v-2a4 4 0 0 0-3-3.8"/>'
         '<path d="M16 4.1a3 3 0 0 1 0 5.8"/>'
     ),
+    "moments": (
+        '<rect x="4" y="5" width="16" height="14" rx="2"/>'
+        '<circle cx="12" cy="12" r="3.2"/>'
+        '<path d="M8 5.2 9.2 3h5.6L16 5.2"/>'
+    ),
+    "box": (
+        '<path d="M3 8h18v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8z"/>'
+        '<path d="M3 8 5.5 4h13L21 8"/>'
+        '<path d="M3 12h6a3 3 0 0 0 6 0h6"/>'
+    ),
+    "heart": (
+        '<path d="M12 20s-7-4.4-7-9a4 4 0 0 1 7-2 4 4 0 0 1 7 2c0 4.6-7 9-7 9z"/>'
+    ),
 }
 
 _cache: dict[tuple[str, str, int, float], QPixmap] = {}

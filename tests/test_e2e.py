@@ -32,6 +32,11 @@ def engine(tmp_path: Path, name: str) -> ChatEngine:
     return ChatEngine.open(name, "password123", str(tmp_path / f"{name}.db"))
 
 
+async def make_friends(left: ChatEngine, right: ChatEngine) -> None:
+    await left.friend_request(right.username, "你好")
+    await right.friend_respond(left.username, True)
+
+
 def test_e2e_chat_group_tamper_and_offline(tmp_path: Path) -> None:
     asyncio.run(_e2e(tmp_path))
 
@@ -66,6 +71,9 @@ async def _e2e(tmp_path: Path) -> None:
         assert first.get("opk")
         if second.get("opk"):
             assert second["opk"] != first["opk"]
+
+        await make_friends(alice, bob)
+        await make_friends(alice, carol)
 
         await alice.send_text("你好鲍勃", peer="bob")
         assert (await wait_pred(bob, lambda i: i.text == "你好鲍勃")).sender == "alice"
