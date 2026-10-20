@@ -280,7 +280,7 @@ def stylesheet(theme: Palette | str = "telegram") -> str:
     QWidget#header, QWidget#composer {{
         background: {p.bg_header};
     }}
-    QWidget#composer {{
+    QWidget#composer, QWidget#filePreview {{
         background: {p.bg_composer};
         border-top: 1px solid {p.hairline};
     }}
@@ -306,6 +306,11 @@ def stylesheet(theme: Palette | str = "telegram") -> str:
         background: {p.bg_menu};
         border: none;
         border-radius: 12px;
+    }}
+    QFrame#previewCard {{
+        background: {p.bg_input};
+        border: none;
+        border-radius: 10px;
     }}
     QLabel#title {{
         font-size: 17px;
@@ -437,6 +442,30 @@ def stylesheet(theme: Palette | str = "telegram") -> str:
     QPushButton[kind="danger"]:hover {{
         background: {p.danger_bg};
     }}
+    QPushButton#chip {{
+        background: {p.accent_soft};
+        color: {p.accent};
+        border-radius: 18px;
+        padding: 0;
+        min-width: 36px;
+        max-width: 36px;
+        min-height: 36px;
+        max-height: 36px;
+        font-size: 15px;
+        font-weight: 600;
+    }}
+    QPushButton#chip:hover {{
+        background: {p.accent};
+        color: {p.accent_text};
+    }}
+    QLabel#letterFlash {{
+        background: {p.bg_menu};
+        color: {p.text};
+        border: none;
+        border-radius: 16px;
+        font-size: 28px;
+        font-weight: 600;
+    }}
     QMenu {{
         background: {p.bg_menu};
         border: 1px solid {p.border};
@@ -529,7 +558,7 @@ def stylesheet(theme: Palette | str = "telegram") -> str:
         selection-background-color: {p.accent_soft};
         border: 1px solid {p.border};
     }}
-    QScrollArea {{
+    QStackedWidget, QScrollArea {{
         background: transparent;
         border: none;
     }}

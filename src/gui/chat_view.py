@@ -16,7 +16,17 @@ from PySide6.QtCore import (
     QVariantAnimation,
     Signal,
 )
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPalette, QPen
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QFontMetrics,
+    QImageReader,
+    QPainter,
+    QPainterPath,
+    QPalette,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QListView,
@@ -26,6 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.attachments import format_size
 from src.gui.icons import paint_icon
 from src.gui.logic import ChatItem, message_clock
 from src.gui.theme import PALETTES, RADIUS_BUBBLE, Palette
@@ -397,7 +408,9 @@ class MessageDelegate(QStyledItemDelegate):
         self.font_meta = ui_font(12)
         self.font_system = ui_font(12)
         self._cache: dict[tuple, QSize] = {}
+        self._pix: dict[tuple, QPixmap] = {}
         self.fail_rects: dict[int, QRect] = {}
+        self.open_rects: dict[int, QRect] = {}
 
     def apply_palette(self, palette: Palette) -> None:
         self.palette = palette
@@ -413,6 +426,7 @@ class MessageDelegate(QStyledItemDelegate):
         width = option.rect.width()
         if width < 40:
             width = self.view.viewport().width() or 640
+        attachment = item.attachment if isinstance(item.attachment, dict) else {}
         key = (
             item.key,
             item.kind,
@@ -424,6 +438,9 @@ class MessageDelegate(QStyledItemDelegate):
             item.show_name,
             item.reply_text,
             item.hint,
+            attachment.get("path"),
+            attachment.get("media"),
+            round(float(item.progress), 2),
             width,
             self.palette.name,
         )
@@ -461,11 +478,28 @@ class MessageDelegate(QStyledItemDelegate):
         meta_h = 16
         reply_h = 36 if item.reply_text else 0
         inner_max = max(48, max_bubble - pad_x * 2)
-        text_w, text_h = self._text_bounds(item.body, self.font_body, inner_max)
+        attachment = item.attachment if isinstance(item.attachment, dict) else None
+        media_kind = str(attachment.get("media") or "file") if attachment else ""
+        if attachment and media_kind == "image":
+            media_w, media_h = 220, 160
+        elif attachment and media_kind == "video":
+            media_w, media_h = 220, 132
+        elif attachment:
+            media_w, media_h = 220, 58
+        else:
+            media_w, media_h = 0, 0
+        media_w = min(media_w, inner_max)
+        caption = item.body if not attachment or item.body else ""
+        if attachment and not item.body:
+            text_w, text_h = 0, 0
+        else:
+            text_w, text_h = self._text_bounds(item.body or " ", self.font_body, inner_max)
         meta_w = QFontMetrics(self.font_meta).horizontalAdvance("00:00") + 22
-        content_w = max(text_w, meta_w, 72)
+        content_w = max(text_w, meta_w, media_w, 72)
         bubble_w = min(max_bubble, content_w + pad_x * 2)
-        bubble_h = pad_y + reply_h + text_h + 2 + meta_h + pad_y
+        text_gap = 6 if attachment and text_h else 0
+        progress_h = 8 if attachment and item.state == "sending" else 0
+        bubble_h = pad_y + reply_h + media_h + text_gap + text_h + progress_h + 2 + meta_h + pad_y
         top = 8 if item.is_head else 2
         name_h = 18 if item.show_name else 0
         height = top + name_h + max(bubble_h, 36 if item.show_avatar else 0) + 2
@@ -489,6 +523,11 @@ class MessageDelegate(QStyledItemDelegate):
             "pad_x": pad_x,
             "pad_y": pad_y,
             "meta_h": meta_h,
+            "media_h": media_h,
+            "media_kind": media_kind,
+            "text_gap": text_gap,
+            "progress_h": progress_h,
+            "caption": caption,
         }
 
     def _security_layout(self, item: ChatItem, width: int) -> dict:
@@ -660,6 +699,20 @@ class MessageDelegate(QStyledItemDelegate):
                 elide(item.reply_text, self.font_meta, int(reply.width() - 16)),
             )
             cursor_y += layout["reply_h"]
+        media_h = int(layout.get("media_h") or 0)
+        if media_h and isinstance(item.attachment, dict):
+            media = QRectF(
+                bubble.left() + layout["pad_x"],
+                cursor_y,
+                bubble.width() - layout["pad_x"] * 2,
+                media_h,
+            )
+            self._paint_attachment(painter, item, media, text_color)
+            absolute = media.translated(option_rect.topLeft()).toRect()
+            self.open_rects[row] = absolute
+            cursor_y += media_h + int(layout.get("text_gap") or 0)
+        else:
+            self.open_rects.pop(row, None)
         painter.setPen(QColor(text_color))
         painter.setFont(self.font_body)
         text_rect = QRectF(
@@ -673,6 +726,24 @@ class MessageDelegate(QStyledItemDelegate):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap,
             item.body,
         )
+        if media_h and item.state == "sending" and item.progress >= 0:
+            cursor_y += layout["text_h"]
+            ratio = max(0.0, min(1.0, float(item.progress)))
+            track = QRectF(
+                bubble.left() + layout["pad_x"],
+                cursor_y + 2,
+                bubble.width() - layout["pad_x"] * 2,
+                3,
+            )
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 40))
+            painter.drawRoundedRect(track, 1.5, 1.5)
+            painter.setBrush(QColor(self.palette.accent))
+            painter.drawRoundedRect(
+                QRectF(track.left(), track.top(), max(3.0, track.width() * ratio), 3),
+                1.5,
+                1.5,
+            )
         clock = message_clock(item.ts)
         painter.setFont(self.font_meta)
         painter.setPen(QColor(meta_color))
@@ -692,6 +763,102 @@ class MessageDelegate(QStyledItemDelegate):
         else:
             paint_icon(painter, "check", icon_rect, meta_color, dpr)
             self.fail_rects.pop(row, None)
+
+    def _paint_attachment(self, painter: QPainter, item: ChatItem, rect: QRectF, text_color: str) -> None:
+        attachment = item.attachment or {}
+        kind = str(attachment.get("media") or "file")
+        painter.save()
+        clip = QPainterPath()
+        clip.addRoundedRect(rect, 8, 8)
+        painter.setClipPath(clip)
+        if kind == "image":
+            pix = self._load_pix(str(attachment.get("path") or ""), int(rect.width()), int(rect.height()))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 24))
+            painter.drawRect(rect)
+            if pix is not None and not pix.isNull():
+                x = rect.left() + (rect.width() - pix.width()) / 2
+                y = rect.top() + (rect.height() - pix.height()) / 2
+                painter.drawPixmap(int(x), int(y), pix)
+            else:
+                self._paint_file_card(painter, attachment, rect, text_color)
+        elif kind == "video":
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#1c2733"))
+            painter.drawRect(rect)
+            painter.setBrush(QColor(255, 255, 255, 230))
+            cx, cy = rect.center().x(), rect.center().y() - 8
+            triangle = QPainterPath()
+            triangle.moveTo(cx - 8, cy - 12)
+            triangle.lineTo(cx + 14, cy)
+            triangle.lineTo(cx - 8, cy + 12)
+            triangle.closeSubpath()
+            painter.drawPath(triangle)
+            painter.setClipping(False)
+            painter.setPen(QColor("white"))
+            painter.setFont(self.font_meta)
+            name = elide(str(attachment.get("name") or "视频"), self.font_meta, int(rect.width() - 16))
+            painter.drawText(
+                QRectF(rect.left() + 8, rect.bottom() - 22, rect.width() - 16, 16),
+                name,
+            )
+        else:
+            painter.setClipping(False)
+            self._paint_file_card(painter, attachment, rect, text_color)
+        painter.restore()
+
+    def _paint_file_card(self, painter: QPainter, attachment: dict, rect: QRectF, text_color: str) -> None:
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 28))
+        painter.drawRoundedRect(rect, 10, 10)
+        badge = QRectF(rect.left() + 10, rect.center().y() - 14, 28, 28)
+        painter.setBrush(QColor(self.palette.accent))
+        painter.drawEllipse(badge)
+        dpr = self.view.devicePixelRatioF()
+        paint_icon(
+            painter,
+            "paperclip",
+            badge.adjusted(6, 6, -6, -6),
+            self.palette.accent_text,
+            dpr,
+        )
+        text_left = badge.right() + 10
+        text_width = max(24, rect.right() - text_left - 8)
+        painter.setPen(QColor(text_color))
+        painter.setFont(self.font_body)
+        name = elide(str(attachment.get("name") or "文件"), self.font_body, int(text_width))
+        painter.drawText(QRectF(text_left, rect.top() + 8, text_width, 20), name)
+        painter.setFont(self.font_meta)
+        painter.setPen(QColor(self.palette.text_secondary if text_color != self.palette.text_out else self.palette.meta_out))
+        size = format_size(int(attachment.get("size") or 0))
+        painter.drawText(
+            QRectF(text_left, rect.top() + 30, text_width, 16),
+            f"{size} · 打开",
+        )
+
+    def _load_pix(self, path: str, width: int, height: int) -> QPixmap | None:
+        if not path or width < 8 or height < 8:
+            return None
+        key = (path, width, height)
+        cached = self._pix.get(key)
+        if cached is not None:
+            return cached
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)
+        image = reader.read()
+        if image.isNull():
+            pix = QPixmap()
+        else:
+            pix = QPixmap.fromImage(image).scaled(
+                width,
+                height,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        if len(self._pix) > 48:
+            self._pix.clear()
+        self._pix[key] = pix
+        return pix
 
     def _tail_path(self, bubble: QRectF, mine: bool) -> QPainterPath:
         """贴在下角的小尖角，伸出不超过 5px，留在头像缝里。"""
@@ -713,6 +880,8 @@ class MessageList(QListView):
     copyRequested = Signal(object)
     replyRequested = Signal(object)
     deleteRequested = Signal(object)
+    openRequested = Signal(object)
+    filesDropped = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -727,6 +896,7 @@ class MessageList(QListView):
         self.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.setFrameShape(QListView.Shape.NoFrame)
         self.setMouseTracking(True)
+        self.setAcceptDrops(True)
         self.verticalScrollBar().setSingleStep(12)
         self.setLayoutMode(QListView.LayoutMode.SinglePass)
         install_overlay_scroll(self)
@@ -789,7 +959,36 @@ class MessageList(QListView):
                     if item and item.local_id:
                         self.retryRequested.emit(item.local_id)
                         return
+            for row, rect in list(self.delegate.open_rects.items()):
+                if rect.contains(event.pos()):
+                    item = self._model.items[row] if row < len(self._model.items) else None
+                    if item and item.attachment:
+                        self.openRequested.emit(item)
+                        return
         super().mousePressEvent(event)
+
+    def dragEnterEvent(self, event) -> None:
+        mime = event.mimeData()
+        if mime is not None and mime.hasUrls():
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event) -> None:
+        paths: list[str] = []
+        mime = event.mimeData()
+        if mime is not None:
+            for url in mime.urls():
+                if url.isLocalFile():
+                    paths.append(url.toLocalFile())
+        if not paths:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self.filesDropped.emit(paths)
 
     def contextMenuEvent(self, event) -> None:
         index = self.indexAt(event.pos())

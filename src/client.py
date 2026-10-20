@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import json
 import uuid
 import sys
@@ -25,6 +24,19 @@ from rich.panel import Panel
 from rich.text import Text
 
 from src import PROJECT_ABSTRACT, PROJECT_NAME
+from src.attachments import (
+    MAX_FILE_BYTES,
+    AttachmentError,
+    attachment_root,
+    attachment_view,
+    display_text,
+    history_body,
+    meta_from_dict,
+    meta_to_dict,
+    open_bytes,
+    plaintext_len,
+    seal_bytes,
+)
 from src.double_ratchet import (
     GCMError,
     RatchetError,
@@ -35,26 +47,45 @@ from src.double_ratchet import (
     init_receiver,
     init_sender,
 )
-from src.prekeys import generate_identity, generate_x25519, sign_bytes, verify_spk
+from src.groups import (
+    GroupStateError,
+    build_add_state,
+    build_genesis_state,
+    verify_group_state_sig,
+    verify_state_transition,
+)
+from src.prekeys import (
+    MLKEM768_PUB_LEN,
+    PqOneTimePrekey,
+    generate_identity,
+    generate_x25519,
+    sign_bytes,
+    verify_pq,
+    verify_pq_opk,
+    verify_spk,
+)
 from src.protocol import (
     ProtocolError,
     b64d,
     b64e,
     check_size,
+    decode_group_state,
     decode_ratchet_payload,
     dumps,
+    encode_group_state,
     encode_ratchet_payload,
     fingerprint,
     fingerprint_short,
     loads,
     validate_username,
 )
-from src.social import clean_file_payload, clean_filename
 from src.store import ClientStore
 from src.x3dh import (
     X3DHError,
     build_initial_message,
+    initiator_hybrid_secret,
     initiator_secret,
+    responder_hybrid_secret,
     responder_secret,
     verify_initial,
 )
@@ -69,6 +100,7 @@ class Incoming:
     group: str | None
     kind: str
     error: str | None = None
+    attachment: dict[str, Any] | None = None
 
 
 @dataclass
@@ -85,7 +117,8 @@ class ChatEngine:
     identity: Any
     sessions: dict[str, RatchetState] = field(default_factory=dict)
     groups: dict[str, list[str]] = field(default_factory=dict)
-    peer_keys: dict[str, tuple[bytes, bytes]] = field(default_factory=dict)
+    group_chain: dict[str, list] = field(default_factory=dict)
+    peer_keys: dict[str, tuple[bytes, bytes, bytes | None]] = field(default_factory=dict)
     current_peer: str | None = None
     current_group: str | None = None
     last_error: str | None = None
@@ -99,16 +132,19 @@ class ChatEngine:
     incoming_requests: list[dict[str, Any]] = field(default_factory=list)
     outgoing_requests: list[dict[str, Any]] = field(default_factory=list)
     blocked_users: list[dict[str, Any]] = field(default_factory=list)
+    rejected_requests: list[dict[str, Any]] = field(default_factory=list)
     profile: dict[str, Any] = field(default_factory=dict)
     privacy: dict[str, Any] = field(default_factory=dict)
     moments: list[dict[str, Any]] = field(default_factory=list)
-    rejected_requests: list[dict[str, Any]] = field(default_factory=list)
     _send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     ws: Any = None
     _waiters: dict[str, asyncio.Future] = field(default_factory=dict)
     _incoming_raw: asyncio.Queue = field(default_factory=asyncio.Queue)
     _tasks: list[asyncio.Task] = field(default_factory=list)
     _peer_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    _incoming_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _incoming_done: set[str] = field(default_factory=set)
+    on_file_progress: Any = None
 
     @classmethod
     def open(cls, username: str, password: str, db_path: str) -> ChatEngine:
@@ -128,6 +164,8 @@ class ChatEngine:
             identity=identity,
         )
         engine.groups = store.load_groups()
+        for name in engine.groups:
+            engine.group_chain[name] = store.load_group_chain(name)
         for peer in store.list_sessions():
             state = store.load_session(peer)
             if state:
@@ -140,6 +178,9 @@ class ChatEngine:
             self.store.save_session(peer, state)
         for name, members in self.groups.items():
             self.store.save_group(name, members)
+        for name, chain in self.group_chain.items():
+            for state in chain:
+                self.store.save_group_state(state)
 
     def status_line(self) -> str:
         if self.current_group:
@@ -214,11 +255,19 @@ class ChatEngine:
                 else:
                     raise
             self.store.save_peer(
-                "__registered__", self.identity.ik_sign_pub, self.identity.ik_dh_pub
+                "__registered__",
+                self.identity.ik_sign_pub,
+                self.identity.ik_dh_pub,
+                self.identity.pq_pub,
             )
         await self._retry_outboxes()
         try:
+            await self._retry_incoming_files()
+        except Exception:
+            self.last_error = "文件下载将在下次连接重试"
+        try:
             await self._retry_pending_prekeys()
+            await self._ensure_local_prekey_pools()
         except Exception:
             self.last_error = "预密钥补充将在下次登录重试"
         try:
@@ -229,35 +278,88 @@ class ChatEngine:
     async def _retry_outboxes(self) -> None:
         """重连后重发原始加密信封，不再次推进双棘轮。"""
         for peer in self.store.list_outbox_peers():
-            payload = self.store.load_outbox(peer)
-            if payload is None:
-                continue
+            lock = self._peer_locks.setdefault(peer, asyncio.Lock())
             try:
-                await self.request(
-                    {
-                        "type": "envelope",
-                        "from": self.username,
-                        "to": peer,
-                        "payload": payload,
-                    },
-                    "envelope_ok",
-                )
+                async with lock:
+                    await self._flush_outbox(peer)
             except Exception:
                 self.last_error = "待发加密信封将在下次重连重试"
-                continue
-            self.store.delete_outbox(peer)
-            if payload.get("x3dh") is not None:
-                self.pending_x3dh.pop(peer, None)
+
+    async def _flush_outbox(self, peer: str) -> None:
+        pending_payload = self.store.load_outbox(peer)
+        if pending_payload is None:
+            return
+        await self.request(
+            {
+                "type": "envelope",
+                "from": self.username,
+                "to": peer,
+                "payload": pending_payload,
+            },
+            "envelope_ok",
+        )
+        self.store.delete_outbox(peer)
+        if pending_payload.get("x3dh") is not None:
+            self.pending_x3dh.pop(peer, None)
+
+    def _progress(self, local_id: str, done: int, total: int) -> None:
+        callback = self.on_file_progress
+        if callback is not None:
+            callback(local_id, done, total)
 
     async def _retry_pending_prekeys(self) -> None:
         pending = self.store.load_pending_prekeys()
-        if not pending:
+        pending_pq = self.store.load_pending_pq_opks()
+        if not pending and not pending_pq:
             return
-        await self.request(
-            {"type": "upload_prekeys", "opks": [b64e(pub) for pub in pending]},
-            "upload_prekeys_ok",
+        payload: dict[str, Any] = {"type": "upload_prekeys"}
+        if pending:
+            payload["opks"] = [b64e(pub) for pub in pending]
+        if pending_pq:
+            payload["pq_opks"] = [
+                {"pub": b64e(pub), "sig": b64e(sig)} for pub, sig in pending_pq
+            ]
+        await self.request(payload, "upload_prekeys_ok")
+        if pending:
+            self.store.clear_pending_prekeys()
+        if pending_pq:
+            self.store.clear_pending_pq_opks()
+
+    async def _push_prekeys(
+        self, opks: list[Any], pq_opks: list[PqOneTimePrekey]
+    ) -> None:
+        """先把待上传公钥写入保险库，再发给服务器。失败则下次登录重试。"""
+        if not opks and not pq_opks:
+            return
+        if opks:
+            self.store.save_pending_prekeys([item.pub for item in opks])
+        if pq_opks:
+            self.store.save_pending_pq_opks(
+                [(item.pub, item.signature) for item in pq_opks]
+            )
+        payload: dict[str, Any] = {"type": "upload_prekeys"}
+        if opks:
+            payload["opks"] = [b64e(item.pub) for item in opks]
+        if pq_opks:
+            payload["pq_opks"] = [
+                {"pub": b64e(item.pub), "sig": b64e(item.signature)} for item in pq_opks
+            ]
+        await self.request(payload, "upload_prekeys_ok")
+        if opks:
+            self.store.clear_pending_prekeys()
+        if pq_opks:
+            self.store.clear_pending_pq_opks()
+
+    async def _ensure_local_prekey_pools(self) -> None:
+        """旧保险库没有一次性 PQ 预密钥时，登录后补池并上传。"""
+        opk_created = self.identity.refill_opks() if self.identity.needs_refill() else []
+        pq_created = (
+            self.identity.refill_pq_opks() if self.identity.needs_pq_refill() else []
         )
-        self.store.clear_pending_prekeys()
+        if not opk_created and not pq_created:
+            return
+        self.store.save_identity(self.identity)
+        await self._push_prekeys(opk_created, pq_created)
 
     async def _register(self) -> None:
         await self.request(
@@ -270,6 +372,12 @@ class ChatEngine:
                 "spk_sig": b64e(self.identity.spk.signature),
                 "spk_created": self.identity.spk.created,
                 "opks": [b64e(o.pub) for o in self.identity.opks],
+                "pq_pub": b64e(self.identity.pq_pub),
+                "pq_sig": b64e(self.identity.pq_sig),
+                "pq_opks": [
+                    {"pub": b64e(item.pub), "sig": b64e(item.signature)}
+                    for item in self.identity.pq_opks
+                ],
             },
             "register_ok",
         )
@@ -324,10 +432,11 @@ class ChatEngine:
         if typ == "envelope":
             await self._on_envelope(msg)
         elif typ == "group_update":
-            name = msg["group"]
-            members = list(msg["members"])
-            self.groups[name] = members
-            self.store.save_group(name, members)
+            name = msg.get("group", "")
+            if msg.get("state"):
+                await self._on_group_update(name, msg["state"])
+            else:
+                self._fail("", name, "群状态缺少签名，已拒绝未受保护的成员表")
             await self.inbox.put(Incoming("系统", "", name, "presence"))
         elif typ == "presence":
             self.online_users = set(msg.get("online") or [])
@@ -345,7 +454,63 @@ class ChatEngine:
             self.last_error = msg.get("message")
             await self.inbox.put(Incoming("", "", None, "sys", self.last_error))
 
-    async def fetch_user(self, name: str) -> tuple[bytes, bytes]:
+    async def _on_group_update(self, name: str, raw_state: dict[str, Any]) -> None:
+        """端到端验证一条群状态：验签 + 哈希链 + 授权，失败即拒绝。
+
+        这是群成员完整性的防线：服务器只能转发合法成员签署的状态，
+        伪造名单在这里被拦下。
+        """
+        try:
+            state = decode_group_state(raw_state)
+        except ProtocolError as exc:
+            self._fail("", name, f"群状态无效：{exc}")
+            return
+        chain = self.group_chain.get(name) or []
+        if chain and state.epoch <= chain[-1].epoch:
+            return  # 已经验证过的纪元，幂等忽略
+        previous = chain[-1] if chain else None
+        try:
+            verify_state_transition(previous, state)
+            ik_sign, _, _ = await self.fetch_user(state.signer)
+            verify_group_state_sig(state, ik_sign)
+        except (GroupStateError, ProtocolError, X3DHError, InvalidSignature) as exc:
+            # 可能是缺链（例如刚被拉进群，还没见过创世状态）。先同步补链：
+            # 同步本身会整链验证，伪造的名单在同步里同样过不去。
+            try:
+                await self.sync_group(name)
+            except Exception:
+                self._fail("", name, f"群状态签名无效，已拒绝：{exc}")
+                return
+            chain_now = self.group_chain.get(name) or []
+            if not chain_now or chain_now[-1].epoch < state.epoch:
+                self._fail("", name, f"群状态签名无效，已拒绝：{exc}")
+            return
+        chain.append(state)
+        self.group_chain[name] = chain
+        self.groups[name] = list(state.members)
+        self.store.save_group_state(state)
+        self.store.save_group(name, list(state.members))
+
+    async def sync_group(self, name: str) -> None:
+        """补拉群状态链并整体验证。漏投状态（而非伪造）靠这里发现。"""
+        result = await self.request({"type": "group_sync", "group": name}, "group_states")
+        raw_states = result.get("states") or []
+        if not raw_states:
+            return
+        chain: list = []
+        for raw in raw_states:
+            state = decode_group_state(raw)
+            verify_state_transition(chain[-1] if chain else None, state)
+            ik_sign, _, _ = await self.fetch_user(state.signer)
+            verify_group_state_sig(state, ik_sign)
+            chain.append(state)
+        self.group_chain[name] = chain
+        self.groups[name] = list(chain[-1].members)
+        self.store.save_group(name, list(chain[-1].members))
+        for state in chain:
+            self.store.save_group_state(state)
+
+    async def fetch_user(self, name: str) -> tuple[bytes, bytes, bytes | None]:
         if name in self.peer_keys:
             return self.peer_keys[name]
         cached = self.store.load_peer(name)
@@ -353,47 +518,146 @@ class ChatEngine:
             self.peer_keys[name] = cached
             return cached
         info = await self.request({"type": "fetch_user", "username": name}, "user")
-        keys = (b64d(info["ik_sign_pub"]) or b"", b64d(info["ik_dh_pub"]) or b"")
+        keys = (
+            b64d(info["ik_sign_pub"]) or b"",
+            b64d(info["ik_dh_pub"]) or b"",
+            b64d(info.get("ik_pq_pub")),
+        )
         self.peer_keys[name] = keys
-        self.store.save_peer(name, keys[0], keys[1])
+        self.store.save_peer(name, keys[0], keys[1], keys[2])
         return keys
 
     async def start_session(self, peer: str) -> RatchetState:
         if peer in self.sessions:
             return self.sessions[peer]
-        bundle = await self.request({"type": "fetch_bundle", "username": peer}, "bundle")
+        bundle = await self.request(
+            {"type": "fetch_bundle", "username": peer, "consume_pq_opk": True},
+            "bundle",
+        )
         ik_sign = b64d(bundle["ik_sign_pub"]) or b""
         ik_dh = b64d(bundle["ik_dh_pub"]) or b""
         spk_pub = b64d(bundle["spk_pub"]) or b""
         spk_sig = b64d(bundle["spk_sig"]) or b""
+        pq_pub = b64d(bundle.get("pq_pub"))
+        pq_sig = b64d(bundle.get("pq_sig"))
         try:
             verify_spk(ik_sign, spk_pub, peer, spk_sig)
         except InvalidSignature as exc:
             self.last_error = "对方预密钥签名无效"
             raise X3DHError("对方预密钥签名无效") from exc
+        if pq_pub is not None and pq_sig is not None:
+            try:
+                verify_pq(ik_sign, pq_pub, peer, pq_sig)
+            except InvalidSignature as exc:
+                self.last_error = "对方 PQ 密钥签名无效"
+                raise X3DHError("对方 PQ 密钥签名无效") from exc
+        if (pq_pub is None) != (pq_sig is None):
+            raise X3DHError("对方预密钥包里的 PQK 公钥与签名不配套")
         pinned = self.store.load_peer(peer)
-        if pinned is not None and pinned != (ik_sign, ik_dh):
-            self.last_error = "身份密钥发生变化"
-            raise X3DHError("身份密钥发生变化：已拒绝覆盖已核对的指纹")
-        self.peer_keys[peer] = (ik_sign, ik_dh)
+        if pinned is not None:
+            p_sign, p_dh, p_pq = pinned
+            if (
+                p_sign != ik_sign
+                or p_dh != ik_dh
+                or (p_pq is not None and p_pq != pq_pub)
+            ):
+                self.last_error = "身份密钥发生变化"
+                raise X3DHError("身份密钥发生变化：已拒绝覆盖已核对的指纹")
+        self.peer_keys[peer] = (ik_sign, ik_dh, pq_pub)
         if pinned is None:
-            self.store.save_peer(peer, ik_sign, ik_dh)
+            self.store.save_peer(peer, ik_sign, ik_dh, pq_pub)
         ek_priv, ek_pub = generate_x25519()
         opk = b64d(bundle.get("opk"))
-        sk = initiator_secret(
-            self.identity.ik_dh_priv, ek_priv, spk_pub, ik_dh, opk
-        )
-        state = init_sender(sk, spk_pub, self.username, peer)
-        self.pending_x3dh[peer] = build_initial_message(
-            self.identity.ik_sign_priv, self.identity.ik_dh_pub, ek_pub, opk
-        )
+        pq_opk = b64d(bundle.get("pq_opk"))
+        pq_opk_sig = b64d(bundle.get("pq_opk_sig"))
+        if (pq_opk is None) != (pq_opk_sig is None):
+            raise X3DHError("对方一次性 PQ 预密钥与签名不配套")
+        if pq_opk is not None and (
+            len(pq_opk) != MLKEM768_PUB_LEN or pq_opk_sig is None or len(pq_opk_sig) != 64
+        ):
+            raise X3DHError("对方一次性 PQ 预密钥长度无效")
+        if pq_pub is not None and self.identity.pq_pub is not None:
+            # 有签过名的一次性钥就用它；服务器扣留时才落到长期 PQK。
+            # 棘轮封装目标始终是长期 PQK，不用这把一次性钥。
+            ek_target = pq_pub
+            handshake_pq = "pqk"
+            if pq_opk is not None and pq_opk_sig is not None:
+                try:
+                    verify_pq_opk(ik_sign, pq_opk, peer, pq_opk_sig)
+                except InvalidSignature as exc:
+                    self.last_error = "对方一次性 PQ 预密钥签名无效"
+                    raise X3DHError("对方一次性 PQ 预密钥签名无效") from exc
+                ek_target = pq_opk
+                handshake_pq = "pqopk"
+            sk, pq_ct = initiator_hybrid_secret(
+                self.identity.ik_dh_priv,
+                ek_priv,
+                spk_pub,
+                ik_dh,
+                opk,
+                ek_target,
+            )
+            state = init_sender(
+                sk,
+                spk_pub,
+                self.username,
+                peer,
+                remote_pq_pk=pq_pub,
+                handshake_pq=handshake_pq,
+            )
+            self.pending_x3dh[peer] = build_initial_message(
+                self.identity.ik_sign_priv,
+                self.identity.ik_dh_pub,
+                ek_pub,
+                opk,
+                ik_pq_pub_a=self.identity.pq_pub,
+                pq_ek_pub=ek_target,
+                pq_ct=pq_ct,
+            )
+        else:
+            sk = initiator_secret(
+                self.identity.ik_dh_priv, ek_priv, spk_pub, ik_dh, opk
+            )
+            state = init_sender(sk, spk_pub, self.username, peer)
+            self.pending_x3dh[peer] = build_initial_message(
+                self.identity.ik_sign_priv, self.identity.ik_dh_pub, ek_pub, opk
+            )
         self.sessions[peer] = state
         return state
 
     async def _ensure_session_for_send(self, peer: str) -> RatchetState:
-        if peer in self.sessions:
-            return self.sessions[peer]
-        return await self.start_session(peer)
+        if peer not in self.sessions:
+            return await self.start_session(peer)
+        state = self.sessions[peer]
+        # 旧会话迁移：状态里没有对端 PQK 公钥时补拉 bundle。
+        # 之后这条会话换出的每条新链都混入 PQ，升级前的旧消息仍是经典密文。
+        if state.remote_pq_pk is None:
+            pq_pub = await self._upgrade_pq_key(peer)
+            if pq_pub is not None:
+                state.remote_pq_pk = pq_pub
+                self.store.save_session(peer, state)
+        return state
+
+    async def _upgrade_pq_key(self, peer: str) -> bytes | None:
+        """拉取对端 bundle 并核验 PQK 签名，返回已固定的 PQK 公钥。"""
+        try:
+            bundle = await self.request(
+                {"type": "fetch_bundle", "username": peer}, "bundle"
+            )
+        except ProtocolError:
+            return None
+        pq_pub = b64d(bundle.get("pq_pub"))
+        pq_sig = b64d(bundle.get("pq_sig"))
+        if pq_pub is None or pq_sig is None:
+            return None
+        ik_sign = b64d(bundle["ik_sign_pub"]) or b""
+        verify_pq(ik_sign, pq_pub, peer, pq_sig)
+        keys = self.store.load_peer(peer)
+        if keys and keys[2] is not None and keys[2] != pq_pub:
+            raise X3DHError("对端 PQK 发生变化，已拒绝降级")
+        self.store.save_peer(peer, ik_sign, b64d(bundle["ik_dh_pub"]) or b"", pq_pub)
+        self.peer_keys[peer] = (ik_sign, b64d(bundle["ik_dh_pub"]) or b"", pq_pub)
+        return pq_pub
 
     async def send_text(self, text: str, *, peer: str | None = None, group: str | None = None) -> None:
         """发送一条聊天正文。群消息按成员扇出，每人一封双棘轮信封。
@@ -409,20 +673,23 @@ class ChatEngine:
         正式题名是 *More is Less: On the End-to-End Security of Group
         Chats in Signal, WhatsApp, and Threema*。
 
-        成员名单仍是服务器记录（`group_create` / `group_add`）。论文里的
-        群完整性与「谁有权管理群」没有被这个扇出补上。`group_meta` 只是
-        把通知正文放进同一套逐人信封。
+        成员名单来自已验签的哈希链，不听服务器口头宣布。每封群消息的
+        内层 JSON 带上 `gstate`。`group_meta` 用同一套逐人信封。
         """
         if group:
-            members = self.groups.get(group) or []
+            state = self._verified_group_state(group)
+            members = list(state.members)
             others = [m for m in members if m != self.username]
             if not others:
                 raise ProtocolError("群里没有其他成员")
+            gstate = state.state_hash().hex()
             self.store.add_history(f"group:{group}", self.username, text)
             delivered = 0
             try:
                 for other in others:
-                    await self._send_one(other, text, group=group, kind="chat")
+                    await self._send_one(
+                        other, text, group=group, kind="chat", gstate=gstate
+                    )
                     delivered += 1
             except Exception:
                 self.store.add_history(
@@ -435,53 +702,249 @@ class ChatEngine:
         dest = peer or self.current_peer
         if not dest:
             raise ProtocolError("先用 /chat 名字 选择对端")
-        await self._send_one(dest, text, group=None, kind="chat")
+        await self._send_one(dest, text, group=None, kind="chat", gstate=None)
         self.store.add_history(f"dm:{dest}", self.username, text)
 
     async def send_file(
         self,
-        filename: str,
-        data: bytes,
+        path: str | None = None,
         *,
         peer: str | None = None,
         group: str | None = None,
         caption: str = "",
-    ) -> None:
-        """把文件放进双棘轮信封。服务器只转发密文，投递箱只在本机解开。"""
-        payload = clean_file_payload(
-            {"name": filename, "data": base64.b64encode(data).decode("ascii")}
-        )
-        assert payload is not None
-        label = f"[文件] {payload['name']}"
-        shown = f"{caption.strip()}\n{label}" if caption.strip() else label
+        local_id: str | None = None,
+        data: bytes | None = None,
+        filename: str | None = None,
+        mime: str | None = None,
+    ) -> str:
+        """上传一份密文，再给每个收件人发一封带文件钥匙的棘轮信封。"""
+        if not isinstance(caption, str) or len(caption) > 2000:
+            raise ProtocolError("附件说明过长")
+        local_id = local_id or uuid.uuid4().hex
+        gstate = None
         if group:
-            members = self.groups.get(group) or []
-            others = [m for m in members if m != self.username]
-            if not others:
+            state = self._verified_group_state(group)
+            members = list(state.members)
+            recipients = sorted(member for member in members if member != self.username)
+            if not recipients:
                 raise ProtocolError("群里没有其他成员")
-            self.store.add_history(f"group:{group}", self.username, shown)
-            delivered = 0
-            try:
-                for other in others:
-                    await self._send_one(
-                        other, caption, group=group, kind="chat", file=payload
-                    )
-                    delivered += 1
-            except Exception:
+            conv = f"group:{group}"
+            target_group: str | None = group
+            gstate = state.state_hash().hex()
+        else:
+            dest = peer or self.current_peer
+            if not dest:
+                raise ProtocolError("先用 /chat 名字 选择对端")
+            if dest == self.username:
+                raise ProtocolError("不能给自己发文件")
+            recipients = [dest]
+            conv = f"dm:{dest}"
+            target_group = None
+        record = self.store.load_file_job(local_id)
+        if record is None:
+            record = self._new_file_job(
+                local_id=local_id,
+                conv=conv,
+                group=target_group,
+                recipients=recipients,
+                caption=caption,
+                path=path,
+                data=data,
+                filename=filename,
+                mime=mime,
+            )
+            record["gstate"] = gstate
+        else:
+            recipients = list(record["recipients"])
+            conv = str(record["conv"])
+            target_group = record.get("group")
+        if not record.get("history"):
+            record["history"] = self._file_history_body(record)
+        self.store.save_file_job(local_id, record)
+        self.store.save_message_status(local_id, conv, str(record["history"]), "sending")
+        if not record.get("uploaded"):
+            await self._upload_file(record)
+            record["uploaded"] = True
+            self.store.save_file_job(local_id, record)
+        if not record.get("logged"):
+            self.store.add_history(conv, self.username, str(record["history"]))
+            record["logged"] = True
+            self.store.save_file_job(local_id, record)
+        delivered = 0
+        try:
+            for other in recipients:
+                await self._deliver_file_envelope(other, record)
+                delivered += 1
+        except Exception:
+            if target_group:
                 self.store.add_history(
-                    f"group:{group}",
+                    conv,
                     "系统",
-                    f"文件仅送达 {delivered}/{len(others)} 人，可稍后重试",
+                    f"文件仅送达 {delivered}/{len(recipients)} 人，可稍后重试",
                 )
-                raise
-            self._write_dropbox(group, payload["name"], payload["data"], "out")
-            return
-        dest = peer or self.current_peer
-        if not dest:
-            raise ProtocolError("先用 /chat 名字 选择对端")
-        await self._send_one(dest, caption, group=None, kind="chat", file=payload)
-        self.store.add_history(f"dm:{dest}", self.username, shown)
-        self._write_dropbox(dest, payload["name"], payload["data"], "out")
+            raise
+        size = int(record["meta"]["size"])
+        self._progress(local_id, size, size)
+        return str(record["history"])
+
+    def _new_file_job(
+        self,
+        *,
+        local_id: str,
+        conv: str,
+        group: str | None,
+        recipients: list[str],
+        caption: str,
+        path: str | None,
+        data: bytes | None,
+        filename: str | None,
+        mime: str | None,
+    ) -> dict[str, Any]:
+        if data is None:
+            if not path:
+                raise ProtocolError("没有要发送的文件")
+            file_path = Path(path)
+            if not file_path.is_file():
+                raise ProtocolError("文件不存在")
+            if file_path.stat().st_size > MAX_FILE_BYTES:
+                raise ProtocolError("文件超过 32MiB")
+            payload = file_path.read_bytes()
+            filename = filename or file_path.name
+        else:
+            if len(data) > MAX_FILE_BYTES:
+                raise ProtocolError("文件超过 32MiB")
+            payload = bytes(data)
+            filename = filename or "file"
+        sealed = seal_bytes(payload, filename, mime)
+        blob_hex = sealed.meta.file_id.hex()
+        root = attachment_root(self.store.path)
+        cipher = root / "cipher" / blob_hex
+        cipher.mkdir(parents=True, exist_ok=True)
+        for index, chunk in enumerate(sealed.chunks):
+            (cipher / str(index)).write_bytes(chunk)
+        rel = f"files/{blob_hex}/{sealed.meta.name}"
+        dest = root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(payload)
+        return {
+            "local_id": local_id,
+            "conv": conv,
+            "group": group,
+            "recipients": recipients,
+            "caption": caption,
+            "meta": meta_to_dict(sealed.meta),
+            "rel": rel,
+            "enveloped": [],
+            "uploaded": False,
+            "logged": False,
+            "history": "",
+        }
+
+    def _file_history_body(self, record: dict[str, Any]) -> str:
+        meta = meta_from_dict(record["meta"])
+        return history_body(
+            name=meta.name,
+            mime=meta.mime,
+            size=meta.size,
+            sha256=meta.sha256,
+            rel_path=str(record["rel"]),
+            caption=str(record.get("caption") or ""),
+        )
+
+    async def _upload_file(self, record: dict[str, Any]) -> None:
+        meta = meta_from_dict(record["meta"])
+        blob_id = meta.file_id.hex()
+        await self.request(
+            {
+                "type": "blob_begin",
+                "id": blob_id,
+                "size": meta.size,
+                "chunks": meta.chunks,
+                "recipients": list(record["recipients"]),
+            },
+            "blob_begin_ok",
+        )
+        cipher = attachment_root(self.store.path) / "cipher" / blob_id
+        total = meta.size
+        sent = 0
+        self._progress(str(record["local_id"]), 0, total)
+        for index in range(meta.chunks):
+            chunk_path = cipher / str(index)
+            if not chunk_path.is_file():
+                raise ProtocolError("本地密文丢失")
+            ciphertext = chunk_path.read_bytes()
+            await self.request(
+                {
+                    "type": "blob_chunk",
+                    "id": blob_id,
+                    "idx": index,
+                    "data": b64e(ciphertext),
+                },
+                "blob_chunk_ok",
+            )
+            sent += plaintext_len(meta.size, meta.chunks, index)
+            self._progress(str(record["local_id"]), sent, total)
+        await self.request({"type": "blob_finish", "id": blob_id}, "blob_finish_ok")
+
+    async def _deliver_file_envelope(self, peer: str, record: dict[str, Any]) -> None:
+        lock = self._peer_locks.setdefault(peer, asyncio.Lock())
+        async with lock:
+            if peer in (record.get("enveloped") or []):
+                await self._flush_outbox(peer)
+                return
+            await self._flush_outbox(peer)
+            state = await self._ensure_session_for_send(peer)
+            x3dh = self.pending_x3dh.get(peer)
+            inner = json.dumps(
+                {
+                    "v": 1,
+                    "text": record.get("caption") or "",
+                    "group": record.get("group"),
+                    "kind": "file",
+                    "gstate": record.get("gstate"),
+                    "file": record["meta"],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            if len(inner) > 12 * 1024:
+                raise ProtocolError("附件说明过长")
+            msg, message_key = encrypt(state, inner)
+            del message_key
+            payload = encode_ratchet_payload(
+                msg, x3dh=x3dh, group=record.get("group"), kind="file"
+            )
+            check_size(
+                dumps(
+                    {
+                        "type": "envelope",
+                        "from": self.username,
+                        "to": peer,
+                        "payload": payload,
+                    }
+                )
+            )
+            updated = dict(record)
+            updated["enveloped"] = list(record.get("enveloped") or []) + [peer]
+            self.store.save_session_with_outbox(
+                peer,
+                state,
+                payload,
+                file_job=(str(record["local_id"]), updated),
+            )
+            record["enveloped"] = updated["enveloped"]
+            await self.request(
+                {
+                    "type": "envelope",
+                    "from": self.username,
+                    "to": peer,
+                    "payload": payload,
+                },
+                "envelope_ok",
+            )
+            self.store.delete_outbox(peer)
+            if x3dh is not None:
+                self.pending_x3dh.pop(peer, None)
 
     async def _send_one(
         self,
@@ -490,30 +953,18 @@ class ChatEngine:
         *,
         group: str | None,
         kind: str,
-        file: dict[str, str] | None = None,
+        gstate: str | None = None,
     ) -> dict[str, Any]:
         lock = self._peer_locks.setdefault(peer, asyncio.Lock())
         async with lock:
-            pending_payload = self.store.load_outbox(peer)
-            if pending_payload is not None:
-                await self.request(
-                    {
-                        "type": "envelope",
-                        "from": self.username,
-                        "to": peer,
-                        "payload": pending_payload,
-                    },
-                    "envelope_ok",
-                )
-                self.store.delete_outbox(peer)
-                if pending_payload.get("x3dh") is not None:
-                    self.pending_x3dh.pop(peer, None)
+            await self._flush_outbox(peer)
             state = await self._ensure_session_for_send(peer)
             x3dh = self.pending_x3dh.get(peer)
-            body: dict[str, Any] = {"v": 1, "text": text, "group": group, "kind": kind}
-            if file is not None:
-                body["file"] = clean_file_payload(file)
-            inner = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            inner = json.dumps(
+                {"v": 1, "text": text, "group": group, "kind": kind, "gstate": gstate},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
             msg, _mk = encrypt(state, inner)
             # 消息钥匙用后即弃：MK 不进棘轮状态，也不进日志。
             # 这是 CRYPTO 2022 对称棘轮的一次性消息钥匙，不是把 MK 留到下一世代。
@@ -541,7 +992,7 @@ class ChatEngine:
         payload = env["payload"]
         group = payload.get("group")
         try:
-            text, verified_group, verified_kind, file_payload = await self._decrypt_envelope(
+            text, verified_group, verified_kind, file_meta = await self._decrypt_envelope(
                 sender, payload
             )
             group = verified_group
@@ -561,20 +1012,23 @@ class ChatEngine:
             self._fail(sender, group, str(exc))
             return
         self.last_error = None
+        if verified_kind == "file" and file_meta is not None:
+            record = {
+                "meta": meta_to_dict(file_meta),
+                "sender": sender,
+                "group": verified_group,
+                "caption": text,
+                "logged": False,
+            }
+            try:
+                await self._accept_incoming(record)
+            except AttachmentError:
+                self._fail(sender, verified_group, "GCM 失败")
+            except Exception:
+                self._fail(sender, verified_group, "文件下载失败")
+            return
         conv = f"group:{group}" if group else f"dm:{sender}"
         who = "系统" if verified_kind == "group_meta" else sender
-        if file_payload is not None:
-            label = f"[文件] {file_payload['name']}"
-            text = f"{text}\n{label}" if text else label
-            try:
-                self._write_dropbox(
-                    group or sender,
-                    file_payload["name"],
-                    file_payload["data"],
-                    "in",
-                )
-            except Exception:
-                self.last_error = "文件已解密，但没有写进投递箱"
         self.store.add_history(conv, who, text)
         await self.inbox.put(Incoming(who, text, group, verified_kind))
 
@@ -585,35 +1039,135 @@ class ChatEngine:
             self.store.add_history(conv, "系统", phrase)
         self.inbox.put_nowait(Incoming(sender, "", group, "error", phrase))
 
-    def _write_dropbox(self, peer: str, name: str, data_b64: str, direction: str) -> None:
-        raw = base64.b64decode(data_b64)
-        item_id = uuid.uuid4().hex
-        safe = clean_filename(name)
-        folder = Path(self.store.path).parent / "dropbox" / self.username
-        folder.mkdir(parents=True, exist_ok=True)
-        path = folder / f"{item_id}_{safe}"
-        path.write_bytes(raw)
-        self.store.add_dropbox(item_id, peer, safe, direction, len(raw), str(path))
+    async def _retry_incoming_files(self) -> None:
+        for _blob_id, record in self.store.list_incoming_files():
+            try:
+                await self._accept_incoming(record)
+            except AttachmentError:
+                blob_id = str(record.get("meta", {}).get("id") or _blob_id)
+                self.store.delete_incoming_file(blob_id)
+                self._fail(str(record.get("sender") or ""), record.get("group"), "GCM 失败")
+            except Exception:
+                self.last_error = "文件下载将在下次连接重试"
+
+    async def _accept_incoming(self, record: dict[str, Any]) -> None:
+        """同一份文件只下载一次。登录补拉和实时信封可能撞在一起。"""
+        blob_id = str(record.get("meta", {}).get("id") or "")
+        async with self._incoming_lock:
+            if blob_id in self._incoming_done:
+                return
+            self._incoming_done.add(blob_id)
+        try:
+            await self._finish_incoming(record)
+        except Exception:
+            async with self._incoming_lock:
+                self._incoming_done.discard(blob_id)
+            raise
+
+    async def _finish_incoming(self, record: dict[str, Any]) -> None:
+        meta = meta_from_dict(record["meta"])
+        blob_id = meta.file_id.hex()
+        self.store.save_incoming_file(blob_id, record)
+        try:
+            plain = await self._download_file(meta)
+        except AttachmentError:
+            self.store.delete_incoming_file(blob_id)
+            raise
+        rel = f"files/{blob_id}/{meta.name}"
+        dest = attachment_root(self.store.path) / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        partial = dest.with_name(dest.name + ".part")
+        partial.write_bytes(plain)
+        partial.replace(dest)
+        body = history_body(
+            name=meta.name,
+            mime=meta.mime,
+            size=meta.size,
+            sha256=meta.sha256,
+            rel_path=rel,
+            caption=str(record.get("caption") or ""),
+        )
+        fresh = not record.get("logged")
+        conv = (
+            f"group:{record['group']}"
+            if record.get("group")
+            else f"dm:{record['sender']}"
+        )
+        if fresh:
+            self.store.add_history(conv, str(record["sender"]), body)
+            record["logged"] = True
+            record["history"] = body
+            self.store.save_incoming_file(blob_id, record)
+        self.store.delete_incoming_file(blob_id)
+        try:
+            await self.request({"type": "blob_done", "id": blob_id}, "blob_done_ok")
+        except Exception:
+            self.last_error = "文件已收下，服务器清理将在下次重试"
+        if fresh:
+            await self.inbox.put(
+                Incoming(
+                    str(record["sender"]),
+                    display_text(body, self.store.path),
+                    record.get("group"),
+                    "file",
+                    attachment=attachment_view(self.store.path, body),
+                )
+            )
+
+    async def _download_file(self, meta: Any) -> bytes:
+        blob_id = meta.file_id.hex()
+        chunks: list[bytes] = []
+        for index in range(meta.chunks):
+            resp = await self.request(
+                {"type": "blob_fetch", "id": blob_id, "idx": index},
+                "blob_fetch_ok",
+            )
+            if resp.get("id") != blob_id or resp.get("idx") != index:
+                raise ProtocolError("分片编号对不上")
+            data = b64d(resp.get("data"))
+            if data is None:
+                raise ProtocolError("分片缺失")
+            chunks.append(data)
+        return open_bytes(meta, chunks)
 
     async def _decrypt_envelope(
         self, sender: str, payload: dict[str, Any]
-    ) -> tuple[str, str | None, str, dict[str, str] | None]:
+    ) -> tuple[str, str | None, str, Any]:
         ratchet_msg, init = decode_ratchet_payload(payload)
         new_identity = False
         consumed_opk: bytes | None = None
+        consumed_pq: bytes | None = None
+        handshake_pq: str | None = None
         if sender not in self.sessions:
             if init is None:
                 raise X3DHError("没有会话且缺少 X3DH 初始消息")
-            ik_sign, ik_dh = await self.fetch_user(sender)
+            ik_sign, ik_dh, server_pq = await self.fetch_user(sender)
             try:
                 verify_initial(
-                    ik_sign, init.ik_dh_pub, init.ek_pub, init.opk_pub, init.signature
+                    ik_sign,
+                    init.ik_dh_pub,
+                    init.ek_pub,
+                    init.opk_pub,
+                    init.signature,
+                    init.ik_pq_pub,
+                    init.pq_ek_pub,
+                    init.pq_ct,
                 )
             except X3DHError:
                 self.last_error = "验签失败"
                 raise
             if init.ik_dh_pub != ik_dh:
                 raise X3DHError("验签失败：身份协商公钥与服务器登记不一致")
+            hybrid = (
+                init.pq_ct is not None
+                and init.ik_pq_pub is not None
+                and init.pq_ek_pub is not None
+            )
+            if self.identity.pq_priv is not None and not hybrid:
+                # 本机支持 PQ 却收到不完整或经典的初始消息：拒绝静默降级。
+                raise X3DHError("缺少 PQ 握手，已拒绝降级")
+            if server_pq is not None and init.ik_pq_pub != server_pq:
+                raise X3DHError("验签失败：PQ 公钥与服务器登记不一致")
             opk_priv = None
             if init.opk_pub:
                 matching = next(
@@ -624,22 +1178,72 @@ class ChatEngine:
                     raise X3DHError("本地没有对应的一次性预密钥私钥")
                 opk_priv = matching.priv
                 consumed_opk = init.opk_pub
-            sk = responder_secret(
-                self.identity.spk.priv,
-                self.identity.ik_dh_priv,
-                init.ik_dh_pub,
-                init.ek_pub,
-                opk_priv,
-            )
+            if hybrid:
+                if self.identity.pq_priv is None or self.identity.pq_pub is None:
+                    raise X3DHError("本机身份没有 PQK 私钥，无法完成混合握手")
+                if init.pq_ek_pub is None or init.pq_ct is None:
+                    raise X3DHError("混合握手缺少封装公钥")
+                match = next(
+                    (
+                        item
+                        for item in self.identity.pq_opks
+                        if item.pub == init.pq_ek_pub
+                    ),
+                    None,
+                )
+                if match is not None:
+                    pq_priv_hs = match.priv
+                    consumed_pq = init.pq_ek_pub
+                    handshake_pq = "pqopk"
+                elif init.pq_ek_pub == self.identity.pq_pub:
+                    pq_priv_hs = self.identity.pq_priv
+                    handshake_pq = "pqk"
+                else:
+                    raise X3DHError("本地没有对应的一次性 PQ 预密钥")
+                sk = responder_hybrid_secret(
+                    self.identity.spk.priv,
+                    self.identity.ik_dh_priv,
+                    init.ik_dh_pub,
+                    init.ek_pub,
+                    opk_priv,
+                    pq_priv_hs,
+                    init.pq_ct,
+                    init.pq_ek_pub,
+                )
+            else:
+                sk = responder_secret(
+                    self.identity.spk.priv,
+                    self.identity.ik_dh_priv,
+                    init.ik_dh_pub,
+                    init.ek_pub,
+                    opk_priv,
+                )
             state = init_receiver(
-                sk, self.identity.spk.priv, ratchet_msg.header.dh_pub, self.username, sender
+                sk,
+                self.identity.spk.priv,
+                ratchet_msg.header.dh_pub,
+                self.username,
+                sender,
+                remote_pq_pk=init.ik_pq_pub if hybrid else None,
+                pq_ct=ratchet_msg.pq_ct if hybrid else None,
+                local_pq_priv=self.identity.pq_priv if hybrid else None,
+                handshake_pq=handshake_pq,
             )
             new_identity = True
         else:
             state = self.sessions[sender]
-        plaintext, mk = decrypt(state, ratchet_msg)
+            if state.remote_pq_pk is None and ratchet_msg.pq_ct is not None:
+                # 旧会话收到带 PQ 的链：补拉对端 PQK 并固定，完成迁移。
+                state.remote_pq_pk = await self._upgrade_pq_key(sender)
+                if state.remote_pq_pk is None:
+                    raise RatchetError("协议错误", "对端没有 PQK，无法迁移该会话")
+                self.store.save_session(sender, state)
+        plaintext, mk = decrypt(
+            state, ratchet_msg, pq_priv=self.identity.pq_priv
+        )
         # 解开后的 MK 立即丢掉。跳过缓存里的那一把已在 decrypt 内弹出。
         del mk
+        file_meta = None
         try:
             inner = json.loads(plaintext.decode("utf-8"))
             if not isinstance(inner, dict) or inner.get("v") != 1:
@@ -647,35 +1251,60 @@ class ChatEngine:
             text = inner["text"]
             verified_group = inner.get("group")
             verified_kind = inner.get("kind", "chat")
+            verified_gstate = inner.get("gstate")
+            if verified_kind not in {"chat", "group_meta", "file"}:
+                raise ValueError
             if not isinstance(text, str) or verified_group != payload.get("group"):
                 raise ValueError
             if verified_kind != (payload.get("kind") or "chat"):
                 raise ValueError
-            file_payload = None
-            if inner.get("file") is not None:
-                file_payload = clean_file_payload(inner.get("file"))
-        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, ValueError, ProtocolError) as exc:
+            if verified_group:
+                if not verified_gstate or not self._check_group_binding(
+                    verified_group, verified_gstate, sender
+                ):
+                    raise ValueError
+            elif verified_gstate:
+                raise ValueError
+            file_payload = inner.get("file")
+            if verified_kind == "file":
+                if not isinstance(file_payload, dict):
+                    raise ValueError
+                file_meta = meta_from_dict(file_payload)
+            elif file_payload is not None:
+                raise ValueError
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            KeyError,
+            ValueError,
+            AttachmentError,
+        ) as exc:
             raise GCMError("GCM 失败：消息语义元数据不一致") from exc
         if new_identity:
             self.sessions[sender] = state
             if consumed_opk is not None:
                 self.identity.take_opk(consumed_opk)
+            if consumed_pq is not None:
+                self.identity.take_pq_opk(consumed_pq)
             self.store.save_identity(self.identity)
         self.store.save_session(sender, state)
-        if new_identity and self.identity.needs_refill():
-            created = self.identity.refill_opks()
-            self.store.save_identity(self.identity)
-            self.store.save_pending_prekeys([item.pub for item in created])
-            try:
-                await self.request(
-                    {"type": "upload_prekeys", "opks": [b64e(o.pub) for o in created]},
-                    "upload_prekeys_ok",
-                )
-                self.store.clear_pending_prekeys()
-            except Exception:
-                # 明文已经认证成功且状态已提交；补池失败不能把消息伪装成解密失败。
-                self.last_error = "预密钥补充将在下次登录重试"
-        return text, verified_group, verified_kind, file_payload
+        if new_identity and (
+            self.identity.needs_refill() or self.identity.needs_pq_refill()
+        ):
+            created = (
+                self.identity.refill_opks() if self.identity.needs_refill() else []
+            )
+            created_pq = (
+                self.identity.refill_pq_opks() if self.identity.needs_pq_refill() else []
+            )
+            if created or created_pq:
+                self.store.save_identity(self.identity)
+                try:
+                    await self._push_prekeys(created, created_pq)
+                except Exception:
+                    # 明文已经认证成功且状态已提交；补池失败不能把消息伪装成解密失败。
+                    self.last_error = "预密钥补充将在下次登录重试"
+        return text, verified_group, verified_kind, file_meta
 
     def _apply_social(self, msg: dict[str, Any]) -> None:
         self.friends = list(msg.get("friends") or [])
@@ -817,39 +1446,81 @@ class ChatEngine:
     async def list_users(self) -> dict[str, Any]:
         return await self.request({"type": "list_users"}, "users")
 
+    def _verified_group_state(self, name: str):
+        """返回本地已通过端到端验证的最新群状态。"""
+        chain = self.group_chain.get(name) or []
+        if not chain:
+            raise ProtocolError(f"群 {name} 没有已验证的成员状态，先 /group {name} 同步")
+        return chain[-1]
+
+    def _check_group_binding(self, group: str, gstate: str, sender: str) -> bool:
+        """群消息必须绑定到一条已验签的群状态，且发送者在该状态的成员表里。"""
+        chain = self.group_chain.get(group) or []
+        for state in chain:
+            if state.state_hash().hex() == gstate:
+                return sender in state.members
+        return False
+
     async def create_group(self, name: str, members: list[str]) -> None:
         all_members = list(dict.fromkeys([self.username, *members]))
+        state = build_genesis_state(
+            self.identity.ik_sign_priv, name, self.username, all_members
+        )
         await self.request(
-            {"type": "group_create", "group": name, "members": all_members},
+            {
+                "type": "group_create",
+                "group": name,
+                "members": all_members,
+                "state": encode_group_state(state),
+            },
             "group_update",
         )
+        self.group_chain[name] = [state]
         self.groups[name] = all_members
+        self.store.save_group_state(state)
         self.store.save_group(name, all_members)
         self.current_group = name
         self.current_peer = None
         notice = f"{self.username} 创建了群，成员 {', '.join(all_members)}"
         self.store.add_history(f"group:{name}", "系统", notice)
+        gstate = state.state_hash().hex()
         for other in all_members:
             if other == self.username:
                 continue
-            await self._send_one(other, notice, group=name, kind="group_meta")
+            await self._send_one(
+                other, notice, group=name, kind="group_meta", gstate=gstate
+            )
 
     async def add_group_member(self, name: str, member: str) -> None:
+        previous = self._verified_group_state(name)
+        state = build_add_state(
+            self.identity.ik_sign_priv, previous, member, self.username
+        )
         await self.request(
-            {"type": "group_add", "group": name, "member": member},
+            {
+                "type": "group_add",
+                "group": name,
+                "member": member,
+                "state": encode_group_state(state),
+            },
             "group_update",
         )
-        members = self.groups.get(name) or []
-        if member not in members:
-            members.append(member)
+        members = list(state.members)
+        chain = self.group_chain.get(name) or []
+        chain.append(state)
+        self.group_chain[name] = chain
         self.groups[name] = members
+        self.store.save_group_state(state)
         self.store.save_group(name, members)
         notice = f"{self.username} 将 {member} 加入 {name}"
         self.store.add_history(f"group:{name}", "系统", notice)
+        gstate = state.state_hash().hex()
         for other in members:
             if other == self.username:
                 continue
-            await self._send_one(other, notice, group=name, kind="group_meta")
+            await self._send_one(
+                other, notice, group=name, kind="group_meta", gstate=gstate
+            )
 
     async def close(self) -> None:
         self.persist()
@@ -869,7 +1540,7 @@ def print_banner(engine: ChatEngine) -> None:
     console.print(Panel(body, title=PROJECT_NAME, border_style="cyan"))
     console.print(
         "[dim]/chat 名字  /fingerprint 名字  /group create 群名 成员…  "
-        "/group add 群名 新成员  /history  /users  /help  /quit[/dim]"
+        "/group add 群名 新成员  /file 路径  /pq status 名字  /history  /users  /help  /quit[/dim]"
     )
 
 
@@ -882,7 +1553,7 @@ def _history_text(engine: ChatEngine) -> str:
         return "先选择会话"
     lines = []
     for sender, body, _ts in engine.store.get_history(conv):
-        lines.append(f"{sender}: {body}")
+        lines.append(f"{sender}: {display_text(body, engine.store.path)}")
     return "\n".join(lines) if lines else "这个会话还没有消息"
 
 
@@ -989,25 +1660,11 @@ async def handle_line(engine: ChatEngine, line: str) -> CommandResult:
         if name == engine.username:
             ik = engine.identity.ik_sign_pub
         else:
-            ik, _ = await engine.fetch_user(name)
+            ik, *_ = await engine.fetch_user(name)
         groups = fingerprint(ik).split()
         grid = "\n".join("  ".join(groups[i : i + 4]) for i in range(0, 16, 4))
         body = f"{name} 的 IK_sign 指纹\n用线下渠道核对这 16 组。不一致就不要继续聊。\n\n{grid}"
         return CommandResult(overlay=body, notice=f"{name} 指纹已显示")
-    if cmd == "/history":
-        return CommandResult(overlay=_history_text(engine))
-    if cmd == "/group" and len(parts) >= 2:
-        if parts[1] == "create" and len(parts) >= 4:
-            await engine.create_group(parts[2], parts[3:])
-            return CommandResult(notice=f"已创建群 {parts[2]}")
-        if parts[1] == "add" and len(parts) == 4:
-            await engine.add_group_member(parts[2], parts[3])
-            return CommandResult(notice=f"已将 {parts[3]} 加入 {parts[2]}")
-        if parts[1] not in engine.groups:
-            raise ProtocolError(f"群 {parts[1]} 不存在")
-        engine.current_group = parts[1]
-        engine.current_peer = None
-        return CommandResult(notice=f"已打开群 {parts[1]}")
     if cmd == "/friend" and len(parts) >= 3:
         action, name = parts[1], parts[2]
         validate_username(name)
@@ -1110,15 +1767,69 @@ async def handle_line(engine: ChatEngine, line: str) -> CommandResult:
             return CommandResult(overlay="\n".join(rows))
         await engine.moment_post(line.split(maxsplit=1)[1])
         return CommandResult(notice="已发布到朋友圈")
-    if cmd == "/file" and len(parts) >= 2:
-        path = Path(line.split(maxsplit=1)[1])
-        data = path.read_bytes()
+    if cmd == "/file":
+        pieces = line.split(maxsplit=1)
+        if len(pieces) != 2 or not pieces[1].strip():
+            raise ProtocolError("用法：/file 路径")
+        file_path = pieces[1].strip()
         if engine.current_group:
-            await engine.send_file(path.name, data, group=engine.current_group)
+            await engine.send_file(file_path, group=engine.current_group)
         else:
-            await engine.send_file(path.name, data)
+            await engine.send_file(file_path)
         engine.last_error = None
-        return CommandResult(notice=f"已投递 {path.name}")
+        return CommandResult(notice=f"已发送文件 {Path(file_path).name}")
+    if cmd == "/pq" and len(parts) == 3 and parts[1] == "status":
+        name = parts[2]
+        if name == engine.username:
+            if engine.identity.pq_pub:
+                row = (
+                    "本机 PQK：已生成 (ML-KEM-768)，长期封装公钥\n"
+                    f"一次性 PQ 预密钥剩余 {len(engine.identity.pq_opks)} 把"
+                )
+            else:
+                row = "本机 PQK：无"
+            return CommandResult(overlay=row)
+        if name not in engine.sessions:
+            raise ProtocolError(f"还没有与 {name} 的会话")
+        state = engine.sessions[name]
+        if state.remote_pq_pk is None:
+            upgraded = await engine._upgrade_pq_key(name)
+            if upgraded is None:
+                return CommandResult(
+                    overlay=f"{name}：经典 X3DH，对端没有 PQK，无法迁移"
+                )
+            state.remote_pq_pk = upgraded
+            engine.store.save_session(name, state)
+        if state.handshake_pq == "pqopk":
+            handshake = "一次性 PQ 预密钥（首条认证成功后私钥已删除）"
+        elif state.handshake_pq == "pqk":
+            handshake = "签过名的长期 PQK（服务器未提供一次性钥）"
+        else:
+            handshake = "经典 X3DH，棘轮侧已补上长期 PQK"
+        return CommandResult(
+            overlay=(
+                f"{name}：混合 PQXDH\n"
+                f"握手封装：{handshake}\n"
+                f"棘轮已混入 PQ：{'是' if state.dhs_pq_ct else '否（下一次换链起生效）'}\n"
+                f"棘轮代数 {state.dh_ratchet_count}"
+            )
+        )
+    if cmd == "/history":
+        return CommandResult(overlay=_history_text(engine))
+    if cmd == "/group" and len(parts) >= 2:
+        if parts[1] == "create" and len(parts) >= 4:
+            await engine.create_group(parts[2], parts[3:])
+            return CommandResult(notice=f"已创建群 {parts[2]}")
+        if parts[1] == "add" and len(parts) == 4:
+            await engine.add_group_member(parts[2], parts[3])
+            return CommandResult(notice=f"已将 {parts[3]} 加入 {parts[2]}")
+        if parts[1] not in engine.groups:
+            raise ProtocolError(f"群 {parts[1]} 不存在")
+        if parts[1] not in engine.group_chain:
+            await engine.sync_group(parts[1])
+        engine.current_group = parts[1]
+        engine.current_peer = None
+        return CommandResult(notice=f"已打开群 {parts[1]}")
     raise ProtocolError("无法识别的命令，输入 /help 查看")
 
 

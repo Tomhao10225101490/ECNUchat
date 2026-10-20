@@ -164,15 +164,8 @@ async def _social(tmp_path: Path) -> None:
         await wait_until(lambda: not any(item["id"] == moment_id for item in alice.moments))
 
         payload = b"hello-dropbox"
-        await alice.send_file("note.txt", payload, peer="bob")
-        await wait_until(lambda: any(row[1].endswith("note.txt") for row in bob.store.get_history("dm:alice")))
-        saved = bob.store.list_dropbox()
-        assert saved[0]["name"] == "note.txt"
-        assert saved[0]["direction"] == "in"
-        assert Path(saved[0]["path"]).read_bytes() == payload
-        assert alice.store.list_dropbox()[0]["direction"] == "out"
-        with pytest.raises(ProtocolError, match="24KB"):
-            await alice.send_file("big.bin", b"x" * (24 * 1024 + 1), peer="bob")
+        await alice.send_file(data=payload, filename="note.txt", peer="bob")
+        await wait_until(lambda: any("note.txt" in row[1] for row in bob.store.get_history("dm:alice")))
 
         await alice.friend_remove("bob")
         with pytest.raises(ProtocolError, match="好友"):

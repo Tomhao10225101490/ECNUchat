@@ -283,8 +283,7 @@ class IconButton(QAbstractButton):
                 color.setAlphaF(min(1.0, 0.35 + self._hover * 0.65))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(color)
-            radius = RADIUS_BUTTON
-            painter.drawRoundedRect(QRectF(1, 1, self.width() - 2, self.height() - 2), radius, radius)
+            painter.drawEllipse(QRectF(2, 2, self.width() - 4, self.height() - 4))
         dpr = self.devicePixelRatioF()
         side = float(self.icon_px)
         rect = QRectF((self.width() - side) / 2, (self.height() - side) / 2, side, side)
@@ -332,6 +331,81 @@ class NavButton(IconButton):
             label = "9+" if self._badge > 9 else str(self._badge)
             painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, label)
             painter.end()
+
+
+class MenuRow(QAbstractButton):
+    """主菜单里的一行：图标加文字，选中只改颜色。"""
+
+    def __init__(self, name: str, label: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.icon_name = name
+        self.label = label
+        self.active = False
+        self._badge = 0
+        self._hover = False
+        self._accent = "#3390EC"
+        self._text = "#F2F6FA"
+        self._muted = "#708499"
+        self._hover_bg = "#202B36"
+        self._badge_color = "#3390EC"
+        self.setFixedHeight(46)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    def set_active(self, active: bool) -> None:
+        self.active = active
+        self.update()
+
+    def set_badge(self, count: int) -> None:
+        self._badge = max(0, int(count))
+        self.update()
+
+    def apply_nav(self, accent: str, text: str, muted: str, hover: str, badge: str = "#3390EC") -> None:
+        self._accent = accent
+        self._text = text
+        self._muted = muted
+        self._hover_bg = hover
+        self._badge_color = badge
+        self.update()
+
+    def enterEvent(self, event) -> None:
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event: QPaintEvent) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        if self._hover:
+            painter.fillRect(self.rect(), QColor(self._hover_bg))
+        color = self._accent if self.active else self._muted
+        paint_icon(painter, self.icon_name, QRectF(16, 12, 22, 22), color, self.devicePixelRatioF())
+        painter.setPen(QColor(self._accent if self.active else self._text))
+        painter.setFont(ui_font(15))
+        painter.drawText(
+            QRectF(50, 0, max(20, self.width() - 86), self.height()),
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            self.label,
+        )
+        if self._badge <= 0:
+            return
+        label = "9+" if self._badge > 9 else str(self._badge)
+        font = ui_font(11, QFont.Weight.DemiBold)
+        painter.setFont(font)
+        width = max(18, QFontMetrics(font).horizontalAdvance(label) + 10)
+        badge = QRectF(self.width() - 16 - width, (self.height() - 18) / 2, width, 18)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(self._badge_color))
+        painter.drawRoundedRect(badge, 9, 9)
+        painter.setPen(QColor("#FFFFFF"))
+        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, label)
 
 
 class SendButton(QAbstractButton):

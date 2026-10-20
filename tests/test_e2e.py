@@ -11,7 +11,9 @@ import websockets
 
 from src.client import ChatEngine
 from src.double_ratchet import GCMError, RatchetError, RatchetState, decrypt
-from src.protocol import decode_ratchet_payload
+from src.groups import sign_group_state
+from src.prekeys import generate_identity
+from src.protocol import decode_ratchet_payload, encode_group_state
 from src.server import ChatServer
 from src.store import ServerStore
 
@@ -71,17 +73,29 @@ async def _e2e(tmp_path: Path) -> None:
         assert first.get("opk")
         if second.get("opk"):
             assert second["opk"] != first["opk"]
+        # 不带 consume_pq_opk 的目录查询不能烧掉一次性封装公钥。
+        assert first.get("pq_opk") is None
+        assert second.get("pq_opk") is None
 
         await make_friends(alice, bob)
         await make_friends(alice, carol)
 
         await alice.send_text("你好鲍勃", peer="bob")
         assert (await wait_pred(bob, lambda i: i.text == "你好鲍勃")).sender == "alice"
+        # 混合 PQXDH：双方会话都已记录对端 PQK，棘轮链携带 PQ 封装。
+        # 握手优先用一次性 PQ 预密钥，首条认证成功后 Bob 删掉对应私钥。
+        assert alice.sessions["bob"].remote_pq_pk is not None
+        assert bob.sessions["alice"].remote_pq_pk is not None
+        assert alice.sessions["bob"].dhs_pq_ct is not None
+        assert alice.sessions["bob"].handshake_pq == "pqopk"
+        assert bob.sessions["alice"].handshake_pq == "pqopk"
+        assert len(bob.identity.pq_opks) == 7
 
         await bob.send_text("你好爱丽丝", peer="alice")
         assert (await wait_pred(alice, lambda i: i.text == "你好爱丽丝")).sender == "bob"
         assert alice.sessions["bob"].dh_ratchet_count >= 2
         assert bob.sessions["alice"].dh_ratchet_count >= 2
+        assert bob.sessions["alice"].dhs_pq_ct is not None
 
         await alice.send_text("给卡罗尔", peer="carol")
         assert (await wait_pred(carol, lambda i: i.text == "给卡罗尔")).text == "给卡罗尔"
@@ -111,9 +125,46 @@ async def _e2e(tmp_path: Path) -> None:
         assert await wait_pred(bob, lambda i: i.text == "群里大家好")
         assert await wait_pred(carol, lambda i: i.text == "群里大家好")
 
+        # 合法拉人：签名群状态被各端验证并接受
+        dave = engine(tmp_path, "dave")
+        await dave.connect(uri)
+        await make_friends(alice, dave)
+        await alice.add_group_member("三人组", "dave")
+        assert await wait_pred(bob, lambda i: i.group == "三人组", timeout=15)
+        assert dave.username in bob.groups["三人组"]
+        await alice.send_text("戴夫也能收到", group="三人组")
+        assert await wait_pred(dave, lambda i: i.text == "戴夫也能收到")
+
+        # 伪造群状态：服务器（或注入者）用非成员密钥签一份加幽灵成员的名单，
+        # 客户端端到端验证必须拒绝，且本地成员表不变。
+        mallory = generate_identity("mallory")
+        latest = bob.group_chain["三人组"][-1]
+        forged = sign_group_state(
+            mallory.ik_sign_priv,
+            name="三人组",
+            epoch=latest.epoch + 1,
+            members=list(latest.members) + ["mallory"],
+            prev_hash=latest.state_hash(),
+            signer="mallory",
+        )
+        await bob._on_server(
+            {
+                "type": "group_update",
+                "group": "三人组",
+                "members": list(forged.members),
+                "state": encode_group_state(forged),
+            }
+        )
+        assert (
+            await wait_pred(bob, lambda i: i.error and "群状态" in i.error)
+        ).error
+        assert "mallory" not in bob.groups["三人组"]
+        assert bob.group_chain["三人组"][-1].epoch == latest.epoch
+
         await alice.close()
         await bob.close()
         await carol.close()
+        await dave.close()
 
     store2 = ServerStore(tmp_path / "server.db")
     assert store2.user_exists("alice")

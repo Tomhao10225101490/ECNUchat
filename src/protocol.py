@@ -12,6 +12,8 @@ import re
 from typing import Any
 
 from src.double_ratchet import Header, RatchetMessage
+from src.groups import GENESIS_PREV_HASH, GroupState
+from src.prekeys import MLKEM768_CT_LEN, MLKEM768_PUB_LEN
 from src.x3dh import InitialMessage
 
 PROJECT_NAME = "基于ECDH与AES-GCM的端到端加密聊天室"
@@ -32,6 +34,12 @@ PROTOCOL_TYPES = (
     "upload_prekeys",
     "fetch_bundle",
     "envelope",
+    "blob_begin",
+    "blob_chunk",
+    "blob_finish",
+    "blob_fetch",
+    "blob_done",
+    "group_sync",
     "error",
 )
 
@@ -106,12 +114,19 @@ def check_size(raw: str | bytes) -> None:
 
 
 def encode_x3dh(init: InitialMessage) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "ik_dh_pub": b64e(init.ik_dh_pub),
         "ek_pub": b64e(init.ek_pub),
         "opk_pub": b64e(init.opk_pub),
         "signature": b64e(init.signature),
     }
+    if init.ik_pq_pub is not None:
+        payload["ik_pq_pub"] = b64e(init.ik_pq_pub)
+    if init.pq_ek_pub is not None:
+        payload["pq_ek"] = b64e(init.pq_ek_pub)
+    if init.pq_ct is not None:
+        payload["pq_ct"] = b64e(init.pq_ct)
+    return payload
 
 
 def decode_x3dh(data: dict[str, Any] | None) -> InitialMessage | None:
@@ -126,6 +141,21 @@ def decode_x3dh(data: dict[str, Any] | None) -> InitialMessage | None:
             else None
         ),
         signature=_fixed(data.get("signature"), 64, "初始消息签名"),
+        ik_pq_pub=(
+            _fixed(data.get("ik_pq_pub"), MLKEM768_PUB_LEN, "IK_PQ 公钥")
+            if data.get("ik_pq_pub") is not None
+            else None
+        ),
+        pq_ek_pub=(
+            _fixed(data.get("pq_ek"), MLKEM768_PUB_LEN, "PQ 封装公钥")
+            if data.get("pq_ek") is not None
+            else None
+        ),
+        pq_ct=(
+            _fixed(data.get("pq_ct"), MLKEM768_CT_LEN, "PQ 封装密文")
+            if data.get("pq_ct") is not None
+            else None
+        ),
     )
 
 
@@ -151,6 +181,8 @@ def encode_ratchet_payload(
     }
     if x3dh is not None:
         payload["x3dh"] = encode_x3dh(x3dh)
+    if message.pq_ct is not None:
+        payload["pq_ct"] = b64e(message.pq_ct)
     if group:
         payload["group"] = group
     return payload
@@ -176,8 +208,51 @@ def decode_ratchet_payload(payload: dict[str, Any]) -> tuple[RatchetMessage, Ini
         header=header,
         nonce=_fixed(payload.get("nonce"), 12, "AES-GCM nonce"),
         ciphertext=ciphertext,
+        pq_ct=(
+            _fixed(payload.get("pq_ct"), MLKEM768_CT_LEN, "PQ 封装密文")
+            if payload.get("pq_ct") is not None
+            else None
+        ),
     )
     return msg, decode_x3dh(payload.get("x3dh"))
+
+
+def encode_group_state(state: GroupState) -> dict[str, Any]:
+    return {
+        "name": state.name,
+        "epoch": state.epoch,
+        "members": list(state.members),
+        "prev_hash": b64e(state.prev_hash) if state.prev_hash else None,
+        "signer": state.signer,
+        "signature": b64e(state.signature),
+    }
+
+
+def decode_group_state(data: dict[str, Any]) -> GroupState:
+    epoch = data.get("epoch")
+    if not isinstance(epoch, int) or epoch < 1:
+        raise ProtocolError("群状态纪元无效")
+    members = data.get("members")
+    if not isinstance(members, list) or not all(isinstance(m, str) for m in members):
+        raise ProtocolError("群状态成员表无效")
+    signer = data.get("signer")
+    if not isinstance(signer, str):
+        raise ProtocolError("群状态签署者无效")
+    name = data.get("name")
+    if not isinstance(name, str):
+        raise ProtocolError("群状态群名无效")
+    prev_hash = b64d(data.get("prev_hash")) if data.get("prev_hash") else GENESIS_PREV_HASH
+    signature = b64d(data.get("signature"))
+    if signature is None or len(signature) != 64:
+        raise ProtocolError("群状态签名无效")
+    return GroupState(
+        name=name,
+        epoch=epoch,
+        members=tuple(members),
+        prev_hash=prev_hash,
+        signer=signer,
+        signature=signature,
+    )
 
 
 def error_msg(message: str) -> dict[str, Any]:

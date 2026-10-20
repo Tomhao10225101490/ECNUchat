@@ -26,7 +26,16 @@
   publisher = {Springer},
   doi = {10.1007/978-3-031-91823-0_5},
   url = {https://eprint.iacr.org/2024/702},
-  note = {ePrint 2024/702, version 2.1, corresponding to PKC 2025, Part II. The external description names the object of the paper PQXDH: A Post-Quantum Extension of X3DH. This repository implements classic X3DH only.}
+  note = {ePrint 2024/702, version 2.1, corresponding to PKC 2025, Part II. The external description names the object of the paper PQXDH: A Post-Quantum Extension of X3DH. This repository implements a hybrid PQXDH with a long-term ML-KEM-768 prekey; it does not implement Kyber or ephemeral KEM keys.}
+}
+
+@misc{fips203mlkem,
+  author = {{National Institute of Standards and Technology}},
+  title = {Module-Lattice-Based Key-Encapsulation Mechanism Standard},
+  howpublished = {FIPS PUB 203},
+  year = {2024},
+  doi = {10.6028/NIST.FIPS.203},
+  note = {The ML-KEM-768 keypair, encapsulation and decapsulation calls in src/prekeys.py are this standard, provided by the cryptography package.}
 }
 
 @inproceedings{rosler2018groups,

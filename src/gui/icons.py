@@ -73,6 +73,7 @@ _PATHS: dict[str, str] = {
         '<path d="M9 7V5h6v2"/>'
         '<path d="M7 7l1 13h8l1-13"/>'
     ),
+    "menu": '<path d="M4 7h16M4 12h16M4 17h16"/>',
     "plus": '<path d="M12 5v14M5 12h14"/>',
     "close": '<path d="M6 6l12 12M18 6 6 18"/>',
     "lock": (

@@ -1,16 +1,27 @@
-"""三栏聊天主窗口。只负责呈现，加密仍走 ChatEngine。"""
+"""桌面主窗口。左列是会话列表，右列是聊天。加密仍走 ChatEngine。"""
 
 from __future__ import annotations
 
-import base64
 import json
+import tempfile
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QEasingCurve, QEvent, QPoint, Qt, QTimer, QUrl, QVariantAnimation
-from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QGuiApplication, QKeySequence
+from PySide6.QtCore import QEasingCurve, QEvent, QPoint, QRectF, Qt, QTimer, QUrl, QVariantAnimation, Signal
+from PySide6.QtGui import (
+    QAction,
+    QCloseEvent,
+    QColor,
+    QDesktopServices,
+    QGuiApplication,
+    QImageReader,
+    QKeySequence,
+    QPainter,
+    QPainterPath,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
@@ -26,9 +37,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import src.gui.widgets as gui_widgets
 from src import PROJECT_NAME
 from src.gui.app_pages import DropboxBoard, MomentBoard, MomentComposer, PeoplePanel, ProfileSettings
+from src.attachments import MAX_FILE_BYTES, format_size, guess_mime, media_kind
+from src.protocol import ProtocolError, validate_group_name
 from src.gui.chat_view import ConvItem, ConversationList, MessageList, group_flags
+from src.gui.icons import paint_icon
+from src.gui.people import ContactBook, PeoplePicker, build_directory, people_from_snapshot
 from src.gui.engine_worker import EngineWorker
 from src.gui.logic import (
     ChatItem,
@@ -42,7 +58,6 @@ from src.gui.logic import (
     security_hint,
 )
 from src.gui.theme import PALETTES, THEME_LABELS, THEME_ORDER, Palette, lerp_palette, next_theme, stylesheet
-import src.gui.widgets as gui_widgets
 from src.gui.widgets import (
     ElideLabel,
     AvatarWidget,
@@ -51,8 +66,8 @@ from src.gui.widgets import (
     EmojiPanel,
     IconButton,
     InputShell,
+    MenuRow,
     MessageBubble,
-    NavButton,
     NewMessageButton,
     SendButton,
     ToggleSwitch,
@@ -110,6 +125,172 @@ class ConnectionBanner(QWidget):
 from PySide6.QtWidgets import QMainWindow  # noqa: E402
 
 
+class _PreviewThumb(QWidget):
+    """圆角封面。图片铺满裁切，视频和文件画类型标记。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(56, 56)
+        self._pix = QPixmap()
+        self._kind = "file"
+        self._accent = "#4BA0F5"
+        self._ink = "#FFFFFF"
+
+    def set_content(self, pixmap: QPixmap | None, kind: str, accent: str, ink: str) -> None:
+        self._kind = kind
+        self._accent = accent
+        self._ink = ink
+        self._pix = QPixmap()
+        if pixmap is not None and not pixmap.isNull():
+            dpr = self.devicePixelRatioF() or 1.0
+            side = max(56, int(56 * dpr))
+            scaled = pixmap.scaled(
+                side,
+                side,
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            x = max(0, (scaled.width() - side) // 2)
+            y = max(0, (scaled.height() - side) // 2)
+            cropped = scaled.copy(x, y, min(side, scaled.width()), min(side, scaled.height()))
+            cropped.setDevicePixelRatio(dpr)
+            self._pix = cropped
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            rect = QRectF(0, 0, self.width(), self.height())
+            path = QPainterPath()
+            path.addRoundedRect(rect, 14, 14)
+            painter.setClipPath(path)
+            if self._pix is not None and not self._pix.isNull():
+                painter.drawPixmap(self.rect(), self._pix)
+            else:
+                painter.fillRect(self.rect(), QColor("#1C2733" if self._kind == "video" else self._accent))
+                if self._kind == "video":
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(QColor(255, 255, 255, 230))
+                    triangle = QPainterPath()
+                    cx, cy = self.width() / 2, self.height() / 2
+                    triangle.moveTo(cx - 6, cy - 9)
+                    triangle.lineTo(cx + 10, cy)
+                    triangle.lineTo(cx - 6, cy + 9)
+                    triangle.closeSubpath()
+                    painter.drawPath(triangle)
+                else:
+                    paint_icon(
+                        painter,
+                        "paperclip",
+                        QRectF(16, 16, 24, 24),
+                        self._ink,
+                        self.devicePixelRatioF(),
+                    )
+            painter.setClipping(False)
+            painter.setPen(QColor(255, 255, 255, 40))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), 14, 14)
+        finally:
+            painter.end()
+
+
+class FilePreviewBar(QWidget):
+    """发送前的文件卡片：圆角封面、类型和大小，可以滑出取消。"""
+
+    cleared = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("filePreview")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._anim: QVariantAnimation | None = None
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(12, 10, 12, 4)
+        outer.setSpacing(0)
+        self.card = QFrame()
+        self.card.setObjectName("previewCard")
+        self.card.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        layout = QHBoxLayout(self.card)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(10)
+        self.thumb = _PreviewThumb()
+        self.title = ElideLabel()
+        self.title.setObjectName("name")
+        self.meta = QLabel()
+        self.meta.setObjectName("secondary")
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        text.addWidget(self.title)
+        text.addWidget(self.meta)
+        self.cancel = IconButton("close", 32, 16)
+        self.cancel.setToolTip("移除")
+        self.cancel.clicked.connect(self.cleared.emit)
+        layout.addWidget(self.thumb)
+        layout.addLayout(text, 1)
+        layout.addWidget(self.cancel)
+        outer.addWidget(self.card)
+        self.hide()
+
+    def show_file(
+        self,
+        name: str,
+        size_text: str,
+        pixmap: QPixmap | None,
+        kind: str,
+        *,
+        reduce_motion: bool = False,
+        accent: str = "#4BA0F5",
+        ink: str = "#FFFFFF",
+    ) -> None:
+        labels = {"image": "图片", "video": "视频", "file": "文件"}
+        self.title.setText(name)
+        self.title.setToolTip(name)
+        self.meta.setText(f"{labels.get(kind, '文件')} · {size_text}")
+        self.thumb.set_content(pixmap, kind, accent, ink)
+        already = self.isVisible() and self.maximumHeight() > 20
+        self.show()
+        target = max(self.sizeHint().height(), 88)
+        self._slide(self.height() if already else 0, target, reduce_motion, hide=False)
+
+    def apply_palette(self, palette: Palette) -> None:
+        self.thumb.set_content(self.thumb._pix, self.thumb._kind, palette.accent, palette.accent_text)
+        self.cancel.apply_colors(palette.text_secondary, palette.bg_hover)
+
+    def dismiss(self, reduce_motion: bool = False) -> None:
+        if not self.isVisible():
+            return
+        self._slide(self.height(), 0, reduce_motion, hide=True)
+
+    def _slide(self, start: int, end: int, reduce_motion: bool, *, hide: bool) -> None:
+        if self._anim is not None:
+            self._anim.stop()
+        if reduce_motion:
+            self.setMaximumHeight(16777215)
+            if hide:
+                self.hide()
+            else:
+                self.show()
+            return
+        self.setMaximumHeight(max(0, start))
+        anim = QVariantAnimation(self)
+        anim.setStartValue(max(0, start))
+        anim.setEndValue(max(0, end))
+        anim.setDuration(180)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.valueChanged.connect(lambda value: self.setMaximumHeight(max(0, int(value))))
+
+        def finish() -> None:
+            self.setMaximumHeight(16777215)
+            if hide:
+                self.hide()
+
+        anim.finished.connect(finish)
+        self._anim = anim
+        anim.start()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, worker: EngineWorker, initial: dict[str, Any]) -> None:
         super().__init__()
@@ -135,12 +316,11 @@ class MainWindow(QMainWindow):
         self._pins = _load_set(initial.get("pins", ""))
         self._mutes = _load_set(initial.get("mutes", ""))
         self.directory: list[str] = []
-        self._search_results: list[dict[str, Any]] = []
-        self._social_open = False
         self._theme_anim: QVariantAnimation | None = None
         self._theme_from = self._palette
         self._fp: BlurDialog | None = None
         self._fp_value = ""
+        self._staged: dict[str, Any] | None = None
         self.setWindowTitle(f"{PROJECT_NAME} — {self.username}")
         self.resize(1180, 760)
         self.setMinimumSize(420, 560)
@@ -148,7 +328,8 @@ class MainWindow(QMainWindow):
         self._connect_worker()
         self.apply_theme(self.theme, persist=False, animate=False)
         self.update_snapshot(initial)
-        self.banner.set_mode("hidden" if self._connected else "error", "端到端加密连接已建立" if self._connected else "未连接")
+        self.update_header()
+        self.banner.set_mode("hidden" if self._connected else "error", "" if self._connected else "未连接")
         saved = str(initial.get("current_conv") or "")
         if saved:
             QTimer.singleShot(0, lambda: self.open_conversation(saved))
@@ -170,40 +351,6 @@ class MainWindow(QMainWindow):
         body.setSpacing(0)
         outer.addLayout(body, 1)
 
-        self.nav = QWidget()
-        self.nav.setObjectName("nav")
-        self.nav.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.nav.setFixedWidth(72)
-        nav_layout = QVBoxLayout(self.nav)
-        nav_layout.setContentsMargins(12, 16, 12, 16)
-        nav_layout.setSpacing(8)
-        self.nav_chat = NavButton("chat")
-        self.nav_contacts = NavButton("contacts")
-        self.nav_moments = NavButton("moments")
-        self.nav_box = NavButton("box")
-        self.nav_settings = NavButton("settings")
-        self.nav_chat.setToolTip("聊天")
-        self.nav_contacts.setToolTip("联系人")
-        self.nav_moments.setToolTip("朋友圈")
-        self.nav_box.setToolTip("投递箱")
-        self.nav_settings.setToolTip("设置")
-        self.nav_chat.clicked.connect(lambda: self._show_page(0))
-        self.nav_contacts.clicked.connect(lambda: self._show_page(1))
-        self.nav_moments.clicked.connect(lambda: self._show_page(2))
-        self.nav_box.clicked.connect(lambda: self._show_page(3))
-        self.nav_settings.clicked.connect(lambda: self._show_page(4))
-        nav_layout.addWidget(self.nav_chat)
-        nav_layout.addWidget(self.nav_contacts)
-        nav_layout.addWidget(self.nav_moments)
-        nav_layout.addWidget(self.nav_box)
-        nav_layout.addWidget(self.nav_settings)
-        nav_layout.addStretch(1)
-        self.self_avatar = AvatarWidget(40)
-        self.self_avatar.set_person(self.username, online=True)
-        self.self_avatar.setToolTip(self.username)
-        nav_layout.addWidget(self.self_avatar, alignment=Qt.AlignmentFlag.AlignHCenter)
-        body.addWidget(self.nav)
-
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.setChildrenCollapsible(False)
         self.splitter.setHandleWidth(1)
@@ -216,33 +363,40 @@ class MainWindow(QMainWindow):
         side = QVBoxLayout(self.sidebar)
         side.setContentsMargins(0, 0, 0, 0)
         side.setSpacing(0)
-        top = QWidget()
-        top_layout = QVBoxLayout(top)
-        top_layout.setContentsMargins(14, 10, 10, 6)
-        top_layout.setSpacing(8)
-        header = QHBoxLayout()
+        self.side_head = QWidget()
+        self.side_head.setFixedHeight(56)
+        head_layout = QHBoxLayout(self.side_head)
+        head_layout.setContentsMargins(4, 8, 8, 8)
+        head_layout.setSpacing(2)
+        self.menu_button = IconButton("menu", 40, 20)
+        self.menu_button.setToolTip("菜单")
+        self.menu_button.clicked.connect(self._toggle_menu)
+        self.side_back = IconButton("back", 40, 18)
+        self.side_back.setToolTip("返回")
+        self.side_back.clicked.connect(lambda: self._show_page(0))
+        self.side_back.hide()
         self.side_title = QLabel("聊天")
         self.side_title.setObjectName("title")
-        header.addWidget(self.side_title)
-        header.addStretch(1)
+        self.side_title.hide()
         self.compose_button = IconButton("plus", 36, 18)
         self.compose_button.setToolTip("新建")
         self.compose_button.clicked.connect(self._compose_menu)
-        header.addWidget(self.compose_button)
-        top_layout.addLayout(header)
-        self.search_icon = IconButton("search", 32, 16)
-        self.search_icon.hide()
         self.search = QLineEdit()
         self.search.setObjectName("searchField")
         self.search.setPlaceholderText("搜索")
         self.search.setClearButtonEnabled(True)
+        self.search.setFixedHeight(36)
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
         self.search_timer.setInterval(200)
         self.search_timer.timeout.connect(self.perform_search)
         self.search.textChanged.connect(lambda: self.search_timer.start())
-        top_layout.addWidget(self.search)
-        side.addWidget(top)
+        head_layout.addWidget(self.menu_button)
+        head_layout.addWidget(self.side_back)
+        head_layout.addWidget(self.side_title, 1)
+        head_layout.addWidget(self.search, 1)
+        head_layout.addWidget(self.compose_button)
+        side.addWidget(self.side_head)
 
         self.page_chat = QWidget()
         chat_page = QVBoxLayout(self.page_chat)
@@ -255,7 +409,7 @@ class MainWindow(QMainWindow):
         self.page_contacts = QWidget()
         contacts_layout = QVBoxLayout(self.page_contacts)
         contacts_layout.setContentsMargins(0, 0, 0, 0)
-        self.contacts = ConversationList()
+        self.contacts = ContactBook()
         self.contacts.activated_key.connect(self._activate_contact)
         self.people_panel = PeoplePanel()
         self.people_panel.acceptClicked.connect(
@@ -279,10 +433,12 @@ class MainWindow(QMainWindow):
         self.people_panel.messageClicked.connect(
             lambda name: self.worker.submit("open_chat", username=name)
         )
-        self.people_panel.addClicked.connect(self._add_named)
+        self.people_panel.addClicked.connect(
+            lambda name: self.worker.submit("friend_request", username=name, greeting="")
+        )
         self.people_panel.hide()
+        contacts_layout.addWidget(self.people_panel)
         contacts_layout.addWidget(self.contacts, 1)
-        contacts_layout.addWidget(self.people_panel, 1)
 
         self.page_moments = MomentComposer()
         self.page_moments.postRequested.connect(
@@ -293,8 +449,7 @@ class MainWindow(QMainWindow):
         self.page_box = QWidget()
         box_layout = QVBoxLayout(self.page_box)
         box_layout.setContentsMargins(8, 4, 8, 8)
-        box_layout.setSpacing(0)
-        box_button = QPushButton("投递到当前会话")
+        box_button = QPushButton("发送文件")
         box_button.setCursor(Qt.CursorShape.PointingHandCursor)
         box_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         box_button.clicked.connect(self._attach)
@@ -315,7 +470,14 @@ class MainWindow(QMainWindow):
         ]
         for page in self._stack:
             pages_layout.addWidget(page)
-        side.addWidget(self.pages, 1)
+        self.menu_panel = self._build_menu()
+        self.side_stack = QStackedWidget()
+        self.side_stack.setAutoFillBackground(False)
+        self.pages.setAutoFillBackground(False)
+        self.menu_panel.setAutoFillBackground(False)
+        self.side_stack.addWidget(self.pages)
+        self.side_stack.addWidget(self.menu_panel)
+        side.addWidget(self.side_stack, 1)
         self.page_contacts.hide()
         self.page_moments.hide()
         self.page_box.hide()
@@ -342,7 +504,6 @@ class MainWindow(QMainWindow):
         self.back_button.hide()
         header_layout.addWidget(self.back_button)
         self.header_avatar = AvatarWidget(40)
-        self.header_avatar.hide()
         header_layout.addWidget(self.header_avatar)
         titles = QVBoxLayout()
         titles.setSpacing(0)
@@ -363,14 +524,10 @@ class MainWindow(QMainWindow):
         titles.addWidget(self.chat_title)
         titles.addLayout(typing_row)
         header_layout.addLayout(titles, 1)
-        self.info_button = QPushButton("指纹")
-        self.info_button.setObjectName("ghost")
-        self.info_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.info_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.info_button.setEnabled(False)
+        self.info_button = QPushButton("指纹", self)
         self.info_button.hide()
+        self.info_button.setEnabled(False)
         self.info_button.clicked.connect(self.show_fingerprint)
-        header_layout.addWidget(self.info_button)
         self.more_button = IconButton("more", 36, 18)
         self.more_button.setToolTip("更多")
         self.more_button.clicked.connect(self._more_menu)
@@ -384,6 +541,8 @@ class MainWindow(QMainWindow):
         self.messages.copyRequested.connect(self._copy_item)
         self.messages.replyRequested.connect(self._reply_to)
         self.messages.deleteRequested.connect(self._delete_item)
+        self.messages.openRequested.connect(self._open_attachment)
+        self.messages.filesDropped.connect(self._on_files_dropped)
         self.new_button = NewMessageButton(self.chat_body)
         self.new_button.clicked.connect(self._jump_bottom)
         chat_layout.addWidget(self.chat_body, 1)
@@ -412,22 +571,25 @@ class MainWindow(QMainWindow):
         composer_layout.addWidget(self.attach_button, alignment=Qt.AlignmentFlag.AlignBottom)
         composer_layout.addWidget(self.input_shell, 1)
         composer_layout.addWidget(self.send_button, alignment=Qt.AlignmentFlag.AlignBottom)
-        self.composer_bar.hide()
+        self.file_preview = FilePreviewBar()
+        self.file_preview.cleared.connect(self._clear_staged)
+        chat_layout.addWidget(self.file_preview)
         chat_layout.addWidget(self.composer_bar)
+        self.composer.installEventFilter(self)
         self.moment_board = MomentBoard()
         self.moment_board.likeClicked.connect(
             lambda moment_id: self.worker.submit("moment_like", id=moment_id)
         )
         self.moment_board.commentClicked.connect(
-            lambda moment_id, body: self.worker.submit(
-                "moment_comment", id=moment_id, body=body
-            )
+            lambda moment_id, body: self.worker.submit("moment_comment", id=moment_id, body=body)
         )
         self.moment_board.deleteClicked.connect(
             lambda moment_id: self.worker.submit("moment_delete", id=moment_id)
         )
         self.drop_board = DropboxBoard()
-        self.drop_board.openRequested.connect(self._open_drop)
+        self.drop_board.openRequested.connect(
+            lambda path: QDesktopServices.openUrl(QUrl.fromLocalFile(path)) if path else None
+        )
         self.main_stack = QStackedWidget()
         self.main_stack.addWidget(self.chat)
         self.main_stack.addWidget(self.moment_board)
@@ -466,6 +628,55 @@ class MainWindow(QMainWindow):
         self.chat_body.installEventFilter(self)
         self._show_page(0)
 
+    def _build_menu(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 4, 0, 8)
+        layout.setSpacing(0)
+        profile = QHBoxLayout()
+        profile.setContentsMargins(16, 8, 16, 14)
+        profile.setSpacing(12)
+        self.self_avatar = AvatarWidget(54)
+        self.self_avatar.set_person(self.username, online=True)
+        text = QVBoxLayout()
+        text.setSpacing(0)
+        self.menu_name = QLabel(self.username)
+        self.menu_name.setObjectName("name")
+        self.menu_handle = QLabel(self.username)
+        self.menu_handle.setObjectName("caption")
+        text.addWidget(self.menu_name)
+        text.addWidget(self.menu_handle)
+        profile.addWidget(self.self_avatar)
+        profile.addLayout(text, 1)
+        layout.addLayout(profile)
+        hair = QFrame()
+        hair.setObjectName("hair")
+        layout.addWidget(hair)
+        layout.addSpacing(6)
+        rows = (
+            ("chat", "聊天", 0),
+            ("contacts", "联系人", 1),
+            ("moments", "朋友圈", 2),
+            ("box", "文件", 3),
+            ("settings", "设置", 4),
+        )
+        built: list[MenuRow] = []
+        for icon, label, index in rows:
+            row = MenuRow(icon, label)
+            row.clicked.connect(lambda _checked=False, page=index: self._show_page(page))
+            layout.addWidget(row)
+            built.append(row)
+        self.nav_chat, self.nav_contacts, self.nav_moments, self.nav_box, self.nav_settings = built
+        layout.addStretch(1)
+        return panel
+
+    def _toggle_menu(self) -> None:
+        if self.side_stack.currentWidget() is self.menu_panel:
+            self.side_stack.setCurrentWidget(self.pages)
+            return
+        self._set_palette(self._palette)
+        self.side_stack.setCurrentWidget(self.menu_panel)
+
     def _build_settings(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -500,8 +711,14 @@ class MainWindow(QMainWindow):
         row.addWidget(self.motion_switch)
         layout.addLayout(row)
         self.profile_settings = ProfileSettings()
-        self.profile_settings.profileSaved.connect(self._save_profile)
-        self.profile_settings.privacySaved.connect(self._save_privacy)
+        self.profile_settings.profileSaved.connect(
+            lambda name, bio, avatar: self.worker.submit(
+                "profile_set", display_name=name, bio=bio, avatar=avatar
+            )
+        )
+        self.profile_settings.privacySaved.connect(
+            lambda privacy: self.worker.submit("privacy_set", **dict(privacy))
+        )
         layout.addWidget(self.profile_settings)
         about = QLabel(PROJECT_NAME)
         about.setObjectName("caption")
@@ -519,6 +736,9 @@ class MainWindow(QMainWindow):
     def eventFilter(self, watched, event):
         if watched is self.chat_body and event.type() == QEvent.Type.Resize:
             self._place_overlays()
+        if watched is self.composer and event.type() == QEvent.Type.KeyPress:
+            if event.matches(QKeySequence.StandardKey.Paste) and self._paste_image():
+                return True
         return super().eventFilter(watched, event)
 
     def _place_overlays(self) -> None:
@@ -541,6 +761,7 @@ class MainWindow(QMainWindow):
         self.worker.actionResult.connect(self.on_action_result)
         self.worker.connectionChanged.connect(self.on_connection)
         self.worker.fatalError.connect(self.on_fatal)
+        self.worker.fileProgress.connect(self.on_file_progress)
 
     def apply_theme(self, theme: str, *, persist: bool = True, animate: bool = True) -> None:
         if theme not in PALETTES:
@@ -596,8 +817,18 @@ class MainWindow(QMainWindow):
         self.typing_dots.set_color(palette.text_secondary)
         muted = palette.text_secondary
         hover = palette.bg_hover
-        for button in (self.emoji_button, self.attach_button, self.more_button, self.back_button, self.compose_button, self.search_icon):
+        for button in (
+            self.emoji_button,
+            self.attach_button,
+            self.more_button,
+            self.back_button,
+            self.compose_button,
+            self.menu_button,
+            self.side_back,
+            self.file_preview.cancel,
+        ):
             button.apply_colors(muted, hover)
+        self.file_preview.apply_palette(palette)
         for nav, active in (
             (self.nav_chat, self.page_chat.isVisible()),
             (self.nav_contacts, self.page_contacts.isVisible()),
@@ -605,44 +836,55 @@ class MainWindow(QMainWindow):
             (self.nav_box, self.page_box.isVisible()),
             (self.nav_settings, self.page_settings.isVisible()),
         ):
-            nav.apply_nav(palette.accent, palette.accent_soft, muted, hover, palette.unread)
+            nav.apply_nav(palette.accent, palette.text, muted, hover, palette.unread)
             nav.set_active(active)
         self.profile_settings.apply_palette(palette.accent, palette.accent_text)
         for name, button in self.theme_buttons.items():
-            if name == self.theme or (palette.name == name):
-                button.setStyleSheet(
-                    f"QPushButton {{ background:{palette.accent_soft}; color:{palette.accent}; border:none; border-radius:8px; font-weight:600; }}"
-                )
-            else:
-                button.setStyleSheet(
-                    f"QPushButton {{ background:transparent; color:{palette.text_secondary}; border:none; border-radius:8px; }}"
-                )
+            chosen = name == self.theme or palette.name == name
+            color = palette.accent if chosen else palette.text
+            weight = "600" if chosen else "400"
+            button.setStyleSheet(
+                "QPushButton {"
+                f"background:transparent; color:{color}; border:none; border-radius:0; "
+                f"padding:6px 10px; font-weight:{weight};"
+                "}"
+                f"QPushButton:hover {{ background:{palette.bg_hover}; }}"
+            )
         if self._fp is not None:
             self._fp.apply_palette(palette)
         self._refresh_badges()
 
     def _show_page(self, index: int) -> None:
-        titles = ("聊天", "联系人", "朋友圈", "投递箱", "设置")
+        titles = ("聊天", "联系人", "朋友圈", "文件", "设置")
         self.side_title.setText(titles[index])
         for i, page in enumerate(self._stack):
             page.setVisible(i == index)
-        self._social_open = index in (2, 3)
         if index == 2:
             self.main_stack.setCurrentWidget(self.moment_board)
         elif index == 3:
             self.main_stack.setCurrentWidget(self.drop_board)
         else:
             self.main_stack.setCurrentWidget(self.chat)
+        on_chats = index == 0
+        on_contacts = index == 1
+        self.menu_button.setVisible(on_chats)
+        self.side_back.setVisible(not on_chats)
+        self.side_title.setVisible(not on_chats and not on_contacts)
         self.compose_button.setVisible(index in (0, 1))
-        self.search.setVisible(index in (0, 1))
-        if index in (2, 3, 4) and not self._compact:
-            self.splitter.setSizes([400, 740])
+        self.compose_button.setToolTip("新建消息" if index == 0 else "新建")
+        searching = index in (0, 1)
+        self.search.setVisible(searching)
+        if hasattr(self, "side_stack"):
+            self.side_stack.setCurrentWidget(self.pages)
+        self.search.blockSignals(True)
+        self.search.clear()
+        self.search.setPlaceholderText("搜索")
+        self.search.blockSignals(False)
         if self._palette:
             self._set_palette(self._palette)
         if index == 1:
             self.rebuild_contacts()
             self._fill_people()
-        self._apply_responsive()
 
     def set_reduce_motion(self, enabled: bool) -> None:
         self._reduce_motion = enabled
@@ -658,19 +900,18 @@ class MainWindow(QMainWindow):
             self.rebuild_conversations()
         if self.page_contacts.isVisible():
             self.rebuild_contacts()
-        self._fill_people()
-        if "profile" in data and data.get("profile"):
-            self.profile_settings.set_profile(data["profile"])
-            profile = data["profile"]
-            self.self_avatar.set_person(
-                str(profile.get("display_name") or self.username),
-                online=True,
-                avatar=str(profile.get("avatar") or ""),
-            )
-        if "privacy" in data and data.get("privacy"):
-            self.profile_settings.set_privacy(data["privacy"])
-        self.moment_board.set_moments(list(data.get("moments") or []))
-        self.drop_board.set_items(list(data.get("dropbox") or []))
+            self._fill_people()
+        if "moments" in data:
+            self.moment_board.set_moments(list(data.get("moments") or []))
+        if "dropbox" in data:
+            self.drop_board.set_items(list(data.get("dropbox") or []))
+        if "profile" in data and hasattr(self, "profile_settings"):
+            profile = dict(data.get("profile") or {})
+            self.profile_settings.set_profile(profile)
+            self.profile_settings.set_privacy(dict(data.get("privacy") or {}))
+            display = str(profile.get("display_name") or self.username)
+            self.menu_name.setText(display)
+            self.self_avatar.set_person(display, online=True, avatar=str(profile.get("avatar") or ""))
         if self.current_conv:
             self.update_header()
         self._refresh_badges()
@@ -696,11 +937,10 @@ class MainWindow(QMainWindow):
             row = recent.get(conv, {})
             kind = "group" if str(conv).startswith("group:") else "dm"
             peer = conv[3:] if kind == "dm" else conv[6:]
-            person = self._person(peer) if kind == "dm" else {}
             items.append(
                 ConvItem(
                     key=conv,
-                    title=str(person.get("display_name") or self.conv_title(conv)),
+                    title=self.conv_title(conv),
                     preview=str(row.get("body", "")),
                     ts=float(row.get("ts", 0) or 0),
                     online=kind == "dm" and peer in online,
@@ -709,72 +949,50 @@ class MainWindow(QMainWindow):
                     muted=conv in self._mutes,
                     kind=kind,
                     clock=list_clock(float(row.get("ts", 0) or 0)),
-                    avatar=str(person.get("avatar") or ""),
                 )
             )
         self.conversations.set_items(items, self.current_conv)
 
+    def known_people(self) -> list[dict]:
+        data = dict(self.snapshot_data)
+        data["directory"] = list(self.directory)
+        return people_from_snapshot(data, self.username)
+
     def rebuild_contacts(self) -> None:
-        names = set(self.snapshot_data.get("online", []))
-        names.update(self.snapshot_data.get("sessions", {}))
-        for members in self.snapshot_data.get("groups", {}).values():
-            names.update(members)
-        names.update(self.directory)
-        names.discard(self.username)
-        online = set(self.snapshot_data.get("online", []))
-        query = self.search.text().strip().lower() if self.page_contacts.isVisible() else ""
-        items = []
-        for name in sorted(names):
-            if query and query not in name.lower():
-                continue
-            items.append(
-                ConvItem(
-                    key=f"dm:{name}",
-                    title=name,
-                    preview="在线" if name in online else "离线",
-                    online=name in online,
-                    kind="contact",
-                )
-            )
-        self.contacts.set_items(items)
-
-    def _person(self, username: str) -> dict[str, Any]:
-        for bucket in ("friends", "incoming", "outgoing", "blocked", "rejected"):
-            for item in self.snapshot_data.get(bucket) or []:
-                if item.get("username") == username:
-                    return item
-        profile = self.snapshot_data.get("profile") or {}
-        if profile.get("username") == username:
-            return profile
-        return {}
-
-    def _dm_allowed(self, peer: str) -> bool:
-        if "friends" not in self.snapshot_data:
-            return True
-        return any(item.get("username") == peer for item in self.snapshot_data.get("friends") or [])
+        query = self.search.text().strip() if self.page_contacts.isVisible() else ""
+        groups = sorted(str(name) for name in self.snapshot_data.get("groups", {}))
+        self.contacts.set_entries(build_directory(self.known_people(), groups, query))
+        if query:
+            self.contacts.empty.setText("没有匹配的联系人")
+        else:
+            self.contacts.empty.setText("没有联系人")
 
     def _fill_people(self) -> None:
         if "friends" not in self.snapshot_data:
             self.people_panel.hide()
-            self.contacts.show()
             return
-        self.contacts.hide()
         self.people_panel.show()
-        query = self.search.text().strip()
         self.people_panel.set_model(
             friends=list(self.snapshot_data.get("friends") or []),
             incoming=list(self.snapshot_data.get("incoming") or []),
             outgoing=list(self.snapshot_data.get("outgoing") or []),
             blocked=list(self.snapshot_data.get("blocked") or []),
             rejected=list(self.snapshot_data.get("rejected") or []),
-            results=self._search_results if query else [],
+        )
+
+    def _dm_allowed(self, username: str) -> bool:
+        if "friends" not in self.snapshot_data:
+            return True
+        return any(
+            str(item.get("username")) == username
+            for item in self.snapshot_data.get("friends") or []
         )
 
     def _refresh_badges(self) -> None:
         total = sum(self.unread.values())
         self.nav_chat.set_badge(total)
-        incoming = self.snapshot_data.get("incoming") or []
-        self.nav_contacts.set_badge(len(incoming) if "friends" in self.snapshot_data else 0)
+        if "friends" in self.snapshot_data:
+            self.nav_contacts.set_badge(len(self.snapshot_data.get("incoming") or []))
 
     @staticmethod
     def conv_title(conv: str) -> str:
@@ -791,6 +1009,9 @@ class MainWindow(QMainWindow):
     def _activate_contact(self, key: str) -> None:
         if key.startswith("dm:"):
             self.worker.submit("open_chat", username=key[3:])
+        elif key.startswith("group:"):
+            self._show_page(0)
+            self.open_conversation(key)
 
     def open_conversation(self, conv: str) -> None:
         if self._in_open:
@@ -822,27 +1043,24 @@ class MainWindow(QMainWindow):
             self.chat_title.setText("")
             self.chat_subtitle.setText("")
             self.header_avatar.hide()
+            self.info_button.setEnabled(False)
             self.info_button.hide()
             self.composer_bar.hide()
             return
         self.header_avatar.show()
-        self.info_button.show()
         self.composer_bar.show()
         conv = self.current_conv
+        self.info_button.setEnabled(conv.startswith("dm:"))
+        self.info_button.hide()
         if conv.startswith("dm:"):
             peer = conv[3:]
             online = peer in set(self.snapshot_data.get("online", []))
             generation = self.snapshot_data.get("sessions", {}).get(peer, 0)
             short_fp = self.snapshot_data.get("fingerprints", {}).get(peer, "")
             fp_text = f" · 指纹 {short_fp}" if short_fp else ""
-            person = self._person(peer)
-            self.chat_title.setText(str(person.get("display_name") or peer))
+            self.chat_title.setText(peer)
             self.chat_subtitle.setText(f"{'在线' if online else '离线'} · 双棘轮代数 {generation}{fp_text}")
-            self.header_avatar.set_person(
-                str(person.get("display_name") or peer),
-                online=online,
-                avatar=str(person.get("avatar") or ""),
-            )
+            self.header_avatar.set_person(peer, online=online)
         else:
             name = conv[6:]
             members = self.snapshot_data.get("groups", {}).get(name, [])
@@ -857,23 +1075,48 @@ class MainWindow(QMainWindow):
         items: list[ChatItem] = []
         bubbles: dict[str, MessageBubble] = {}
         self._append_rows(items, rows, bubbles)
+        extra: list[dict[str, Any]] = []
         for pending in self.snapshot_data.get("pending", []):
             if pending.get("conv") != conv:
                 continue
             local_id = str(pending["local_id"])
-            self._append_rows(
-                items,
-                [
-                    {
-                        "sender": self.username,
-                        "body": pending["body"],
-                        "ts": pending["ts"],
-                        "state": pending["state"],
-                        "local_id": local_id,
-                    }
-                ],
-                bubbles,
+            matched = None
+            for item in items:
+                if item.local_id == local_id:
+                    matched = item
+                    break
+                if (
+                    matched is None
+                    and item.kind == "message"
+                    and item.mine
+                    and not item.local_id
+                    and item.raw == str(pending.get("body") or "")
+                ):
+                    matched = item
+            if matched is not None:
+                matched.state = str(pending.get("state") or matched.state)
+                matched.local_id = local_id
+                matched.key = local_id
+                pending_attachment = pending.get("attachment")
+                if matched.attachment is None and isinstance(pending_attachment, dict):
+                    matched.attachment = pending_attachment
+                    matched.body = str(pending_attachment.get("caption") or matched.body)
+                if matched.attachment and matched.state == "sending":
+                    matched.progress = max(0.0, matched.progress)
+                bubbles[local_id] = MessageBubble(matched, self._on_bubble_state, self)
+                continue
+            extra.append(
+                {
+                    "sender": self.username,
+                    "body": pending["body"],
+                    "ts": pending["ts"],
+                    "state": pending["state"],
+                    "local_id": local_id,
+                    "attachment": pending.get("attachment"),
+                }
             )
+        if extra:
+            self._append_rows(items, extra, bubbles)
         finalize_groups(items, is_group=conv.startswith("group:"))
         self.bubbles = bubbles
         self.messages.set_messages(items)
@@ -893,31 +1136,36 @@ class MainWindow(QMainWindow):
             raw = str(row.get("body", ""))
             ts = float(row.get("ts") or time.time())
             local_id = str(row.get("local_id") or "")
+            attachment = row.get("attachment") if isinstance(row.get("attachment"), dict) else None
+            shown = str(attachment.get("caption") or "") if attachment else raw
             if hidden_key(conv, sender, ts, raw) in self._hidden:
                 continue
-            kind = classify_row(sender, raw, str(row.get("kind") or ""))
+            kind = classify_row(sender, shown, str(row.get("kind") or ""))
             day = day_label(ts)
             if not items or items[-1].kind == "date" or getattr(self, "_last_day", None) != day:
                 if not items or items[-1].body != day or items[-1].kind != "date":
                     if not any(item.kind == "date" and item.body == day for item in items):
                         items.append(ChatItem(kind="date", body=day, ts=ts, key=f"date:{day}:{len(items)}"))
-            author, quote, text = ("", "", raw)
+            author, quote, text = ("", "", shown)
             if kind == "message":
-                author, quote, text = decode_reply(raw)
+                author, quote, text = decode_reply(shown)
+            state = str(row.get("state") or "accepted")
             item = ChatItem(
                 sender=sender,
                 mine=sender == self.username and kind == "message",
                 ts=ts,
                 kind=kind,
-                body=text if kind == "message" else raw,
+                body=text if kind == "message" else shown,
                 raw=raw,
-                state=str(row.get("state") or "accepted"),
+                state=state,
                 local_id=local_id,
                 reply_author=author,
                 reply_text=quote,
-                hint=security_hint(raw) or "",
+                hint=security_hint(shown) or "",
                 key=local_id or f"{ts:.3f}:{sender}:{len(items)}:{raw[:12]}",
                 anim=1.0,
+                attachment=attachment,
+                progress=0.0 if attachment and state == "sending" else -1.0,
             )
             items.append(item)
             if local_id:
@@ -933,6 +1181,7 @@ class MainWindow(QMainWindow):
         kind: str = "chat",
         local_id: str | None = None,
         animate: bool = True,
+        attachment: dict[str, Any] | None = None,
     ) -> MessageBubble:
         mapped = classify_row(sender, body, "error" if kind == "error" else kind)
         if kind == "error":
@@ -954,6 +1203,8 @@ class MainWindow(QMainWindow):
             hint=security_hint(body) or "",
             key=local_id or uuid.uuid4().hex,
             anim=0.0 if animate and not self._reduce_motion else 1.0,
+            attachment=attachment,
+            progress=0.0 if attachment and state == "sending" else -1.0,
         )
         items = [existing for existing in self.messages.items() if existing.kind != "typing"]
         day = day_label(timestamp)
@@ -1038,6 +1289,9 @@ class MainWindow(QMainWindow):
         fade.start()
 
     def send_current(self) -> None:
+        if self._staged:
+            self._send_staged()
+            return
         text = self.composer.toPlainText()
         if not self.current_conv or not text.strip():
             if not self.current_conv and text.strip():
@@ -1073,8 +1327,18 @@ class MainWindow(QMainWindow):
         if state == "failed":
             self.show_toast(f"发送失败：{error}", error=True)
 
+    def on_file_progress(self, local_id: str, done: int, total: int) -> None:
+        bubble = self.bubbles.get(local_id)
+        if bubble is None or total <= 0:
+            return
+        bubble.item.progress = max(0.0, min(1.0, done / total))
+        self.messages.delegate.invalidate()
+        row = self._row_of(bubble.item)
+        if row >= 0:
+            self.messages.notify_row(row)
+
     def on_incoming(self, item: dict[str, Any]) -> None:
-        if item.get("kind") in {"presence", "social", "moment"}:
+        if item.get("kind") == "presence":
             return
         if item.get("kind") == "typing":
             self.set_peer_typing(True, str(item.get("sender") or ""))
@@ -1082,11 +1346,26 @@ class MainWindow(QMainWindow):
         group = item.get("group")
         sender = str(item.get("sender") or "")
         conv = f"group:{group}" if group else (f"dm:{sender}" if sender and sender != "系统" else "")
-        body = str(item.get("text") or item.get("error") or "")
+        attachment = item.get("attachment") if isinstance(item.get("attachment"), dict) else None
+        if item.get("error"):
+            attachment = None
+            body = str(item.get("error") or "")
+        elif attachment:
+            body = str(attachment.get("caption") or "")
+        else:
+            body = str(item.get("text") or "")
         kind = "error" if item.get("error") else str(item.get("kind") or "chat")
         if conv and conv == self.current_conv:
             self.set_peer_typing(False)
-            self.append_message(sender, body, time.time(), mine=False, kind=kind, animate=True)
+            self.append_message(
+                sender,
+                body,
+                time.time(),
+                mine=False,
+                kind=kind,
+                animate=True,
+                attachment=attachment,
+            )
         elif conv:
             if conv not in self._mutes:
                 self.unread[conv] = self.unread.get(conv, 0) + 1
@@ -1126,10 +1405,7 @@ class MainWindow(QMainWindow):
 
     def perform_search(self) -> None:
         if self.page_contacts.isVisible():
-            if "friends" in self.snapshot_data:
-                self.worker.submit("search_users", query=self.search.text().strip())
-            else:
-                self.rebuild_contacts()
+            self.rebuild_contacts()
             return
         query = self.search.text().strip()
         if not query:
@@ -1160,12 +1436,9 @@ class MainWindow(QMainWindow):
     def _compose_menu(self) -> None:
         from PySide6.QtWidgets import QMenu
 
-        if self.page_contacts.isVisible():
-            self._add_friend_dialog()
-            return
         menu = QMenu(self)
-        chat = menu.addAction("新建聊天")
-        group = menu.addAction("创建群聊")
+        chat = menu.addAction("新建消息")
+        group = menu.addAction("新建群组")
         chosen = menu.exec(self.compose_button.mapToGlobal(QPoint(0, self.compose_button.height())))
         if chosen is chat:
             self.new_chat()
@@ -1173,16 +1446,30 @@ class MainWindow(QMainWindow):
             self.new_group()
 
     def new_chat(self) -> None:
-        name = self._ask("新建聊天", [("对方用户名", "bob")])
-        if name:
-            self.worker.submit("open_chat", username=name[0].strip())
+        picked = self._pick_people("chat")
+        if picked:
+            self.worker.submit("open_chat", username=picked[0])
 
     def new_group(self) -> None:
-        values = self._ask("创建群聊", [("群名", "三人组"), ("成员", "bob, carol")])
-        if not values:
+        picked = self._pick_people("group")
+        if not picked:
             return
-        members = [part.strip() for part in values[1].replace("，", ",").split(",") if part.strip()]
-        self.worker.submit("create_group", name=values[0].strip(), members=members)
+        name, members = picked
+        try:
+            validate_group_name(name)
+        except ProtocolError as exc:
+            self.show_toast(str(exc), error=True)
+            return
+        self.worker.submit("create_group", name=name, members=members)
+
+    def _pick_people(self, mode: str) -> list[str] | tuple[str, list[str]] | None:
+        picker = PeoplePicker(self.known_people(), mode=mode, palette=self._palette, parent=self)
+        if picker.exec() != QDialog.DialogCode.Accepted:
+            return None
+        if mode == "chat":
+            names = picker.selected()
+            return names[:1] or None
+        return picker.group_name(), picker.selected()
 
     def _ask(self, title: str, fields: list[tuple[str, str]]) -> list[str] | None:
         dialog = QDialog(self)
@@ -1239,7 +1526,7 @@ class MainWindow(QMainWindow):
             self._fp_title = QLabel()
             self._fp_title.setObjectName("title")
             self._fp_title.setWordWrap(True)
-            self._fp_hint = QLabel("线下核对这 16 组。")
+            self._fp_hint = QLabel("请用线下渠道核对这 16 组。不一致就不要继续聊。")
             self._fp_hint.setObjectName("secondary")
             self._fp_hint.setWordWrap(True)
             self._fp_body = QLabel()
@@ -1284,25 +1571,6 @@ class MainWindow(QMainWindow):
         elif action == "users" and isinstance(data, dict):
             self.directory = [str(name) for name in data.get("users") or []]
             self.rebuild_contacts()
-        elif action == "search_users" and isinstance(data, dict):
-            self._search_results = list(data.get("users") or [])
-            self._fill_people()
-        elif action == "friend_request":
-            self.show_toast("好友申请已发送")
-        elif action == "friend_respond":
-            self.show_toast("已处理好友申请")
-        elif action == "friend_remove":
-            self.show_toast("关系已更新")
-        elif action == "friend_block":
-            self.show_toast("已拉黑")
-        elif action == "profile_set":
-            self.show_toast("资料已保存")
-        elif action == "privacy_set":
-            self.show_toast("隐私已保存")
-        elif action == "moment_post":
-            self.show_toast("已发布到朋友圈")
-        elif action in {"moment_delete", "moment_like", "moment_comment"}:
-            self.moment_board.set_moments(list(self.snapshot_data.get("moments") or []))
 
     def on_connection(self, connected: bool, text: str) -> None:
         self._connected = connected
@@ -1323,7 +1591,7 @@ class MainWindow(QMainWindow):
         fg = palette.danger_text if error else palette.text
         self.toast.setText(text)
         self.toast.setStyleSheet(
-            f"background:{bg};color:{fg};border:none;border-radius:10px;padding:8px 14px;font-size:13px;"
+            f"background:{bg};color:{fg};border:none;border-radius:8px;padding:8px 14px;font-size:13px;"
         )
         self.toast.adjustSize()
         self.toast.move(
@@ -1344,12 +1612,12 @@ class MainWindow(QMainWindow):
         self.toast_timer.start(3200)
 
     def _refresh_send(self) -> None:
-        has_text = bool(self.composer.toPlainText().strip())
+        has_text = bool(self.composer.toPlainText().strip() or self._staged)
         self.send_button.set_active(has_text, animate=not self._reduce_motion)
         self.send_button.setToolTip("发送" if has_text else "语音")
 
     def _send_or_mic(self) -> None:
-        if self.composer.toPlainText().strip():
+        if self.composer.toPlainText().strip() or self._staged:
             self.send_current()
         else:
             self.show_toast("按住说话还没做，先发文字吧")
@@ -1369,94 +1637,251 @@ class MainWindow(QMainWindow):
         self._refresh_send()
 
     def _attach(self) -> None:
+        path, _selected = QFileDialog.getOpenFileName(
+            self,
+            "选择附件",
+            "",
+            "所有文件 (*.*);;图片 (*.png *.jpg *.jpeg *.gif *.webp *.bmp);;视频 (*.mp4 *.mov *.mkv *.webm *.avi)",
+        )
+        if path:
+            self._stage_path(path)
+
+    def _on_files_dropped(self, paths: object) -> None:
+        chosen = [str(path) for path in paths] if isinstance(paths, list) else []
+        if len(chosen) > 1:
+            self.show_toast("一次发一个文件")
+        if chosen:
+            self._stage_path(chosen[0])
+
+    def _stage_path(self, path: str) -> None:
+        file_path = Path(path)
+        if not file_path.is_file():
+            self.show_toast("找不到这个文件", error=True)
+            return
+        size = file_path.stat().st_size
+        if size > MAX_FILE_BYTES:
+            self.show_toast("文件超过 32MiB，发送前已拒绝", error=True)
+            return
+        mime = guess_mime(file_path.name)
+        kind = media_kind(mime)
+        pixmap = None
+        if kind == "image":
+            reader = QImageReader(str(file_path))
+            reader.setAutoTransform(True)
+            image = reader.read()
+            if not image.isNull():
+                pixmap = QPixmap.fromImage(image)
+        self._staged = {
+            "path": str(file_path),
+            "name": file_path.name,
+            "size": size,
+            "mime": mime,
+            "media": kind,
+        }
+        self.file_preview.show_file(
+            file_path.name,
+            format_size(size),
+            pixmap,
+            kind,
+            reduce_motion=self._reduce_motion,
+            accent=self._palette.accent,
+            ink=self._palette.accent_text,
+        )
+        self._refresh_send()
+
+    def _clear_staged(self) -> None:
+        self._staged = None
+        self.file_preview.dismiss(self._reduce_motion)
+        self._refresh_send()
+
+    def _paste_image(self) -> bool:
+        clipboard = QGuiApplication.clipboard()
+        mime = clipboard.mimeData()
+        if mime is None or not mime.hasImage():
+            return False
+        if mime.hasText() and mime.text().strip():
+            return False
+        image = clipboard.image()
+        if image.isNull():
+            return False
+        folder = Path(tempfile.gettempdir()) / "ecnuchat-paste"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{uuid.uuid4().hex}.png"
+        if not image.save(str(path), "PNG"):
+            return False
+        self._stage_path(str(path))
+        return True
+
+    def _send_staged(self) -> None:
+        staged = self._staged
+        if staged is None:
+            return
         if not self.current_conv:
-            self.show_toast("先打开一个会话，再投递文件")
+            self.show_toast("先选择一个聊天")
             return
-        if self.current_conv.startswith("dm:") and not self._dm_allowed(self.current_conv[3:]):
-            self.show_toast("需要对方同意好友申请后才能发消息", error=True)
+        caption = self.composer.toPlainText().strip()
+        if self.reply_bar.author:
+            caption = encode_reply(
+                self.reply_bar.author,
+                self.reply_bar.quote,
+                caption or str(staged["name"]),
+            )
+            self.reply_bar.clear_reply()
+        if len(caption.encode("utf-8")) > 2000:
+            self.show_toast("附件说明过长", error=True)
             return
-        path, _selected = QFileDialog.getOpenFileName(self, "投递文件")
-        if not path:
-            return
-        try:
-            data = Path(path).read_bytes()
-        except OSError as exc:
-            self.show_toast(f"读不到这个文件：{exc}", error=True)
-            return
-        if not data:
-            self.show_toast("不能投递空文件", error=True)
-            return
-        if len(data) > 24 * 1024:
-            self.show_toast("投递箱单文件不超过 24KB", error=True)
-            return
-        name = Path(path).name
+        self.composer.clear()
+        self.emoji_panel.hide()
         local_id = uuid.uuid4().hex
+        attachment = {
+            "name": staged["name"],
+            "mime": staged["mime"],
+            "size": staged["size"],
+            "path": staged["path"],
+            "media": staged["media"],
+            "caption": caption,
+            "sha256": "",
+        }
         self.append_message(
             self.username,
-            f"[文件] {name}",
+            caption,
             time.time(),
             mine=True,
             state="sending",
             local_id=local_id,
+            attachment=attachment,
         )
+        path = str(staged["path"])
+        name = str(staged["name"])
+        mime = str(staged["mime"])
+        self._clear_staged()
         self.worker.submit(
             "send_file",
             local_id=local_id,
             conv=self.current_conv,
+            path=path,
+            caption=caption,
             name=name,
-            data=base64.b64encode(data).decode("ascii"),
+            mime=mime,
         )
+        self._refresh_send()
 
-    def _open_drop(self, path: str) -> None:
+    def _open_attachment(self, item: ChatItem) -> None:
+        attachment = item.attachment or {}
+        path = str(attachment.get("path") or "")
         if not path or not Path(path).is_file():
-            self.show_toast("文件不在本机了", error=True)
+            self.show_toast("文件不在本机", error=True)
             return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        kind = str(attachment.get("media") or "file")
+        if kind == "image":
+            self._show_image(path, str(attachment.get("name") or "图片"))
+        elif kind == "video":
+            self._show_video(path, str(attachment.get("name") or "视频"))
+        else:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
-    def _save_profile(self, display_name: str, bio: str, avatar: str) -> None:
-        self.worker.submit(
-            "profile_set",
-            display_name=display_name,
-            bio=bio,
-            avatar=avatar,
-        )
+    def _show_image(self, path: str, title: str) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(720, 540)
+        layout = QVBoxLayout(dialog)
+        label = QLabel()
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pixmap = QPixmap(path)
+        if not pixmap.isNull():
+            screen = self.screen()
+            limit = 960
+            if screen is not None:
+                limit = int(screen.availableGeometry().width() * 0.7)
+            label.setPixmap(
+                pixmap.scaled(
+                    limit,
+                    int(limit * 0.75),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+        layout.addWidget(label)
+        dialog.exec()
 
-    def _save_privacy(self, privacy: object) -> None:
-        if not isinstance(privacy, dict):
+    def _show_video(self, path: str, title: str) -> None:
+        try:
+            from PySide6.QtCore import QObject
+            from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
+        except Exception:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
             return
-        self.worker.submit("privacy_set", **privacy)
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(760, 480)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(0, 0, 0, 0)
+        screen = QLabel("正在打开视频")
+        screen.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        screen.setStyleSheet("background:#111111;color:#dddddd;")
+        screen.setMinimumSize(480, 270)
+        layout.addWidget(screen)
+        player = QMediaPlayer(dialog)
+        audio = QAudioOutput(dialog)
+        sink = QVideoSink(dialog)
+        player.setAudioOutput(audio)
+        player.setVideoSink(sink)
+        latest: dict[str, QPixmap] = {}
 
-    def _add_friend_dialog(self) -> None:
-        values = self._ask("添加好友", [("用户名", "bob"), ("验证消息", "你好")])
-        if not values or not values[0].strip():
-            return
-        self.worker.submit(
-            "friend_request",
-            username=values[0].strip(),
-            greeting=values[1].strip(),
-        )
+        def paint_latest() -> None:
+            pix = latest.get("frame")
+            if pix is None or pix.isNull():
+                return
+            screen.setPixmap(
+                pix.scaled(
+                    max(1, screen.width()),
+                    max(1, screen.height()),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.FastTransformation,
+                )
+            )
 
-    def _add_named(self, username: str) -> None:
-        values = self._ask("添加好友", [("验证消息", f"你好，我是{self.username}")])
-        if values is None:
-            return
-        self.worker.submit(
-            "friend_request",
-            username=username,
-            greeting=values[0].strip(),
-        )
+        def on_frame(frame) -> None:
+            image = frame.toImage()
+            if image.isNull():
+                return
+            latest["frame"] = QPixmap.fromImage(image)
+            paint_latest()
+
+        def on_error(_code, text: str) -> None:
+            if "frame" not in latest:
+                screen.setText(text or "视频打不开")
+
+        class _Refit(QObject):
+            def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
+                if watched is screen and event.type() == QEvent.Type.Resize:
+                    paint_latest()
+                return False
+
+        refit = _Refit(dialog)
+        screen.installEventFilter(refit)
+        sink.videoFrameChanged.connect(on_frame)
+        player.errorOccurred.connect(on_error)
+        player.setSource(QUrl.fromLocalFile(path))
+        player.play()
+        dialog.finished.connect(player.stop)
+        dialog.exec()
 
     def _more_menu(self) -> None:
         from PySide6.QtWidgets import QMenu
 
         menu = QMenu(self)
         search = menu.addAction("搜索")
+        fingerprint = menu.addAction("身份指纹")
+        fingerprint.setEnabled(bool(self.current_conv and self.current_conv.startswith("dm:")))
         pin = menu.addAction("置顶会话")
         mute = menu.addAction("静音")
         theme = menu.addAction(f"切换主题 · {THEME_LABELS.get(next_theme(self.theme), '')}")
         chosen = menu.exec(self.more_button.mapToGlobal(QPoint(0, self.more_button.height())))
         if chosen is search:
             self._focus_search()
+        elif chosen is fingerprint:
+            self.show_fingerprint()
         elif chosen is pin and self.current_conv:
             self._conv_menu(self.current_conv, "pin")
         elif chosen is mute and self.current_conv:
@@ -1485,9 +1910,6 @@ class MainWindow(QMainWindow):
         self.search.selectAll()
 
     def _back(self) -> None:
-        if self._social_open:
-            self._show_page(0)
-            return
         self._pane = "list"
         self._apply_responsive()
 
@@ -1501,6 +1923,19 @@ class MainWindow(QMainWindow):
         if bubble is None or not self.current_conv:
             return
         bubble.set_state("sending")
+        attachment = bubble.item.attachment
+        if attachment:
+            bubble.item.progress = 0.0
+            self.worker.submit(
+                "send_file",
+                local_id=local_id,
+                conv=self.current_conv,
+                path=str(attachment.get("path") or ""),
+                caption=str(attachment.get("caption") or bubble.item.body),
+                name=str(attachment.get("name") or ""),
+                mime=str(attachment.get("mime") or ""),
+            )
+            return
         self.worker.submit("send", local_id=local_id, conv=self.current_conv, text=bubble.item.raw)
 
     def _copy_item(self, item: ChatItem) -> None:
@@ -1508,9 +1943,10 @@ class MainWindow(QMainWindow):
         self.show_toast("已复制")
 
     def _reply_to(self, item: ChatItem) -> None:
-        if not item.body:
+        quote = item.body or str((item.attachment or {}).get("name") or "")
+        if not quote:
             return
-        self.reply_bar.set_reply(item.sender or "对方", item.body)
+        self.reply_bar.set_reply(item.sender or "对方", quote)
         self.composer.setFocus()
 
     def _delete_item(self, item: ChatItem) -> None:
@@ -1543,19 +1979,12 @@ class MainWindow(QMainWindow):
     def _apply_responsive(self) -> None:
         compact = self.width() < 800
         self._compact = compact
-        social = self._social_open
-        show_chat = bool(self.current_conv) and self._pane == "chat" and not social
-        self.back_button.setVisible(compact and (show_chat or social))
+        show_chat = bool(self.current_conv) and self._pane == "chat"
+        self.back_button.setVisible(compact and show_chat)
         if compact:
-            self.nav.setVisible(False)
-            if social:
-                self.sidebar.setVisible(True)
-                self.main_stack.setVisible(True)
-            else:
-                self.sidebar.setVisible(not show_chat)
-                self.main_stack.setVisible(show_chat)
+            self.sidebar.setVisible(not show_chat)
+            self.main_stack.setVisible(show_chat)
         else:
-            self.nav.setVisible(True)
             self.sidebar.setVisible(True)
             self.main_stack.setVisible(True)
             self.back_button.setVisible(False)

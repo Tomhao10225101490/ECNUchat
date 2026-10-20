@@ -21,6 +21,7 @@ from rich.live import Live
 from rich.text import Text
 
 from src import PROJECT_NAME
+from src.attachments import display_text, preview_text
 from src.client import ChatEngine, CommandResult, Incoming, handle_line, legacy_command_loop
 from src.double_ratchet import RatchetError
 from src.protocol import ProtocolError, fingerprint_short
@@ -87,11 +88,13 @@ HELP_TEXT = """命令
   /privacy online on|off  是否对好友显示在线
   /privacy search on|off  是否允许被搜索
   /fingerprint 名字       16 组身份指纹，线下核对
+  /pq status 名字         混合握手与 PQ 棘轮状态
   /group create 群名 成员…
   /group add 群名 新成员
   /group 群名             打开群
   /users                  在线列表
   /history                当前会话记录
+  /file 路径              加密发送图片、视频或文件
   /theme telegram|wechat  切换蓝色/微信绿色风格
   /help                   本页
   /quit                   退出
@@ -314,7 +317,8 @@ def list_conversations(engine: ChatEngine, ui: UIState) -> list[ConvItem]:
             title, kind = conv[6:], "group"
         else:
             continue
-        preview = body if sender in {engine.username, "系统"} else f"{sender}: {body}"
+        shown = preview_text(body)
+        preview = shown if sender in {engine.username, "系统"} else f"{sender}: {shown}"
         found[conv] = ConvItem(conv, title, kind, preview, ts, ui.unread.get(conv, 0))
     for name in engine.groups:
         found.setdefault(f"group:{name}", ConvItem(f"group:{name}", name, "group", unread=ui.unread.get(f"group:{name}", 0)))
@@ -607,13 +611,14 @@ class ChatPane:
             if label and label != prev_day:
                 prev_day = label
                 lines.append(_line([(f" {label} ", f"{MUTED} {SIDE_BG}")], width, BG))
+            shown = display_text(body, getattr(engine.store, "path", None))
             if sender == "系统":
-                hot = any(flag in body for flag in SECURITY)
+                hot = any(flag in shown for flag in SECURITY)
                 style = f"bold {RED} {BG}" if hot else f"{MUTED} {BG}"
-                lines.append(_line([(f" {body} ", style)], width, BG))
+                lines.append(_line([(f" {shown} ", style)], width, BG))
                 continue
             mine = sender == engine.username
-            rows = _bubble_lines(body, short_clock(ts), mine, inner)
+            rows = _bubble_lines(shown, short_clock(ts), mine, inner)
             if engine.current_group and not mine:
                 lines.append(_line([("  " + sender, f"bold {avatar_color(sender)} {BG}")], width, BG))
             bubble = OUT if mine else IN

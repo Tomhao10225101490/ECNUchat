@@ -170,6 +170,24 @@ class PeoplePanel(QWidget):
             for item in blocked:
                 self._body.addWidget(self._blocked_card(item))
         self._body.addStretch(1)
+        self._fit()
+
+    def _fit(self) -> None:
+        margins = self._body.contentsMargins()
+        height = margins.top() + margins.bottom()
+        spacing = self._body.spacing()
+        counted = 0
+        for index in range(self._body.count()):
+            widget = self._body.itemAt(index).widget()
+            if widget is None:
+                continue
+            height += widget.sizeHint().height()
+            counted += 1
+        if counted > 1:
+            height += spacing * (counted - 1)
+        height = min(max(height, 1), 360)
+        self.setMinimumHeight(height)
+        self.setMaximumHeight(height)
 
     def _person_row(self, item: dict[str, Any], extra: str = "") -> QHBoxLayout:
         row = QHBoxLayout()
@@ -309,8 +327,9 @@ class MomentComposer(QWidget):
         self.visibility.addItem("好友可见", "friends")
         self.visibility.addItem("仅自己可见", "private")
         layout.addWidget(self.visibility)
-        self.image_label = QLabel("未附加图片")
+        self.image_label = QLabel("")
         self.image_label.setObjectName("caption")
+        self.image_label.hide()
         layout.addWidget(self.image_label)
         row = QHBoxLayout()
         self.image_button = _button("加图片", "quiet")
@@ -340,12 +359,15 @@ class MomentComposer(QWidget):
         except Exception as exc:
             self._image = ""
             self.image_label.setText(str(exc))
+            self.image_label.show()
             return
-        self.image_label.setText("已附上一张小图")
+        self.image_label.setText("已附加图片")
+        self.image_label.show()
 
     def _clear_image(self) -> None:
         self._image = ""
-        self.image_label.setText("未附加图片")
+        self.image_label.clear()
+        self.image_label.hide()
 
     def _publish(self) -> None:
         body = self.body.toPlainText().strip()

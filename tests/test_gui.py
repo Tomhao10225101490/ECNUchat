@@ -19,6 +19,7 @@ class FakeWorker(QObject):
     historyReady = Signal(str, object)
     searchReady = Signal(object)
     messageState = Signal(str, str, str)
+    fileProgress = Signal(str, int, int)
     actionResult = Signal(str, bool, object)
     connectionChanged = Signal(bool, str)
     fatalError = Signal(str)
@@ -292,6 +293,212 @@ def test_incoming_friend_request_can_be_accepted() -> None:
     assert window.moment_board.isVisible()
     window._show_page(3)
     qt.processEvents()
-    assert window.drop_board.isVisible()
+    window.hide()
+    qt.processEvents()
+
+
+def test_stage_send_and_paint_file_bubble(tmp_path) -> None:
+    from PySide6.QtGui import QImage
+
+    qt = app()
+    worker = FakeWorker()
+    window = MainWindow(worker, snapshot())
+    window.show()
+    window.open_conversation("dm:bob")
+    note = tmp_path / "课堂笔记.txt"
+    note.write_text("只在本机看到的字", encoding="utf-8")
+    window._stage_path(str(note))
+    qt.processEvents()
+    assert window.file_preview.isVisible()
+    assert "课堂笔记.txt" in window.file_preview.title.text()
+    window.file_preview.cleared.emit()
+    qt.processEvents()
+    assert window._staged is None
+    assert not window.file_preview.isVisible()
+
+    window._stage_path(str(note))
+    window.composer.setPlainText("看看附件")
+    window.send_current()
+    action, payload = worker.commands[-1]
+    assert action == "send_file"
+    assert payload["path"] == str(note)
+    assert payload["caption"] == "看看附件"
+    assert payload["local_id"] in window.bubbles
+    window._retry(payload["local_id"])
+    assert worker.commands[-1][0] == "send_file"
+    assert worker.commands[-1][1]["local_id"] == payload["local_id"]
+
+    image_path = tmp_path / "dot.png"
+    image = QImage(8, 8, QImage.Format.Format_RGB32)
+    image.fill(0xFF2266AA)
+    assert image.save(str(image_path))
+    window.show_history(
+        "dm:bob",
+        [
+            {
+                "sender": "alice",
+                "body": "看看",
+                "ts": time.time(),
+                "attachment": {
+                    "name": "dot.png",
+                    "mime": "image/png",
+                    "size": 12,
+                    "path": str(image_path),
+                    "media": "image",
+                    "caption": "看看",
+                    "sha256": "ab",
+                },
+            },
+            {
+                "sender": "bob",
+                "body": "",
+                "ts": time.time(),
+                "attachment": {
+                    "name": "clip.mp4",
+                    "mime": "video/mp4",
+                    "size": 4096,
+                    "path": str(tmp_path / "missing.mp4"),
+                    "media": "video",
+                    "caption": "",
+                    "sha256": "cd",
+                },
+            },
+            {
+                "sender": "bob",
+                "body": "",
+                "ts": time.time(),
+                "attachment": {
+                    "name": "spec.pdf",
+                    "mime": "application/pdf",
+                    "size": 99,
+                    "path": str(note),
+                    "media": "file",
+                    "caption": "",
+                    "sha256": "ef",
+                },
+            },
+        ],
+    )
+    qt.processEvents()
+    painted = [item for item in window.messages.items() if item.attachment]
+    assert [item.attachment["media"] for item in painted] == ["image", "video", "file"]
+    window.messages.viewport().repaint()
+    qt.processEvents()
+    window.hide()
+
+
+def test_people_picker_cancel_and_finish() -> None:
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QDialog, QPushButton
+
+    from src.gui.people import PeoplePicker
+    from src.gui.theme import PALETTES
+
+    qt = app()
+    people = [
+        {"name": "bob", "online": True, "known": True},
+        {"name": "carol", "online": False, "known": False},
+    ]
+    picker = PeoplePicker(people, mode="group", palette=PALETTES["telegram"])
+    picker.show()
+    qt.processEvents()
+    picker.toggle("bob")
+    finish = next(button for button in picker.findChildren(QPushButton) if button.objectName() == "primary")
+    QTest.mouseClick(finish, Qt.MouseButton.LeftButton)
+    qt.processEvents()
+    assert not picker.isVisible()
+    assert picker.result() == QDialog.DialogCode.Accepted
+    assert picker.selected() == ["bob"]
+    assert picker.group_name() == "bob"
+
+    again = PeoplePicker(people, mode="group", palette=PALETTES["telegram"])
+    again.show()
+    qt.processEvents()
+    cancel = next(button for button in again.findChildren(QPushButton) if button.text() == "取消")
+    QTest.mouseClick(cancel, Qt.MouseButton.LeftButton)
+    qt.processEvents()
+    assert not again.isVisible()
+    assert again.result() == QDialog.DialogCode.Rejected
+    again.hide()
+
+
+def test_contacts_sections_partial_search_and_preview(tmp_path) -> None:
+    from PySide6.QtGui import QImage
+
+    from src.gui.people import PeoplePicker, build_directory, suggest_group_name
+    from src.gui.theme import PALETTES
+    from src.protocol import MAX_GROUP_MEMBERS
+
+    people = [
+        {"name": "bob", "online": True, "known": True},
+        {"name": "carol", "online": False, "known": False},
+        {"name": "dave", "online": True, "known": False},
+        {"name": "_amy", "online": False, "known": False},
+    ]
+    titles = [row.title for row in build_directory(people, ["三人组"], "")]
+    assert titles[0] == "群聊"
+    assert "三人组" in titles
+    assert "B" in titles and "bob" in titles
+    assert "#" in titles and "_amy" in titles
+    assert [row.title for row in build_directory(people, ["三人组"], "da") if row.kind == "person"] == ["dave"]
+    assert suggest_group_name(["bob", "carol", "dave", "erin"]).startswith("bob、carol、dave")
+
+    qt = app()
+    picker = PeoplePicker(people, mode="group", palette=PALETTES["telegram"])
+    picker.search.setText("bo")
+    qt.processEvents()
+    assert picker.visible_names() == ["bob"]
+    picker.toggle("bob")
+    picker.search.setText("ca")
+    qt.processEvents()
+    picker.toggle("carol")
+    assert picker.selected() == ["bob", "carol"]
+    assert picker.group_name() == "bob、carol"
+    assert "bob" in picker.picked_label.text()
+    assert picker.chips._names == ["bob", "carol"]
+    assert not picker.chips.isHidden()
+    for index in range(MAX_GROUP_MEMBERS):
+        picker.toggle(f"user{index}")
+    assert len(picker.selected()) == MAX_GROUP_MEMBERS - 1
+    assert picker.limit_hint.text()
+    picker.hide()
+
+    worker = FakeWorker()
+    window = MainWindow(worker, snapshot())
+    window.show()
+    window.directory = ["bob", "carol", "dave"]
+    window._show_page(1)
+    qt.processEvents()
+    shown = [entry.title for entry in window.contacts.entries()]
+    assert "群聊" in shown and "B" in shown and "dave" in shown
+    window.search.setText("da")
+    window.perform_search()
+    qt.processEvents()
+    names = [entry.title for entry in window.contacts.entries() if entry.kind == "person"]
+    assert names == ["dave"]
+    window.contacts.scroll_to_letter("D")
+    assert window.contacts.flash.isVisible()
+    window._show_page(0)
+    window.open_conversation("dm:bob")
+    note = tmp_path / "课堂笔记.txt"
+    note.write_text("预览", encoding="utf-8")
+    window._stage_path(str(note))
+    qt.processEvents()
+    assert window.file_preview.meta.text().startswith("文件 ·")
+    window.apply_theme("wechat", animate=False)
+    assert window.file_preview.isVisible()
+    image_path = tmp_path / "poster.png"
+    image = QImage(32, 48, QImage.Format.Format_RGB32)
+    image.fill(0xFFCC8844)
+    assert image.save(str(image_path))
+    window._stage_path(str(image_path))
+    qt.processEvents()
+    assert window.file_preview.meta.text().startswith("图片 ·")
+    assert not window.file_preview.thumb._pix.isNull()
+    window.file_preview.cleared.emit()
+    qt.processEvents()
+    assert window._staged is None
+    assert not window.file_preview.isVisible()
     window.hide()
 

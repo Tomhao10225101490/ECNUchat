@@ -41,6 +41,8 @@ class ChatItem:
     is_tail: bool = True
     anim: float = 1.0
     key: str = ""
+    attachment: dict | None = None
+    progress: float = -1.0
 
 
 def security_hint(text: str) -> str | None:

@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 from src import PROJECT_NAME
 from src.gui.engine_worker import ConnectionConfig
 from src.gui.icons import paint_icon
+from src.gui.theme import stylesheet
 from src.gui.widgets import ui_font
 
 
@@ -45,6 +46,7 @@ class LoginDialog(QDialog):
         self.setWindowTitle(PROJECT_NAME)
         self.setMinimumSize(420, 560)
         self.resize(480, 640)
+        self.setStyleSheet(stylesheet("telegram"))
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -67,21 +69,20 @@ class LoginDialog(QDialog):
         card_layout.addWidget(title)
         card_layout.addSpacing(12)
 
-        def field(caption: str, widget: QWidget) -> None:
-            label = QLabel(caption)
-            label.setObjectName("caption")
-            card_layout.addWidget(label)
-            card_layout.addWidget(widget)
-
         self.username = QLineEdit("alice")
         self.username.setPlaceholderText("用户名")
+        self.username.setFixedHeight(42)
         self.password = QLineEdit("password123")
         self.password.setEchoMode(QLineEdit.EchoMode.Password)
         self.password.setPlaceholderText("口令")
+        self.password.setFixedHeight(42)
         self.host = QLineEdit("127.0.0.1")
+        self.host.setPlaceholderText("服务器")
+        self.host.setFixedHeight(42)
         self.port = QSpinBox()
         self.port.setRange(1, 65535)
         self.port.setValue(8765)
+        self.port.setFixedHeight(42)
         endpoint = QWidget()
         endpoint_row = QHBoxLayout(endpoint)
         endpoint_row.setContentsMargins(0, 0, 0, 0)
@@ -94,10 +95,10 @@ class LoginDialog(QDialog):
                 QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
             )
         )
-        field("用户名", self.username)
-        field("本地口令", self.password)
+        card_layout.addWidget(self.username)
+        card_layout.addWidget(self.password)
         card_layout.addWidget(self.show_password)
-        field("服务器", endpoint)
+        card_layout.addWidget(endpoint)
 
         self.status = QLabel("")
         self.status.setObjectName("secondary")
