@@ -24,6 +24,8 @@ PROJECT_ABSTRACT = (
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 MAX_WS_MESSAGE = 64 * 1024
+# 聊天信封仍是 64KB。附件密文单独放宽到 2MiB，才能放下 1MiB 明文加 GCM 标签的 base64。
+MAX_BLOB_FRAME = 2 * 1024 * 1024
 # 群正文按收件人各发一封双棘轮信封，信封数随人数线性增长，所以封顶。
 # 不是 Sender Keys 的一条群链。见 ChatEngine.send_text。
 MAX_GROUP_MEMBERS = 8
@@ -107,9 +109,12 @@ def loads(raw: str | bytes) -> dict[str, Any]:
     return data
 
 
-def check_size(raw: str | bytes) -> None:
+def check_size(raw: str | bytes, limit: int | None = None) -> None:
+    cap = MAX_WS_MESSAGE if limit is None else limit
     n = len(raw.encode("utf-8") if isinstance(raw, str) else raw)
-    if n > MAX_WS_MESSAGE:
+    if n > cap:
+        if cap > MAX_WS_MESSAGE:
+            raise ProtocolError("单条 WebSocket 消息超过 2MiB")
         raise ProtocolError("单条 WebSocket 消息超过 64KB")
 
 

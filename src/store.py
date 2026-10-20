@@ -160,6 +160,7 @@ class ClientStore:
         self._key: bytes | None = None
         self.conn = sqlite3.connect(self.path)
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self._init()
 
     def _init(self) -> None:
@@ -677,6 +678,8 @@ class ServerStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA cache_size=-65536")
         self._init()
 
     def _init(self) -> None:

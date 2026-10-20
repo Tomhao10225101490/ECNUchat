@@ -502,3 +502,83 @@ def test_contacts_sections_partial_search_and_preview(tmp_path) -> None:
     assert not window.file_preview.isVisible()
     window.hide()
 
+
+def test_large_video_preview_and_receive_progress(tmp_path) -> None:
+    qt = app()
+    worker = FakeWorker()
+    window = MainWindow(worker, snapshot())
+    window.resize(1100, 760)
+    window.show()
+    window.open_conversation("dm:bob")
+    video = tmp_path / "lecture.mp4"
+    with video.open("wb") as handle:
+        handle.seek(40 * 1024 * 1024 - 1)
+        handle.write(b"x")
+    window._stage_path(str(video))
+    qt.processEvents()
+    assert window._staged is not None
+    assert window.file_preview.meta.text().startswith("视频 ·")
+    assert "MB" in window.file_preview.meta.text()
+    window._clear_staged()
+    huge = tmp_path / "too-big.mp4"
+    with huge.open("wb") as handle:
+        handle.seek(8 * 1024 * 1024 * 1024)
+        handle.write(b"x")
+    window._stage_path(str(huge))
+    qt.processEvents()
+    assert window._staged is None
+    assert "8GiB" in window.toast.text()
+    digest = "ab" * 32
+    window.on_incoming(
+        {
+            "sender": "bob",
+            "text": "",
+            "group": None,
+            "kind": "file_progress",
+            "error": None,
+            "local_id": "in:clip",
+            "attachment": {
+                "name": "lecture.mp4",
+                "mime": "video/mp4",
+                "size": 40 * 1024 * 1024,
+                "sha256": digest,
+                "path": "",
+                "media": "video",
+                "caption": "",
+            },
+        }
+    )
+    window.on_file_progress("in:clip", 16 * 1024 * 1024, 40 * 1024 * 1024)
+    qt.processEvents()
+    assert [item.attachment.get("name") for item in window.messages.items() if item.attachment] == [
+        "lecture.mp4"
+    ]
+    assert window.bubbles["in:clip"].item.state == "sending"
+    assert window.bubbles["in:clip"].item.progress == 0.4
+    window.on_incoming(
+        {
+            "sender": "bob",
+            "text": "视频",
+            "group": None,
+            "kind": "file",
+            "error": None,
+            "local_id": "in:clip",
+            "attachment": {
+                "name": "lecture.mp4",
+                "mime": "video/mp4",
+                "size": 40 * 1024 * 1024,
+                "sha256": digest,
+                "path": str(video),
+                "media": "video",
+                "caption": "",
+            },
+        }
+    )
+    qt.processEvents()
+    files = [item for item in window.messages.items() if item.attachment]
+    assert len(files) == 1
+    assert files[0].state == "accepted"
+    assert files[0].attachment["path"] == str(video)
+    window.grab().save(str(tmp_path / "video-bubble.png"))
+    window.hide()
+

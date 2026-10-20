@@ -12,14 +12,17 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-MAX_FILE_BYTES = 32 * 1024 * 1024
-FILE_PLAIN_CHUNK = 24 * 1024
+MAX_FILE_BYTES = 8 * 1024 * 1024 * 1024
+FILE_PLAIN_CHUNK = 1024 * 1024
+FILE_LIMIT_LABEL = "8GiB"
 FILE_KEY_LEN = 32
 FILE_ID_LEN = 16
 NONCE_PREFIX_LEN = 8
@@ -56,7 +59,7 @@ def expected_chunks(size: int) -> int:
     if isinstance(size, bool) or not isinstance(size, int):
         raise AttachmentError("文件大小无效")
     if size < 0 or size > MAX_FILE_BYTES:
-        raise AttachmentError("文件超过 32MiB")
+        raise AttachmentError(f"文件超过 {FILE_LIMIT_LABEL}")
     if size == 0:
         return 1
     return (size + FILE_PLAIN_CHUNK - 1) // FILE_PLAIN_CHUNK
@@ -72,6 +75,102 @@ def plaintext_len(size: int, chunks: int, index: int) -> int:
 
 def cipher_len(size: int, chunks: int, index: int) -> int:
     return plaintext_len(size, chunks, index) + GCM_TAG_LEN
+
+
+def decrypt_chunk(meta: FileMeta, index: int, ciphertext: bytes) -> bytes:
+    if index < 0 or index >= meta.chunks:
+        raise AttachmentError("GCM 失败")
+    if not isinstance(ciphertext, (bytes, bytearray)):
+        raise AttachmentError("GCM 失败")
+    if len(ciphertext) != cipher_len(meta.size, meta.chunks, index):
+        raise AttachmentError("GCM 失败")
+    try:
+        piece = AESGCM(meta.key).decrypt(
+            chunk_nonce(meta.nonce_prefix, index),
+            bytes(ciphertext),
+            chunk_aad(meta.file_id, index, meta.chunks),
+        )
+    except (InvalidTag, ValueError) as exc:
+        raise AttachmentError("GCM 失败") from exc
+    if len(piece) != plaintext_len(meta.size, meta.chunks, index):
+        raise AttachmentError("GCM 失败")
+    return piece
+
+
+def hash_file(path: Path) -> bytes:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            block = handle.read(FILE_PLAIN_CHUNK)
+            if not block:
+                break
+            digest.update(block)
+    return digest.digest()
+
+
+def seal_path(
+    src: Path,
+    cipher_root: Path,
+    name: str,
+    mime: str | None = None,
+    on_plain: Any = None,
+) -> FileMeta:
+    """按块从磁盘加密。明文不进内存列表，密文写到 cipher_root/<文件编号>/<序号>。"""
+    if not src.is_file():
+        raise AttachmentError("文件不存在")
+    size = src.stat().st_size
+    chunks_n = expected_chunks(size)
+    file_id = os.urandom(FILE_ID_LEN)
+    key = os.urandom(FILE_KEY_LEN)
+    prefix = os.urandom(NONCE_PREFIX_LEN)
+    aes = AESGCM(key)
+    folder = cipher_root / file_id.hex()
+    folder.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    sealed = 0
+    try:
+        with src.open("rb") as handle:
+            for index in range(chunks_n):
+                want = plaintext_len(size, chunks_n, index)
+                piece = handle.read(want)
+                if len(piece) != want:
+                    raise AttachmentError("文件读取中断")
+                digest.update(piece)
+                sealed += len(piece)
+                if on_plain is not None:
+                    on_plain(sealed)
+                ciphertext = aes.encrypt(
+                    chunk_nonce(prefix, index),
+                    piece,
+                    chunk_aad(file_id, index, chunks_n),
+                )
+                (folder / str(index)).write_bytes(ciphertext)
+    except Exception:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+    safe_name = clean_name(name)
+    safe_mime = mime if isinstance(mime, str) and _MIME_RE.fullmatch(mime) else guess_mime(safe_name)
+    return FileMeta(
+        file_id=file_id,
+        key=key,
+        nonce_prefix=prefix,
+        sha256=digest.digest(),
+        size=size,
+        chunks=chunks_n,
+        name=safe_name,
+        mime=safe_mime[:80],
+    )
+
+
+def place_local_copy(src: Path, dest: Path) -> None:
+    """发送方留下一份明文。同一文件系统上用硬链接，避免再读一遍大视频。"""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.unlink()
+    try:
+        os.link(src, dest)
+    except OSError:
+        shutil.copyfile(src, dest)
 
 
 def chunk_nonce(prefix: bytes, index: int) -> bytes:
@@ -122,7 +221,9 @@ def format_size(size: int) -> str:
         return f"{size} B"
     if size < 1024 * 1024:
         return f"{size / 1024:.1f} KB"
-    return f"{size / 1024 / 1024:.1f} MB"
+    if size < 1024 * 1024 * 1024:
+        return f"{size / 1024 / 1024:.1f} MB"
+    return f"{size / 1024 / 1024 / 1024:.1f} GB"
 
 
 def _b64e(data: bytes) -> str:
@@ -179,22 +280,7 @@ def seal_bytes(data: bytes, name: str, mime: str | None = None) -> SealedFile:
 def open_bytes(meta: FileMeta, chunks: list[bytes]) -> bytes:
     if len(chunks) != meta.chunks:
         raise AttachmentError("GCM 失败")
-    aes = AESGCM(meta.key)
-    parts: list[bytes] = []
-    for index, ciphertext in enumerate(chunks):
-        if not isinstance(ciphertext, (bytes, bytearray)):
-            raise AttachmentError("GCM 失败")
-        if len(ciphertext) != cipher_len(meta.size, meta.chunks, index):
-            raise AttachmentError("GCM 失败")
-        try:
-            piece = aes.decrypt(
-                chunk_nonce(meta.nonce_prefix, index),
-                bytes(ciphertext),
-                chunk_aad(meta.file_id, index, meta.chunks),
-            )
-        except (InvalidTag, ValueError) as exc:
-            raise AttachmentError("GCM 失败") from exc
-        parts.append(piece)
+    parts = [decrypt_chunk(meta, index, ciphertext) for index, ciphertext in enumerate(chunks)]
     plain = b"".join(parts)
     if len(plain) != meta.size or hashlib.sha256(plain).digest() != meta.sha256:
         raise AttachmentError("摘要不一致")

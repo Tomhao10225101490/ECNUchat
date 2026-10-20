@@ -80,7 +80,7 @@ HELP_TEXT = """命令
   /friends                 好友、申请、未通过、黑名单
   /search 关键字           按用户名或昵称搜索
   /chat 名字              打开单聊
-  /file 路径              把不超过 24KB 的文件投进当前会话
+  /file 路径              加密发送图片、视频或文件，最大 8GiB
   /moment 正文            发一条朋友圈。/moment 查看
   /profile 昵称           改昵称。/bio 正文 改简介
   /privacy approval on|off 是否需要同意才加好友
@@ -94,7 +94,6 @@ HELP_TEXT = """命令
   /group 群名             打开群
   /users                  在线列表
   /history                当前会话记录
-  /file 路径              加密发送图片、视频或文件
   /theme telegram|wechat  切换蓝色/微信绿色风格
   /help                   本页
   /quit                   退出

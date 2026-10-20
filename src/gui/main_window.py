@@ -1343,6 +1343,10 @@ class MainWindow(QMainWindow):
         if item.get("kind") == "typing":
             self.set_peer_typing(True, str(item.get("sender") or ""))
             return
+        local_id = str(item.get("local_id") or "")
+        if item.get("kind") == "file_abort":
+            self._drop_live_file(local_id)
+            return
         group = item.get("group")
         sender = str(item.get("sender") or "")
         conv = f"group:{group}" if group else (f"dm:{sender}" if sender and sender != "系统" else "")
@@ -1355,6 +1359,21 @@ class MainWindow(QMainWindow):
         else:
             body = str(item.get("text") or "")
         kind = "error" if item.get("error") else str(item.get("kind") or "chat")
+        if kind == "file_progress":
+            if conv and conv == self.current_conv and attachment and local_id:
+                self._upsert_incoming_file(local_id, sender, attachment, "sending", create=True)
+            return
+        if kind == "file" and attachment and local_id:
+            if self._upsert_incoming_file(
+                local_id,
+                sender,
+                attachment,
+                "accepted",
+                create=bool(conv and conv == self.current_conv),
+            ):
+                if conv == self.current_conv:
+                    self.set_peer_typing(False)
+                return
         if conv and conv == self.current_conv:
             self.set_peer_typing(False)
             self.append_message(
@@ -1660,7 +1679,7 @@ class MainWindow(QMainWindow):
             return
         size = file_path.stat().st_size
         if size > MAX_FILE_BYTES:
-            self.show_toast("文件超过 32MiB，发送前已拒绝", error=True)
+            self.show_toast("文件超过 8GiB，发送前已拒绝", error=True)
             return
         mime = guess_mime(file_path.name)
         kind = media_kind(mime)
@@ -1806,66 +1825,109 @@ class MainWindow(QMainWindow):
 
     def _show_video(self, path: str, title: str) -> None:
         try:
-            from PySide6.QtCore import QObject
-            from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
+            from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+            from PySide6.QtMultimediaWidgets import QVideoWidget
         except Exception:
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
             return
         dialog = QDialog(self)
         dialog.setWindowTitle(title)
-        dialog.resize(760, 480)
+        dialog.resize(960, 540)
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(0, 0, 0, 0)
-        screen = QLabel("正在打开视频")
-        screen.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        screen.setStyleSheet("background:#111111;color:#dddddd;")
-        screen.setMinimumSize(480, 270)
+        screen = QVideoWidget(dialog)
+        screen.setStyleSheet("background:#111111;")
+        screen.setMinimumSize(640, 360)
         layout.addWidget(screen)
         player = QMediaPlayer(dialog)
         audio = QAudioOutput(dialog)
-        sink = QVideoSink(dialog)
         player.setAudioOutput(audio)
-        player.setVideoSink(sink)
-        latest: dict[str, QPixmap] = {}
-
-        def paint_latest() -> None:
-            pix = latest.get("frame")
-            if pix is None or pix.isNull():
-                return
-            screen.setPixmap(
-                pix.scaled(
-                    max(1, screen.width()),
-                    max(1, screen.height()),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.FastTransformation,
-                )
-            )
-
-        def on_frame(frame) -> None:
-            image = frame.toImage()
-            if image.isNull():
-                return
-            latest["frame"] = QPixmap.fromImage(image)
-            paint_latest()
+        player.setVideoOutput(screen)
 
         def on_error(_code, text: str) -> None:
-            if "frame" not in latest:
-                screen.setText(text or "视频打不开")
+            player.stop()
+            dialog.close()
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+            if text:
+                self.show_toast(text, error=True)
 
-        class _Refit(QObject):
-            def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
-                if watched is screen and event.type() == QEvent.Type.Resize:
-                    paint_latest()
-                return False
-
-        refit = _Refit(dialog)
-        screen.installEventFilter(refit)
-        sink.videoFrameChanged.connect(on_frame)
         player.errorOccurred.connect(on_error)
         player.setSource(QUrl.fromLocalFile(path))
         player.play()
         dialog.finished.connect(player.stop)
         dialog.exec()
+
+    def _find_file_item(self, local_id: str, attachment: dict[str, Any]) -> ChatItem | None:
+        bubble = self.bubbles.get(local_id)
+        if bubble is not None:
+            return bubble.item
+        digest = str(attachment.get("sha256") or "")
+        name = str(attachment.get("name") or "")
+        for current in self.messages.items():
+            current_attachment = current.attachment or {}
+            if local_id and current.local_id == local_id:
+                return current
+            if (
+                digest
+                and current_attachment.get("sha256") == digest
+                and current_attachment.get("name") == name
+                and current_attachment.get("path")
+            ):
+                return current
+        return None
+
+    def _drop_live_file(self, local_id: str) -> None:
+        bubble = self.bubbles.pop(local_id, None)
+        if bubble is None:
+            return
+        kept = [
+            current
+            for current in self.messages.items()
+            if current is not bubble.item and current.kind != "typing"
+        ]
+        finalize_groups(kept, is_group=bool(self.current_conv and self.current_conv.startswith("group:")))
+        self.messages.set_messages(kept)
+
+    def _upsert_incoming_file(
+        self,
+        local_id: str,
+        sender: str,
+        attachment: dict[str, Any],
+        state: str,
+        *,
+        create: bool,
+    ) -> bool:
+        existing = self._find_file_item(local_id, attachment)
+        if existing is None:
+            if not create:
+                return False
+            self.append_message(
+                sender,
+                str(attachment.get("caption") or ""),
+                time.time(),
+                mine=False,
+                state=state,
+                kind="file",
+                local_id=local_id,
+                animate=state == "sending",
+                attachment=attachment,
+            )
+            return True
+        existing.attachment = attachment
+        existing.state = state
+        existing.progress = 0.0 if state == "sending" else 1.0
+        caption = str(attachment.get("caption") or "")
+        if caption:
+            existing.body = caption
+        existing.local_id = local_id
+        existing.key = local_id
+        self.bubbles[local_id] = MessageBubble(existing, self._on_bubble_state, self)
+        self.messages.delegate.invalidate()
+        row = self._row_of(existing)
+        if row >= 0:
+            self.messages.notify_row(row)
+        self.messages.viewport().update()
+        return True
 
     def _more_menu(self) -> None:
         from PySide6.QtWidgets import QMenu

@@ -797,11 +797,22 @@ class MessageDelegate(QStyledItemDelegate):
             painter.setClipping(False)
             painter.setPen(QColor("white"))
             painter.setFont(self.font_meta)
-            name = elide(str(attachment.get("name") or "视频"), self.font_meta, int(rect.width() - 16))
+            size = format_size(int(attachment.get("size") or 0))
+            name = elide(
+                f"{attachment.get('name') or '视频'} · {size}",
+                self.font_meta,
+                int(rect.width() - 16),
+            )
             painter.drawText(
                 QRectF(rect.left() + 8, rect.bottom() - 22, rect.width() - 16, 16),
                 name,
             )
+            if item.state == "sending" and item.progress >= 0:
+                painter.drawText(
+                    QRectF(rect.left(), rect.center().y() + 18, rect.width(), 16),
+                    Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                    f"{int(max(0.0, min(1.0, item.progress)) * 100)}%",
+                )
         else:
             painter.setClipping(False)
             self._paint_file_card(painter, attachment, rect, text_color)

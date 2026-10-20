@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import shutil
 import uuid
 import sys
 from dataclasses import dataclass, field
@@ -25,17 +26,22 @@ from rich.text import Text
 
 from src import PROJECT_ABSTRACT, PROJECT_NAME
 from src.attachments import (
+    FILE_PLAIN_CHUNK,
     MAX_FILE_BYTES,
     AttachmentError,
     attachment_root,
     attachment_view,
+    decrypt_chunk,
     display_text,
+    hash_file,
     history_body,
+    media_kind,
     meta_from_dict,
     meta_to_dict,
-    open_bytes,
+    place_local_copy,
     plaintext_len,
     seal_bytes,
+    seal_path,
 )
 from src.double_ratchet import (
     GCMError,
@@ -65,6 +71,7 @@ from src.prekeys import (
     verify_spk,
 )
 from src.protocol import (
+    MAX_BLOB_FRAME,
     ProtocolError,
     b64d,
     b64e,
@@ -91,6 +98,8 @@ from src.x3dh import (
 )
 
 console = Console()
+CHUNK_WINDOW = 6
+BLOB_TIMEOUT = 120.0
 
 
 @dataclass
@@ -101,6 +110,7 @@ class Incoming:
     kind: str
     error: str | None = None
     attachment: dict[str, Any] | None = None
+    local_id: str | None = None
 
 
 @dataclass
@@ -205,9 +215,9 @@ class ChatEngine:
             )
         return f"用户 {self.username} | 未选择会话 | {self.last_error or '就绪'}"
 
-    async def send_json(self, obj: dict[str, Any]) -> None:
+    async def send_json(self, obj: dict[str, Any], *, blob: bool = False) -> None:
         raw = dumps(obj)
-        check_size(raw)
+        check_size(raw, MAX_BLOB_FRAME if blob else None)
         await self.ws.send(raw)
 
     def _arm(self, request_id: str) -> asyncio.Future:
@@ -219,17 +229,28 @@ class ChatEngine:
     def _disarm(self, request_id: str) -> None:
         self._waiters.pop(request_id, None)
 
-    async def request(self, obj: dict[str, Any], *expect: str) -> dict[str, Any]:
+    async def request(
+        self,
+        obj: dict[str, Any],
+        *expect: str,
+        timeout: float | None = None,
+        blob: bool | None = None,
+    ) -> dict[str, Any]:
         if not self.connected and obj.get("type") not in {"register", "login"}:
             raise ProtocolError("连接已断开")
         request_id = uuid.uuid4().hex
         request_obj = dict(obj)
         request_obj["request_id"] = request_id
+        kind = str(request_obj.get("type") or "")
+        if blob is None:
+            blob = kind == "blob_chunk"
+        if timeout is None:
+            timeout = BLOB_TIMEOUT if kind.startswith("blob_") else 15
         fut = self._arm(request_id)
         try:
             async with self._send_lock:
-                await self.send_json(request_obj)
-            result = await asyncio.wait_for(fut, timeout=15)
+                await self.send_json(request_obj, blob=blob)
+            result = await asyncio.wait_for(fut, timeout=timeout)
         finally:
             self._disarm(request_id)
         if result.get("type") == "error":
@@ -239,7 +260,7 @@ class ChatEngine:
         return result
 
     async def connect(self, uri: str) -> None:
-        self.ws = await websockets.connect(uri, max_size=64 * 1024)
+        self.ws = await websockets.connect(uri, max_size=MAX_BLOB_FRAME)
         self.connected = True
         self._tasks.append(asyncio.create_task(self._reader()))
         self._tasks.append(asyncio.create_task(self._processor()))
@@ -742,7 +763,8 @@ class ChatEngine:
             target_group = None
         record = self.store.load_file_job(local_id)
         if record is None:
-            record = self._new_file_job(
+            record = await asyncio.to_thread(
+                self._new_file_job,
                 local_id=local_id,
                 conv=conv,
                 group=target_group,
@@ -766,6 +788,8 @@ class ChatEngine:
             await self._upload_file(record)
             record["uploaded"] = True
             self.store.save_file_job(local_id, record)
+            cipher = attachment_root(self.store.path) / "cipher" / str(record["meta"]["id"])
+            await asyncio.to_thread(shutil.rmtree, cipher, True)
         if not record.get("logged"):
             self.store.add_history(conv, self.username, str(record["history"]))
             record["logged"] = True
@@ -784,7 +808,8 @@ class ChatEngine:
                 )
             raise
         size = int(record["meta"]["size"])
-        self._progress(local_id, size, size)
+        span = max(size, 1) * 2
+        self._progress(local_id, span, span)
         return str(record["history"])
 
     def _new_file_job(
@@ -800,39 +825,51 @@ class ChatEngine:
         filename: str | None,
         mime: str | None,
     ) -> dict[str, Any]:
+        root = attachment_root(self.store.path)
         if data is None:
             if not path:
                 raise ProtocolError("没有要发送的文件")
             file_path = Path(path)
             if not file_path.is_file():
                 raise ProtocolError("文件不存在")
-            if file_path.stat().st_size > MAX_FILE_BYTES:
-                raise ProtocolError("文件超过 32MiB")
-            payload = file_path.read_bytes()
+            size = file_path.stat().st_size
+            if size > MAX_FILE_BYTES:
+                raise ProtocolError("文件超过 8GiB")
             filename = filename or file_path.name
+            span = max(size, 1) * 2
+
+            def on_plain(done: int) -> None:
+                self._progress(local_id, done, span)
+
+            try:
+                meta = seal_path(file_path, root / "cipher", filename, mime, on_plain=on_plain)
+            except AttachmentError as exc:
+                raise ProtocolError(exc.message) from exc
+            rel = f"files/{meta.file_id.hex()}/{meta.name}"
+            place_local_copy(file_path, root / rel)
         else:
             if len(data) > MAX_FILE_BYTES:
-                raise ProtocolError("文件超过 32MiB")
+                raise ProtocolError("文件超过 8GiB")
             payload = bytes(data)
             filename = filename or "file"
-        sealed = seal_bytes(payload, filename, mime)
-        blob_hex = sealed.meta.file_id.hex()
-        root = attachment_root(self.store.path)
-        cipher = root / "cipher" / blob_hex
-        cipher.mkdir(parents=True, exist_ok=True)
-        for index, chunk in enumerate(sealed.chunks):
-            (cipher / str(index)).write_bytes(chunk)
-        rel = f"files/{blob_hex}/{sealed.meta.name}"
-        dest = root / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(payload)
+            sealed = seal_bytes(payload, filename, mime)
+            meta = sealed.meta
+            blob_hex = meta.file_id.hex()
+            cipher = root / "cipher" / blob_hex
+            cipher.mkdir(parents=True, exist_ok=True)
+            for index, chunk in enumerate(sealed.chunks):
+                (cipher / str(index)).write_bytes(chunk)
+            rel = f"files/{blob_hex}/{meta.name}"
+            dest = root / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(payload)
         return {
             "local_id": local_id,
             "conv": conv,
             "group": group,
             "recipients": recipients,
             "caption": caption,
-            "meta": meta_to_dict(sealed.meta),
+            "meta": meta_to_dict(meta),
             "rel": rel,
             "enveloped": [],
             "uploaded": False,
@@ -865,14 +902,17 @@ class ChatEngine:
             "blob_begin_ok",
         )
         cipher = attachment_root(self.store.path) / "cipher" / blob_id
-        total = meta.size
+        span = max(meta.size, 1) * 2
         sent = 0
-        self._progress(str(record["local_id"]), 0, total)
-        for index in range(meta.chunks):
+        lock = asyncio.Lock()
+        self._progress(str(record["local_id"]), meta.size, span)
+
+        async def one(index: int) -> None:
+            nonlocal sent
             chunk_path = cipher / str(index)
             if not chunk_path.is_file():
                 raise ProtocolError("本地密文丢失")
-            ciphertext = chunk_path.read_bytes()
+            ciphertext = await asyncio.to_thread(chunk_path.read_bytes)
             await self.request(
                 {
                     "type": "blob_chunk",
@@ -882,9 +922,16 @@ class ChatEngine:
                 },
                 "blob_chunk_ok",
             )
-            sent += plaintext_len(meta.size, meta.chunks, index)
-            self._progress(str(record["local_id"]), sent, total)
-        await self.request({"type": "blob_finish", "id": blob_id}, "blob_finish_ok")
+            async with lock:
+                sent += plaintext_len(meta.size, meta.chunks, index)
+                done = meta.size + sent
+            self._progress(str(record["local_id"]), done, span)
+
+        await self._run_indexed(meta.chunks, one)
+        await self.request(
+            {"type": "blob_finish", "id": blob_id},
+            "blob_finish_ok",
+        )
 
     async def _deliver_file_envelope(self, peer: str, record: dict[str, Any]) -> None:
         lock = self._peer_locks.setdefault(peer, asyncio.Lock())
@@ -1067,17 +1114,57 @@ class ChatEngine:
     async def _finish_incoming(self, record: dict[str, Any]) -> None:
         meta = meta_from_dict(record["meta"])
         blob_id = meta.file_id.hex()
+        local_id = f"in:{blob_id}"
         self.store.save_incoming_file(blob_id, record)
-        try:
-            plain = await self._download_file(meta)
-        except AttachmentError:
-            self.store.delete_incoming_file(blob_id)
-            raise
         rel = f"files/{blob_id}/{meta.name}"
         dest = attachment_root(self.store.path) / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
         partial = dest.with_name(dest.name + ".part")
-        partial.write_bytes(plain)
+        caption = str(record.get("caption") or "")
+        await self.inbox.put(
+            Incoming(
+                str(record["sender"]),
+                caption,
+                record.get("group"),
+                "file_progress",
+                local_id=local_id,
+                attachment={
+                    "name": meta.name,
+                    "mime": meta.mime,
+                    "size": meta.size,
+                    "sha256": meta.sha256.hex(),
+                    "path": "",
+                    "media": media_kind(meta.mime),
+                    "caption": caption,
+                },
+            )
+        )
+        try:
+            await self._download_file(meta, partial, local_id)
+        except AttachmentError:
+            partial.unlink(missing_ok=True)
+            self.store.delete_incoming_file(blob_id)
+            await self.inbox.put(
+                Incoming(
+                    str(record["sender"]),
+                    "",
+                    record.get("group"),
+                    "file_abort",
+                    local_id=local_id,
+                )
+            )
+            raise
+        except Exception:
+            partial.unlink(missing_ok=True)
+            await self.inbox.put(
+                Incoming(
+                    str(record["sender"]),
+                    "",
+                    record.get("group"),
+                    "file_abort",
+                    local_id=local_id,
+                )
+            )
+            raise
         partial.replace(dest)
         body = history_body(
             name=meta.name,
@@ -1085,7 +1172,7 @@ class ChatEngine:
             size=meta.size,
             sha256=meta.sha256,
             rel_path=rel,
-            caption=str(record.get("caption") or ""),
+            caption=caption,
         )
         fresh = not record.get("logged")
         conv = (
@@ -1100,7 +1187,10 @@ class ChatEngine:
             self.store.save_incoming_file(blob_id, record)
         self.store.delete_incoming_file(blob_id)
         try:
-            await self.request({"type": "blob_done", "id": blob_id}, "blob_done_ok")
+            await self.request(
+                {"type": "blob_done", "id": blob_id},
+                "blob_done_ok",
+            )
         except Exception:
             self.last_error = "文件已收下，服务器清理将在下次重试"
         if fresh:
@@ -1110,14 +1200,28 @@ class ChatEngine:
                     display_text(body, self.store.path),
                     record.get("group"),
                     "file",
+                    local_id=local_id,
                     attachment=attachment_view(self.store.path, body),
                 )
             )
 
-    async def _download_file(self, meta: Any) -> bytes:
+    async def _download_file(self, meta: Any, dest: Path, local_id: str) -> None:
         blob_id = meta.file_id.hex()
-        chunks: list[bytes] = []
-        for index in range(meta.chunks):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with dest.open("wb") as handle:
+            handle.truncate(meta.size)
+        got = 0
+        lock = asyncio.Lock()
+
+        def write_piece(index: int, ciphertext: bytes) -> int:
+            piece = decrypt_chunk(meta, index, ciphertext)
+            with dest.open("r+b") as handle:
+                handle.seek(index * FILE_PLAIN_CHUNK)
+                handle.write(piece)
+            return len(piece)
+
+        async def one(index: int) -> None:
+            nonlocal got
             resp = await self.request(
                 {"type": "blob_fetch", "id": blob_id, "idx": index},
                 "blob_fetch_ok",
@@ -1127,8 +1231,51 @@ class ChatEngine:
             data = b64d(resp.get("data"))
             if data is None:
                 raise ProtocolError("分片缺失")
-            chunks.append(data)
-        return open_bytes(meta, chunks)
+            written = await asyncio.to_thread(write_piece, index, data)
+            async with lock:
+                got += written
+                done = got
+            self._progress(local_id, done, max(meta.size, 1))
+
+        try:
+            await self._run_indexed(meta.chunks, one)
+            digest = await asyncio.to_thread(hash_file, dest)
+        except AttachmentError:
+            raise
+        except ProtocolError:
+            raise
+        if digest != meta.sha256 or dest.stat().st_size != meta.size:
+            raise AttachmentError("摘要不一致")
+
+    async def _run_indexed(self, count: int, fn: Any) -> None:
+        if count <= 0:
+            return
+        pending: asyncio.Queue[int] = asyncio.Queue()
+        for index in range(count):
+            pending.put_nowait(index)
+        failed: list[BaseException] = []
+
+        async def worker() -> None:
+            while not failed:
+                try:
+                    index = pending.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    await fn(index)
+                except Exception as exc:
+                    failed.append(exc)
+                    return
+
+        tasks = [asyncio.create_task(worker()) for _ in range(min(CHUNK_WINDOW, count))]
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            raise
+        if failed:
+            raise failed[0]
 
     async def _decrypt_envelope(
         self, sender: str, payload: dict[str, Any]

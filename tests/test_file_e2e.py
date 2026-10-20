@@ -17,7 +17,7 @@ from src.attachments import (
 )
 from src.client import ChatEngine, handle_line
 from src.double_ratchet import GCMError, RatchetError, RatchetState, decrypt
-from src.protocol import MAX_WS_MESSAGE, ProtocolError, decode_ratchet_payload, dumps
+from src.protocol import MAX_BLOB_FRAME, MAX_WS_MESSAGE, ProtocolError, decode_ratchet_payload, dumps
 from src.server import ChatServer
 from src.store import ServerStore
 from tests.test_e2e import engine, make_friends, wait_pred
@@ -36,7 +36,7 @@ async def _all(tmp_path: Path) -> None:
     server = ChatServer(store)
     log_buffer = _capture_server_log()
     try:
-        async with websockets.serve(server.handler, "127.0.0.1", 0, max_size=64 * 1024) as srv:
+        async with websockets.serve(server.handler, "127.0.0.1", 0, max_size=MAX_BLOB_FRAME) as srv:
             uri = f"ws://127.0.0.1:{srv.sockets[0].getsockname()[1]}"
             alice = engine(tmp_path, "alice")
             bob = engine(tmp_path, "bob")
@@ -56,7 +56,7 @@ async def _all(tmp_path: Path) -> None:
             await carol.close()
             await dave.close()
 
-        async with websockets.serve(server.handler, "127.0.0.1", 0, max_size=64 * 1024) as srv:
+        async with websockets.serve(server.handler, "127.0.0.1", 0, max_size=MAX_BLOB_FRAME) as srv:
             uri = f"ws://127.0.0.1:{srv.sockets[0].getsockname()[1]}"
             await _offline_tamper_and_delivery(tmp_path, store, uri)
     finally:
@@ -86,7 +86,7 @@ async def _roundtrip_and_blind(server, alice, bob, log_buffer) -> None:
     path.write_bytes(plain)
     alice.current_peer = "bob"
     await handle_line(alice, f"/file {path}")
-    item = await wait_pred(bob, lambda incoming: incoming.attachment is not None)
+    item = await wait_pred(bob, lambda incoming: incoming.kind == "file" and incoming.attachment is not None)
     assert item.sender == "alice"
     assert Path(item.attachment["path"]).read_bytes() == plain
     assert "note.txt" in item.text
@@ -121,7 +121,7 @@ async def _roundtrip_and_blind(server, alice, bob, log_buffer) -> None:
         handle.seek(MAX_FILE_BYTES)
         handle.write(b"x")
     before = server.store.conn.execute("SELECT COUNT(*) FROM blobs").fetchone()[0]
-    with pytest.raises(ProtocolError, match="32MiB"):
+    with pytest.raises(ProtocolError, match="8GiB"):
         await alice.send_file(str(huge), peer="bob")
     after = server.store.conn.execute("SELECT COUNT(*) FROM blobs").fetchone()[0]
     assert after == before
@@ -140,11 +140,16 @@ async def _group_isolation(server, alice, bob, carol) -> None:
     plain = b"group-same-plain" + MARKER
     await alice.send_file(data=plain, filename="same.txt", mime="text/plain", group="文件组")
     bob_item = await wait_pred(
-        bob, lambda incoming: bool(incoming.attachment) and incoming.attachment.get("name") == "same.txt"
+        bob,
+        lambda incoming: incoming.kind == "file"
+        and bool(incoming.attachment)
+        and incoming.attachment.get("name") == "same.txt",
     )
     carol_item = await wait_pred(
         carol,
-        lambda incoming: bool(incoming.attachment) and incoming.attachment.get("name") == "same.txt",
+        lambda incoming: incoming.kind == "file"
+        and bool(incoming.attachment)
+        and incoming.attachment.get("name") == "same.txt",
     )
     assert Path(bob_item.attachment["path"]).read_bytes() == plain
     assert Path(carol_item.attachment["path"]).read_bytes() == plain
@@ -187,7 +192,10 @@ async def _retry_does_not_ratchet_twice(alice, bob) -> None:
     await alice.send_file(local_id="retry-job", peer="bob")
     assert alice.sessions["bob"].ns == before + 1
     item = await wait_pred(
-        bob, lambda incoming: bool(incoming.attachment) and incoming.attachment.get("name") == "retry.txt"
+        bob,
+        lambda incoming: incoming.kind == "file"
+        and bool(incoming.attachment)
+        and incoming.attachment.get("name") == "retry.txt",
     )
     assert Path(item.attachment["path"]).read_bytes() == b"retry-me"
 
@@ -229,7 +237,8 @@ async def _offline_tamper_and_delivery(tmp_path: Path, store: ServerStore, uri: 
             bob,
             lambda incoming: incoming.error == "GCM 失败"
             or (
-                bool(incoming.attachment)
+                incoming.kind == "file"
+                and bool(incoming.attachment)
                 and incoming.attachment.get("name") == "later.bin"
             ),
         )

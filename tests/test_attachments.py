@@ -1,9 +1,14 @@
-"""分块 AES-256-GCM：对调、篡改、摘要和 32MiB 上限。"""
+"""分块 AES-256-GCM：对调、篡改、摘要和 8GiB 上限。"""
+
+from pathlib import Path
 
 from src.attachments import (
     FILE_PLAIN_CHUNK,
     MAX_FILE_BYTES,
     AttachmentError,
+    decrypt_chunk,
+    expected_chunks,
+    hash_file,
     history_body,
     meta_from_dict,
     meta_to_dict,
@@ -11,7 +16,9 @@ from src.attachments import (
     parse_history_body,
     preview_text,
     seal_bytes,
+    seal_path,
 )
+from src.protocol import MAX_BLOB_FRAME, MAX_WS_MESSAGE, b64e, dumps
 
 
 def test_roundtrip_and_history_omits_key() -> None:
@@ -66,11 +73,53 @@ def test_tamper_swap_and_digest() -> None:
         raise AssertionError("换掉摘要后仍解开了")
 
 
-def test_over_32mib_is_rejected() -> None:
-    assert MAX_FILE_BYTES == 32 * 1024 * 1024
+def test_over_8gib_is_rejected(tmp_path: Path) -> None:
+    assert MAX_FILE_BYTES == 8 * 1024 * 1024 * 1024
+    assert FILE_PLAIN_CHUNK == 1024 * 1024
     try:
-        seal_bytes(b"x" * (MAX_FILE_BYTES + 1), "big.bin")
+        expected_chunks(MAX_FILE_BYTES + 1)
     except AttachmentError as exc:
-        assert "32MiB" in str(exc)
+        assert "8GiB" in str(exc)
     else:
-        raise AssertionError("超过 32MiB 仍被加密")
+        raise AssertionError("超过 8GiB 仍被接受")
+    huge = tmp_path / "huge.bin"
+    with huge.open("wb") as handle:
+        handle.seek(MAX_FILE_BYTES)
+        handle.write(b"x")
+    try:
+        seal_path(huge, tmp_path / "cipher", "huge.bin")
+    except AttachmentError as exc:
+        assert "8GiB" in str(exc)
+    else:
+        raise AssertionError("超过 8GiB 仍被加密")
+    assert not (tmp_path / "cipher").exists()
+
+
+def test_stream_roundtrip_and_blob_frame_fits(tmp_path: Path) -> None:
+    plain = b"V" * (FILE_PLAIN_CHUNK + 17)
+    src = tmp_path / "clip.bin"
+    src.write_bytes(plain)
+    meta = seal_path(src, tmp_path / "cipher", "clip.mp4", "video/mp4")
+    assert meta.chunks == 2
+    dest = tmp_path / "out.bin"
+    with dest.open("wb") as handle:
+        handle.truncate(meta.size)
+        for index in range(meta.chunks):
+            ciphertext = (tmp_path / "cipher" / meta.file_id.hex() / str(index)).read_bytes()
+            piece = decrypt_chunk(meta, index, ciphertext)
+            handle.seek(index * FILE_PLAIN_CHUNK)
+            handle.write(piece)
+    assert hash_file(dest) == meta.sha256
+    assert dest.read_bytes() == plain
+    first = (tmp_path / "cipher" / meta.file_id.hex() / "0").read_bytes()
+    raw = dumps(
+        {
+            "type": "blob_chunk",
+            "id": meta.file_id.hex(),
+            "idx": 0,
+            "data": b64e(first),
+        }
+    )
+    size = len(raw.encode("utf-8"))
+    assert size > MAX_WS_MESSAGE
+    assert size <= MAX_BLOB_FRAME

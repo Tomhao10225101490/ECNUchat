@@ -21,7 +21,9 @@ from src.groups import (
 )
 from src.prekeys import MLKEM768_PUB_LEN, verify_pq, verify_pq_opk, verify_spk
 from src.protocol import (
+    MAX_BLOB_FRAME,
     MAX_GROUP_MEMBERS,
+    MAX_WS_MESSAGE,
     PROJECT_NAME,
     ProtocolError,
     b64d,
@@ -95,17 +97,27 @@ class RequestSocket:
     async def send(self, raw: str | bytes) -> None:
         request_id = self._request_id.get()
         if request_id and isinstance(raw, str):
-            try:
-                message = loads(raw)
-            except Exception:
-                message = None
+            # 大分片不再整段解析再序列化，避免 1MiB 密文多占一份内存。
             if (
-                isinstance(message, dict)
-                and message.get("type") not in UNSOLICITED_TYPES
-                and "request_id" not in message
+                len(raw) > 2048
+                and raw.startswith("{")
+                and raw.endswith("}")
+                and request_id.isalnum()
+                and '"request_id"' not in raw[:160]
             ):
-                message["request_id"] = request_id
-                raw = dumps(message)
+                raw = raw[:-1] + f',"request_id":"{request_id}"' + "}"
+            else:
+                try:
+                    message = loads(raw)
+                except Exception:
+                    message = None
+                if (
+                    isinstance(message, dict)
+                    and message.get("type") not in UNSOLICITED_TYPES
+                    and "request_id" not in message
+                ):
+                    message["request_id"] = request_id
+                    raw = dumps(message)
         await self.raw.send(raw)
 
     def begin_request(self, request_id: str | None) -> contextvars.Token:
@@ -129,20 +141,17 @@ class ChatServer:
         username: str | None = None
         try:
             async for raw in ws:
-                if isinstance(raw, bytes):
-                    if len(raw) > 64 * 1024:
-                        await ws.send(dumps(error_msg("单条 WebSocket 消息超过 64KB")))
-                        continue
-                else:
-                    try:
-                        check_size(raw)
-                    except Exception as exc:
-                        await ws.send(dumps(error_msg(str(exc))))
-                        continue
+                size = len(raw) if isinstance(raw, (bytes, bytearray)) else len(raw.encode("utf-8"))
+                if size > MAX_BLOB_FRAME:
+                    await ws.send(dumps(error_msg("单条 WebSocket 消息超过 2MiB")))
+                    continue
                 try:
                     msg = loads(raw)
                 except Exception as exc:
                     await ws.send(dumps(error_msg(str(exc))))
+                    continue
+                if msg.get("type") != "blob_chunk" and size > MAX_WS_MESSAGE:
+                    await ws.send(dumps(error_msg("单条 WebSocket 消息超过 64KB")))
                     continue
                 try:
                     token = socket.begin_request(msg.get("request_id"))
@@ -665,8 +674,8 @@ class ChatServer:
             return
         try:
             expect = expected_chunks(size)
-        except AttachmentError:
-            await ws.send(dumps(error_msg("文件超过 32MiB")))
+        except AttachmentError as exc:
+            await ws.send(dumps(error_msg(exc.message)))
             return
         if chunks != expect:
             await ws.send(dumps(error_msg("分片数量不对")))
@@ -748,13 +757,6 @@ class ChatServer:
                 return
         else:
             self.store.blob_put_chunk(blob_id, index, data)
-        log.info(
-            "blob_chunk user=%s id=%s idx=%s bytes=%s",
-            username,
-            blob_id,
-            index,
-            len(data),
-        )
         await ws.send(dumps({"type": "blob_chunk_ok", "id": blob_id, "idx": index}))
 
     async def on_blob_finish(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
@@ -770,10 +772,6 @@ class ChatServer:
             if self.store.blob_chunk_count(blob_id) != info["chunks"]:
                 await ws.send(dumps(error_msg("分片不齐")))
                 return
-            for index in range(info["chunks"]):
-                if self.store.blob_chunk(blob_id, index) is None:
-                    await ws.send(dumps(error_msg("分片不齐")))
-                    return
             self.store.blob_mark_complete(blob_id)
         log.info("blob_finish user=%s id=%s bytes=%s", username, blob_id, info["size"])
         await ws.send(dumps({"type": "blob_finish_ok", "id": blob_id}))
@@ -806,14 +804,7 @@ class ChatServer:
                 "data": b64e(data),
             }
         )
-        check_size(frame)
-        log.info(
-            "blob_fetch user=%s id=%s idx=%s bytes=%s",
-            username,
-            blob_id,
-            index,
-            len(data),
-        )
+        check_size(frame, MAX_BLOB_FRAME)
         await ws.send(frame)
 
     async def on_blob_done(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
@@ -843,7 +834,7 @@ async def run_server(host: str, port: int, db_path: str) -> None:
     store = ServerStore(db_path)
     server = ChatServer(store)
     log.info("%s 监听 %s:%s db=%s", PROJECT_NAME, host, port, db_path)
-    async with websockets.serve(server.handler, host, port, max_size=64 * 1024):
+    async with websockets.serve(server.handler, host, port, max_size=MAX_BLOB_FRAME):
         await asyncio.Future()
 
 
