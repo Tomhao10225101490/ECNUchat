@@ -339,6 +339,42 @@ def test_stage_send_and_paint_file_bubble(tmp_path) -> None:
     window.hide()
 
 
+def test_people_picker_cancel_and_finish() -> None:
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QDialog, QPushButton
+
+    from src.gui.people import PeoplePicker
+    from src.gui.theme import PALETTES
+
+    qt = app()
+    people = [
+        {"name": "bob", "online": True, "known": True},
+        {"name": "carol", "online": False, "known": False},
+    ]
+    picker = PeoplePicker(people, mode="group", palette=PALETTES["telegram"])
+    picker.show()
+    qt.processEvents()
+    picker.toggle("bob")
+    finish = next(button for button in picker.findChildren(QPushButton) if button.objectName() == "primary")
+    QTest.mouseClick(finish, Qt.MouseButton.LeftButton)
+    qt.processEvents()
+    assert not picker.isVisible()
+    assert picker.result() == QDialog.DialogCode.Accepted
+    assert picker.selected() == ["bob"]
+    assert picker.group_name() == "bob"
+
+    again = PeoplePicker(people, mode="group", palette=PALETTES["telegram"])
+    again.show()
+    qt.processEvents()
+    cancel = next(button for button in again.findChildren(QPushButton) if button.text() == "取消")
+    QTest.mouseClick(cancel, Qt.MouseButton.LeftButton)
+    qt.processEvents()
+    assert not again.isVisible()
+    assert again.result() == QDialog.DialogCode.Rejected
+    again.hide()
+
+
 def test_contacts_sections_partial_search_and_preview(tmp_path) -> None:
     from PySide6.QtGui import QImage
 

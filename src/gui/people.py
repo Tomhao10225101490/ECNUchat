@@ -547,12 +547,12 @@ class PeoplePicker(QDialog):
         self.limit_hint.setObjectName("caption")
         buttons = QHBoxLayout()
         cancel = QPushButton("取消")
-        self.done = QPushButton("完成")
-        self.done.setObjectName("primary")
+        self.finish_button = QPushButton("完成")
+        self.finish_button.setObjectName("primary")
         cancel.clicked.connect(self.reject)
-        self.done.clicked.connect(self._finish)
+        self.finish_button.clicked.connect(self._finish)
         buttons.addWidget(cancel)
-        buttons.addWidget(self.done)
+        buttons.addWidget(self.finish_button)
         root.addWidget(title)
         root.addWidget(hint)
         root.addWidget(self.search)
@@ -566,7 +566,7 @@ class PeoplePicker(QDialog):
         root.addLayout(buttons)
         if mode == "chat":
             self.book.activated_key.connect(self._pick_one)
-            self.done.hide()
+            self.finish_button.hide()
         self._refresh()
         self.search.setFocus()
         self.search.returnPressed.connect(self._enter)
@@ -604,8 +604,8 @@ class PeoplePicker(QDialog):
     def _sync_button(self) -> None:
         names = self.selected()
         count = len(names)
-        self.done.setText(f"完成（{count}）" if count else "完成")
-        self.done.setEnabled(count > 0)
+        self.finish_button.setText(f"完成（{count}）" if count else "完成")
+        self.finish_button.setEnabled(count > 0)
         if self.mode != "group":
             return
         self.chips.set_names(names)
