@@ -292,6 +292,11 @@ def stylesheet(theme: Palette | str = "telegram") -> str:
         border: 1px solid {p.hairline};
         border-radius: {RADIUS_CARD}px;
     }}
+    QFrame#previewCard {{
+        background: {p.bg_card};
+        border: 1px solid {p.hairline};
+        border-radius: 14px;
+    }}
     QLabel#title {{
         font-size: 17px;
         font-weight: 600;
@@ -376,6 +381,30 @@ def stylesheet(theme: Palette | str = "telegram") -> str:
     }}
     QPushButton#ghost:hover {{
         background: {p.accent_soft};
+    }}
+    QPushButton#chip {{
+        background: {p.accent_soft};
+        color: {p.accent};
+        border-radius: 18px;
+        padding: 0;
+        min-width: 36px;
+        max-width: 36px;
+        min-height: 36px;
+        max-height: 36px;
+        font-size: 15px;
+        font-weight: 600;
+    }}
+    QPushButton#chip:hover {{
+        background: {p.accent};
+        color: {p.accent_text};
+    }}
+    QLabel#letterFlash {{
+        background: {p.bg_card};
+        color: {p.text};
+        border: 1px solid {p.hairline};
+        border-radius: 16px;
+        font-size: 28px;
+        font-weight: 600;
     }}
     QMenu {{
         background: {p.bg_menu};

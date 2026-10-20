@@ -338,3 +338,83 @@ def test_stage_send_and_paint_file_bubble(tmp_path) -> None:
     qt.processEvents()
     window.hide()
 
+
+def test_contacts_sections_partial_search_and_preview(tmp_path) -> None:
+    from PySide6.QtGui import QImage
+
+    from src.gui.people import PeoplePicker, build_directory, suggest_group_name
+    from src.gui.theme import PALETTES
+    from src.protocol import MAX_GROUP_MEMBERS
+
+    people = [
+        {"name": "bob", "online": True, "known": True},
+        {"name": "carol", "online": False, "known": False},
+        {"name": "dave", "online": True, "known": False},
+        {"name": "_amy", "online": False, "known": False},
+    ]
+    titles = [row.title for row in build_directory(people, ["三人组"], "")]
+    assert titles[0] == "群聊"
+    assert "三人组" in titles
+    assert "B" in titles and "bob" in titles
+    assert "#" in titles and "_amy" in titles
+    assert [row.title for row in build_directory(people, ["三人组"], "da") if row.kind == "person"] == ["dave"]
+    assert suggest_group_name(["bob", "carol", "dave", "erin"]).startswith("bob、carol、dave")
+
+    qt = app()
+    picker = PeoplePicker(people, mode="group", palette=PALETTES["telegram"])
+    picker.search.setText("bo")
+    qt.processEvents()
+    assert picker.visible_names() == ["bob"]
+    picker.toggle("bob")
+    picker.search.setText("ca")
+    qt.processEvents()
+    picker.toggle("carol")
+    assert picker.selected() == ["bob", "carol"]
+    assert picker.group_name() == "bob、carol"
+    assert "bob" in picker.picked_label.text()
+    assert picker.chips._names == ["bob", "carol"]
+    assert not picker.chips.isHidden()
+    for index in range(MAX_GROUP_MEMBERS):
+        picker.toggle(f"user{index}")
+    assert len(picker.selected()) == MAX_GROUP_MEMBERS - 1
+    assert picker.limit_hint.text()
+    picker.hide()
+
+    worker = FakeWorker()
+    window = MainWindow(worker, snapshot())
+    window.show()
+    window.directory = ["bob", "carol", "dave"]
+    window._show_page(1)
+    qt.processEvents()
+    shown = [entry.title for entry in window.contacts.entries()]
+    assert "群聊" in shown and "B" in shown and "dave" in shown
+    window.search.setText("da")
+    window.perform_search()
+    qt.processEvents()
+    names = [entry.title for entry in window.contacts.entries() if entry.kind == "person"]
+    assert names == ["dave"]
+    window.contacts.scroll_to_letter("D")
+    assert window.contacts.flash.isVisible()
+    window._show_page(0)
+    window.open_conversation("dm:bob")
+    note = tmp_path / "课堂笔记.txt"
+    note.write_text("预览", encoding="utf-8")
+    window._stage_path(str(note))
+    qt.processEvents()
+    assert window.file_preview.meta.text().startswith("文件 ·")
+    window.apply_theme("wechat", animate=False)
+    assert window.file_preview.isVisible()
+    image_path = tmp_path / "poster.png"
+    image = QImage(32, 48, QImage.Format.Format_RGB32)
+    image.fill(0xFFCC8844)
+    assert image.save(str(image_path))
+    window._stage_path(str(image_path))
+    qt.processEvents()
+    assert window.file_preview.meta.text().startswith("图片 ·")
+    assert not window.file_preview.thumb._pix.isNull()
+    window.file_preview.cleared.emit()
+    qt.processEvents()
+    assert window._staged is None
+    assert not window.file_preview.isVisible()
+    window.hide()
+

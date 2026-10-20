@@ -9,14 +9,17 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QEasingCurve, QEvent, QPoint, Qt, QTimer, QUrl, QVariantAnimation, Signal
+from PySide6.QtCore import QEasingCurve, QEvent, QPoint, QRectF, Qt, QTimer, QUrl, QVariantAnimation, Signal
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
+    QColor,
     QDesktopServices,
     QGuiApplication,
     QImageReader,
     QKeySequence,
+    QPainter,
+    QPainterPath,
     QPixmap,
 )
 from PySide6.QtWidgets import (
@@ -34,7 +37,10 @@ from PySide6.QtWidgets import (
 
 from src import PROJECT_ABSTRACT, PROJECT_NAME
 from src.attachments import MAX_FILE_BYTES, format_size, guess_mime, media_kind
+from src.protocol import ProtocolError, validate_group_name
 from src.gui.chat_view import ConvItem, ConversationList, MessageList, group_flags
+from src.gui.icons import paint_icon
+from src.gui.people import ContactBook, PeoplePicker, build_directory, people_from_snapshot
 from src.gui.engine_worker import EngineWorker
 from src.gui.logic import (
     ChatItem,
@@ -115,8 +121,79 @@ class ConnectionBanner(QWidget):
 from PySide6.QtWidgets import QMainWindow  # noqa: E402
 
 
+class _PreviewThumb(QWidget):
+    """圆角封面。图片铺满裁切，视频和文件画类型标记。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(56, 56)
+        self._pix = QPixmap()
+        self._kind = "file"
+        self._accent = "#4BA0F5"
+        self._ink = "#FFFFFF"
+
+    def set_content(self, pixmap: QPixmap | None, kind: str, accent: str, ink: str) -> None:
+        self._kind = kind
+        self._accent = accent
+        self._ink = ink
+        self._pix = QPixmap()
+        if pixmap is not None and not pixmap.isNull():
+            dpr = self.devicePixelRatioF() or 1.0
+            side = max(56, int(56 * dpr))
+            scaled = pixmap.scaled(
+                side,
+                side,
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            x = max(0, (scaled.width() - side) // 2)
+            y = max(0, (scaled.height() - side) // 2)
+            cropped = scaled.copy(x, y, min(side, scaled.width()), min(side, scaled.height()))
+            cropped.setDevicePixelRatio(dpr)
+            self._pix = cropped
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            rect = QRectF(0, 0, self.width(), self.height())
+            path = QPainterPath()
+            path.addRoundedRect(rect, 14, 14)
+            painter.setClipPath(path)
+            if self._pix is not None and not self._pix.isNull():
+                painter.drawPixmap(self.rect(), self._pix)
+            else:
+                painter.fillRect(self.rect(), QColor("#1C2733" if self._kind == "video" else self._accent))
+                if self._kind == "video":
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(QColor(255, 255, 255, 230))
+                    triangle = QPainterPath()
+                    cx, cy = self.width() / 2, self.height() / 2
+                    triangle.moveTo(cx - 6, cy - 9)
+                    triangle.lineTo(cx + 10, cy)
+                    triangle.lineTo(cx - 6, cy + 9)
+                    triangle.closeSubpath()
+                    painter.drawPath(triangle)
+                else:
+                    paint_icon(
+                        painter,
+                        "paperclip",
+                        QRectF(16, 16, 24, 24),
+                        self._ink,
+                        self.devicePixelRatioF(),
+                    )
+            painter.setClipping(False)
+            painter.setPen(QColor(255, 255, 255, 40))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), 14, 14)
+        finally:
+            painter.end()
+
+
 class FilePreviewBar(QWidget):
-    """发送前的文件条：缩略图、名字、大小，可以取消。"""
+    """发送前的文件卡片：圆角封面、类型和大小，可以滑出取消。"""
 
     cleared = Signal()
 
@@ -124,45 +201,90 @@ class FilePreviewBar(QWidget):
         super().__init__(parent)
         self.setObjectName("filePreview")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 0)
+        self._anim: QVariantAnimation | None = None
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(12, 10, 12, 4)
+        outer.setSpacing(0)
+        self.card = QFrame()
+        self.card.setObjectName("previewCard")
+        self.card.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        layout = QHBoxLayout(self.card)
+        layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(10)
-        self.thumb = QLabel()
-        self.thumb.setFixedSize(48, 48)
-        self.thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.title = QLabel()
+        self.thumb = _PreviewThumb()
+        self.title = ElideLabel()
         self.title.setObjectName("name")
         self.meta = QLabel()
         self.meta.setObjectName("secondary")
         text = QVBoxLayout()
-        text.setSpacing(0)
+        text.setSpacing(2)
         text.addWidget(self.title)
         text.addWidget(self.meta)
-        self.cancel = QPushButton("取消")
-        self.cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cancel = IconButton("close", 32, 16)
+        self.cancel.setToolTip("移除")
         self.cancel.clicked.connect(self.cleared.emit)
         layout.addWidget(self.thumb)
         layout.addLayout(text, 1)
         layout.addWidget(self.cancel)
+        outer.addWidget(self.card)
         self.hide()
 
-    def show_file(self, name: str, size_text: str, pixmap: QPixmap | None, kind: str) -> None:
+    def show_file(
+        self,
+        name: str,
+        size_text: str,
+        pixmap: QPixmap | None,
+        kind: str,
+        *,
+        reduce_motion: bool = False,
+        accent: str = "#4BA0F5",
+        ink: str = "#FFFFFF",
+    ) -> None:
+        labels = {"image": "图片", "video": "视频", "file": "文件"}
         self.title.setText(name)
-        self.meta.setText(size_text)
-        if pixmap is not None and not pixmap.isNull():
-            self.thumb.setPixmap(
-                pixmap.scaled(
-                    48,
-                    48,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-            )
-            self.thumb.setText("")
-        else:
-            self.thumb.setPixmap(QPixmap())
-            self.thumb.setText("视频" if kind == "video" else "文件")
+        self.title.setToolTip(name)
+        self.meta.setText(f"{labels.get(kind, '文件')} · {size_text}")
+        self.thumb.set_content(pixmap, kind, accent, ink)
+        already = self.isVisible() and self.maximumHeight() > 20
         self.show()
+        target = max(self.sizeHint().height(), 88)
+        self._slide(self.height() if already else 0, target, reduce_motion, hide=False)
+
+    def apply_palette(self, palette: Palette) -> None:
+        self.thumb.set_content(self.thumb._pix, self.thumb._kind, palette.accent, palette.accent_text)
+        self.cancel.apply_colors(palette.text_secondary, palette.bg_hover)
+
+    def dismiss(self, reduce_motion: bool = False) -> None:
+        if not self.isVisible():
+            return
+        self._slide(self.height(), 0, reduce_motion, hide=True)
+
+    def _slide(self, start: int, end: int, reduce_motion: bool, *, hide: bool) -> None:
+        if self._anim is not None:
+            self._anim.stop()
+        if reduce_motion:
+            self.setMaximumHeight(16777215)
+            if hide:
+                self.hide()
+            else:
+                self.show()
+            return
+        self.setMaximumHeight(max(0, start))
+        anim = QVariantAnimation(self)
+        anim.setStartValue(max(0, start))
+        anim.setEndValue(max(0, end))
+        anim.setDuration(180)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.valueChanged.connect(lambda value: self.setMaximumHeight(max(0, int(value))))
+
+        def finish() -> None:
+            self.setMaximumHeight(16777215)
+            if hide:
+                self.hide()
+
+        anim.finished.connect(finish)
+        self._anim = anim
+        anim.start()
 
 
 class MainWindow(QMainWindow):
@@ -298,7 +420,7 @@ class MainWindow(QMainWindow):
         self.page_contacts = QWidget()
         contacts_layout = QVBoxLayout(self.page_contacts)
         contacts_layout.setContentsMargins(0, 0, 0, 0)
-        self.contacts = ConversationList()
+        self.contacts = ContactBook()
         self.contacts.activated_key.connect(self._activate_contact)
         contacts_layout.addWidget(self.contacts)
 
@@ -561,8 +683,17 @@ class MainWindow(QMainWindow):
         self.typing_dots.set_color(palette.text_secondary)
         muted = palette.text_secondary
         hover = palette.bg_hover
-        for button in (self.emoji_button, self.attach_button, self.more_button, self.back_button, self.compose_button, self.search_icon):
+        for button in (
+            self.emoji_button,
+            self.attach_button,
+            self.more_button,
+            self.back_button,
+            self.compose_button,
+            self.search_icon,
+            self.file_preview.cancel,
+        ):
             button.apply_colors(muted, hover)
+        self.file_preview.apply_palette(palette)
         for nav, active in (
             (self.nav_chat, self.page_chat.isVisible()),
             (self.nav_contacts, self.page_contacts.isVisible()),
@@ -588,9 +719,14 @@ class MainWindow(QMainWindow):
         self.side_title.setText(titles[index])
         for i, page in enumerate(self._stack):
             page.setVisible(i == index)
-        self.compose_button.setVisible(index == 0)
+        self.compose_button.setVisible(index != 2)
+        self.compose_button.setToolTip("发起聊天" if index == 0 else "从联系人发起")
         self.search.setVisible(index != 2)
         self.search_icon.setVisible(index != 2)
+        self.search.blockSignals(True)
+        self.search.clear()
+        self.search.setPlaceholderText("搜索联系人" if index == 1 else "搜索")
+        self.search.blockSignals(False)
         if self._palette:
             self._set_palette(self._palette)
         if index == 1:
@@ -651,29 +787,19 @@ class MainWindow(QMainWindow):
             )
         self.conversations.set_items(items, self.current_conv)
 
+    def known_people(self) -> list[dict]:
+        data = dict(self.snapshot_data)
+        data["directory"] = list(self.directory)
+        return people_from_snapshot(data, self.username)
+
     def rebuild_contacts(self) -> None:
-        names = set(self.snapshot_data.get("online", []))
-        names.update(self.snapshot_data.get("sessions", {}))
-        for members in self.snapshot_data.get("groups", {}).values():
-            names.update(members)
-        names.update(self.directory)
-        names.discard(self.username)
-        online = set(self.snapshot_data.get("online", []))
-        query = self.search.text().strip().lower() if self.page_contacts.isVisible() else ""
-        items = []
-        for name in sorted(names):
-            if query and query not in name.lower():
-                continue
-            items.append(
-                ConvItem(
-                    key=f"dm:{name}",
-                    title=name,
-                    preview="在线" if name in online else "离线",
-                    online=name in online,
-                    kind="contact",
-                )
-            )
-        self.contacts.set_items(items)
+        query = self.search.text().strip() if self.page_contacts.isVisible() else ""
+        groups = sorted(str(name) for name in self.snapshot_data.get("groups", {}))
+        self.contacts.set_entries(build_directory(self.known_people(), groups, query))
+        if query:
+            self.contacts.empty.setText("没有匹配的联系人")
+        else:
+            self.contacts.empty.setText("通讯录还是空的\n先发起聊天，或等对方上线")
 
     def _refresh_badges(self) -> None:
         total = sum(self.unread.values())
@@ -694,6 +820,9 @@ class MainWindow(QMainWindow):
     def _activate_contact(self, key: str) -> None:
         if key.startswith("dm:"):
             self.worker.submit("open_chat", username=key[3:])
+        elif key.startswith("group:"):
+            self._show_page(0)
+            self.open_conversation(key)
 
     def open_conversation(self, conv: str) -> None:
         if self._in_open:
@@ -1108,8 +1237,8 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QMenu
 
         menu = QMenu(self)
-        chat = menu.addAction("新建聊天")
-        group = menu.addAction("创建群聊")
+        chat = menu.addAction("发起聊天")
+        group = menu.addAction("发起群聊")
         chosen = menu.exec(self.compose_button.mapToGlobal(QPoint(0, self.compose_button.height())))
         if chosen is chat:
             self.new_chat()
@@ -1117,16 +1246,30 @@ class MainWindow(QMainWindow):
             self.new_group()
 
     def new_chat(self) -> None:
-        name = self._ask("新建聊天", [("对方用户名", "bob")])
-        if name:
-            self.worker.submit("open_chat", username=name[0].strip())
+        picked = self._pick_people("chat")
+        if picked:
+            self.worker.submit("open_chat", username=picked[0])
 
     def new_group(self) -> None:
-        values = self._ask("创建群聊", [("群名", "三人组"), ("成员", "bob, carol")])
-        if not values:
+        picked = self._pick_people("group")
+        if not picked:
             return
-        members = [part.strip() for part in values[1].replace("，", ",").split(",") if part.strip()]
-        self.worker.submit("create_group", name=values[0].strip(), members=members)
+        name, members = picked
+        try:
+            validate_group_name(name)
+        except ProtocolError as exc:
+            self.show_toast(str(exc), error=True)
+            return
+        self.worker.submit("create_group", name=name, members=members)
+
+    def _pick_people(self, mode: str) -> list[str] | tuple[str, list[str]] | None:
+        picker = PeoplePicker(self.known_people(), mode=mode, palette=self._palette, parent=self)
+        if picker.exec() != QDialog.DialogCode.Accepted:
+            return None
+        if mode == "chat":
+            names = picker.selected()
+            return names[:1] or None
+        return picker.group_name(), picker.selected()
 
     def _ask(self, title: str, fields: list[tuple[str, str]]) -> list[str] | None:
         dialog = QDialog(self)
@@ -1336,12 +1479,20 @@ class MainWindow(QMainWindow):
             "mime": mime,
             "media": kind,
         }
-        self.file_preview.show_file(file_path.name, format_size(size), pixmap, kind)
+        self.file_preview.show_file(
+            file_path.name,
+            format_size(size),
+            pixmap,
+            kind,
+            reduce_motion=self._reduce_motion,
+            accent=self._palette.accent,
+            ink=self._palette.accent_text,
+        )
         self._refresh_send()
 
     def _clear_staged(self) -> None:
         self._staged = None
-        self.file_preview.hide()
+        self.file_preview.dismiss(self._reduce_motion)
         self._refresh_send()
 
     def _paste_image(self) -> bool:

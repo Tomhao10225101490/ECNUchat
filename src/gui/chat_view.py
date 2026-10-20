@@ -807,24 +807,29 @@ class MessageDelegate(QStyledItemDelegate):
     def _paint_file_card(self, painter: QPainter, attachment: dict, rect: QRectF, text_color: str) -> None:
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(0, 0, 0, 28))
-        painter.drawRoundedRect(rect, 8, 8)
+        painter.drawRoundedRect(rect, 10, 10)
+        badge = QRectF(rect.left() + 10, rect.center().y() - 14, 28, 28)
+        painter.setBrush(QColor(self.palette.accent))
+        painter.drawEllipse(badge)
         dpr = self.view.devicePixelRatioF()
         paint_icon(
             painter,
             "paperclip",
-            QRectF(rect.left() + 10, rect.top() + 16, 20, 20),
-            text_color,
+            badge.adjusted(6, 6, -6, -6),
+            self.palette.accent_text,
             dpr,
         )
+        text_left = badge.right() + 10
+        text_width = max(24, rect.right() - text_left - 8)
         painter.setPen(QColor(text_color))
         painter.setFont(self.font_body)
-        name = elide(str(attachment.get("name") or "文件"), self.font_body, int(rect.width() - 44))
-        painter.drawText(QRectF(rect.left() + 38, rect.top() + 8, rect.width() - 48, 20), name)
+        name = elide(str(attachment.get("name") or "文件"), self.font_body, int(text_width))
+        painter.drawText(QRectF(text_left, rect.top() + 8, text_width, 20), name)
         painter.setFont(self.font_meta)
-        painter.setPen(QColor(self.palette.text_secondary))
+        painter.setPen(QColor(self.palette.text_secondary if text_color != self.palette.text_out else self.palette.meta_out))
         size = format_size(int(attachment.get("size") or 0))
         painter.drawText(
-            QRectF(rect.left() + 38, rect.top() + 30, rect.width() - 48, 16),
+            QRectF(text_left, rect.top() + 30, text_width, 16),
             f"{size} · 打开",
         )
 
