@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import sqlite3
 import time
 from pathlib import Path
@@ -13,10 +15,13 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
+from src.attachments import FILE_PLAIN_CHUNK, GCM_TAG_LEN, cipher_len
 from src.double_ratchet import RatchetState
 from src.prekeys import IdentityKeys, OneTimePrekey, PqOneTimePrekey, SignedPrekey
 from src.protocol import b64d, b64e, decode_group_state, encode_group_state
 
+_BLOB_ID = re.compile(r"^[0-9a-f]{32}$")
+_CHUNK_STRIDE = FILE_PLAIN_CHUNK + GCM_TAG_LEN
 PBKDF2_ITERS = 600_000
 SALT_LEN = 16
 KEY_LEN = 32
@@ -1053,24 +1058,59 @@ class ServerStore:
                 (blob_id, owner, size, chunks, encoded, time.time()),
             )
 
+    def _blob_dir(self, blob_id: str) -> Path:
+        if not _BLOB_ID.fullmatch(blob_id):
+            raise ValueError("文件编号无效")
+        return self.path.parent / f"{self.path.stem}.blobs" / blob_id
+
     def blob_put_chunk(self, blob_id: str, index: int, data: bytes) -> None:
+        """密文写到数据库旁边的文件。SQLite 只记序号，避免把大视频塞进 WAL。"""
+        directory = self._blob_dir(blob_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / "data"
+        fd = os.open(target, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            written = os.pwrite(fd, data, index * _CHUNK_STRIDE)
+        finally:
+            os.close(fd)
+        if written != len(data):
+            raise OSError("密文写入不完整")
         with self.conn:
             self.conn.execute(
                 """
                 INSERT INTO blob_chunks(blob_id, idx, data) VALUES(?,?,?)
                 ON CONFLICT(blob_id, idx) DO UPDATE SET data=excluded.data
                 """,
-                (blob_id, index, data),
+                (blob_id, index, b""),
             )
 
     def blob_chunk(self, blob_id: str, index: int) -> bytes | None:
-        row = self.conn.execute(
+        meta = self.conn.execute(
+            "SELECT size, chunks FROM blobs WHERE id=?",
+            (blob_id,),
+        ).fetchone()
+        seen = self.conn.execute(
             "SELECT data FROM blob_chunks WHERE blob_id=? AND idx=?",
             (blob_id, index),
         ).fetchone()
-        if not row:
+        if not seen:
             return None
-        return bytes(row[0])
+        if meta is not None:
+            try:
+                length = cipher_len(int(meta[0]), int(meta[1]), index)
+            except Exception:
+                length = 0
+            path = self._blob_dir(blob_id) / "data"
+            if length and path.is_file():
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    data = os.pread(fd, length, index * _CHUNK_STRIDE)
+                finally:
+                    os.close(fd)
+                if len(data) == length:
+                    return data
+        stored = bytes(seen[0] or b"")
+        return stored or None
 
     def blob_chunk_count(self, blob_id: str) -> int:
         row = self.conn.execute(
@@ -1105,6 +1145,7 @@ class ServerStore:
                 self.conn.execute("DELETE FROM blob_chunks WHERE blob_id=?", (blob_id,))
                 self.conn.execute("DELETE FROM blob_downloads WHERE blob_id=?", (blob_id,))
                 self.conn.execute("DELETE FROM blobs WHERE id=?", (blob_id,))
+                shutil.rmtree(self._blob_dir(blob_id), ignore_errors=True)
                 return True
             return False
 

@@ -34,6 +34,8 @@ from src.protocol import (
     encode_group_state,
     error_msg,
     loads,
+    pack_blob_frame,
+    unpack_blob_frame,
     validate_group_name,
     validate_username,
 )
@@ -143,7 +145,25 @@ class ChatServer:
             async for raw in ws:
                 size = len(raw) if isinstance(raw, (bytes, bytearray)) else len(raw.encode("utf-8"))
                 if size > MAX_BLOB_FRAME:
-                    await ws.send(dumps(error_msg("单条 WebSocket 消息超过 2MiB")))
+                    await ws.send(dumps(error_msg("单条 WebSocket 消息超过 8MiB")))
+                    continue
+                if not isinstance(raw, str):
+                    frame = unpack_blob_frame(raw if isinstance(raw, (bytes, bytearray)) else bytes(raw))
+                    if frame is None or frame[0] != "U":
+                        await ws.send(dumps(error_msg("分片帧无效")))
+                        continue
+                    if username is None:
+                        await ws.send(dumps(error_msg("请先注册或登录")))
+                        continue
+                    _kind, request_id, file_id, index, data = frame
+                    try:
+                        token = socket.begin_request(request_id)
+                        await self.on_blob_chunk_raw(socket, username, file_id, index, data)
+                    except Exception as exc:
+                        log.info("error type=blob_chunk detail=%s", type(exc).__name__)
+                        await socket.send(dumps(error_msg(str(exc))))
+                    finally:
+                        socket.end_request(token)
                     continue
                 try:
                     msg = loads(raw)
@@ -724,40 +744,52 @@ class ChatServer:
         )
         await ws.send(dumps({"type": "blob_begin_ok", "id": blob_id}))
 
+    def _store_chunk(self, username: str, blob_id: str, index: object, data: bytes | None) -> str | None:
+        info = self.store.blob_get(blob_id)
+        if info is None or info["owner"] != username:
+            return "无权上传"
+        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < info["chunks"]:
+            return "分片序号无效"
+        if data is None:
+            return "分片无效"
+        try:
+            expect = cipher_len(info["size"], info["chunks"], index)
+        except AttachmentError:
+            return "分片无效"
+        if len(data) != expect:
+            return "分片长度不对"
+        if info["complete"]:
+            old = self.store.blob_chunk(blob_id, index)
+            if old != data:
+                return "文件已完成，不能改分片"
+            return None
+        self.store.blob_put_chunk(blob_id, index, data)
+        return None
+
+    async def on_blob_chunk_raw(
+        self, ws: Any, username: str, blob_id: str, index: int, data: bytes
+    ) -> None:
+        if self._blob_id({"id": blob_id}) is None:
+            await ws.send(dumps(error_msg("文件编号无效")))
+            return
+        reason = self._store_chunk(username, blob_id, index, data)
+        if reason:
+            await ws.send(dumps(error_msg(reason)))
+            return
+        await ws.send(dumps({"type": "blob_chunk_ok", "id": blob_id, "idx": index}))
+
     async def on_blob_chunk(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
         blob_id = self._blob_id(msg)
         if blob_id is None:
             await ws.send(dumps(error_msg("文件编号无效")))
             return
-        info = self.store.blob_get(blob_id)
-        if info is None or info["owner"] != username:
-            await ws.send(dumps(error_msg("无权上传")))
-            return
-        index = msg.get("idx")
-        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < info["chunks"]:
-            await ws.send(dumps(error_msg("分片序号无效")))
-            return
         encoded = msg.get("data")
         data = b64d(encoded) if isinstance(encoded, str) else None
-        if data is None:
-            await ws.send(dumps(error_msg("分片无效")))
+        reason = self._store_chunk(username, blob_id, msg.get("idx"), data)
+        if reason:
+            await ws.send(dumps(error_msg(reason)))
             return
-        try:
-            expect = cipher_len(info["size"], info["chunks"], index)
-        except AttachmentError:
-            await ws.send(dumps(error_msg("分片无效")))
-            return
-        if len(data) != expect:
-            await ws.send(dumps(error_msg("分片长度不对")))
-            return
-        if info["complete"]:
-            old = self.store.blob_chunk(blob_id, index)
-            if old != data:
-                await ws.send(dumps(error_msg("文件已完成，不能改分片")))
-                return
-        else:
-            self.store.blob_put_chunk(blob_id, index, data)
-        await ws.send(dumps({"type": "blob_chunk_ok", "id": blob_id, "idx": index}))
+        await ws.send(dumps({"type": "blob_chunk_ok", "id": blob_id, "idx": msg.get("idx")}))
 
     async def on_blob_finish(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
         blob_id = self._blob_id(msg)
@@ -795,6 +827,14 @@ class ChatServer:
         data = self.store.blob_chunk(blob_id, index)
         if data is None:
             await ws.send(dumps(error_msg("分片缺失")))
+            return
+        request_id = msg.get("request_id")
+        if isinstance(request_id, str) and len(request_id) == 32 and request_id.isalnum():
+            frame_bin = pack_blob_frame("D", request_id, blob_id, index, data)
+            if len(frame_bin) > MAX_BLOB_FRAME:
+                await ws.send(dumps(error_msg("单条 WebSocket 消息超过 8MiB")))
+                return
+            await ws.send(frame_bin)
             return
         frame = dumps(
             {
@@ -834,7 +874,9 @@ async def run_server(host: str, port: int, db_path: str) -> None:
     store = ServerStore(db_path)
     server = ChatServer(store)
     log.info("%s 监听 %s:%s db=%s", PROJECT_NAME, host, port, db_path)
-    async with websockets.serve(server.handler, host, port, max_size=MAX_BLOB_FRAME):
+    async with websockets.serve(
+        server.handler, host, port, max_size=MAX_BLOB_FRAME, compression=None
+    ):
         await asyncio.Future()
 
 

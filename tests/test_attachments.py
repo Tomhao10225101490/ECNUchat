@@ -18,7 +18,7 @@ from src.attachments import (
     seal_bytes,
     seal_path,
 )
-from src.protocol import MAX_BLOB_FRAME, MAX_WS_MESSAGE, b64e, dumps
+from src.protocol import MAX_BLOB_FRAME, MAX_WS_MESSAGE, pack_blob_frame
 
 
 def test_roundtrip_and_history_omits_key() -> None:
@@ -75,7 +75,7 @@ def test_tamper_swap_and_digest() -> None:
 
 def test_over_8gib_is_rejected(tmp_path: Path) -> None:
     assert MAX_FILE_BYTES == 8 * 1024 * 1024 * 1024
-    assert FILE_PLAIN_CHUNK == 1024 * 1024
+    assert FILE_PLAIN_CHUNK == 8 * 1024 * 1024
     try:
         expected_chunks(MAX_FILE_BYTES + 1)
     except AttachmentError as exc:
@@ -112,14 +112,6 @@ def test_stream_roundtrip_and_blob_frame_fits(tmp_path: Path) -> None:
     assert hash_file(dest) == meta.sha256
     assert dest.read_bytes() == plain
     first = (tmp_path / "cipher" / meta.file_id.hex() / "0").read_bytes()
-    raw = dumps(
-        {
-            "type": "blob_chunk",
-            "id": meta.file_id.hex(),
-            "idx": 0,
-            "data": b64e(first),
-        }
-    )
-    size = len(raw.encode("utf-8"))
-    assert size > MAX_WS_MESSAGE
-    assert size <= MAX_BLOB_FRAME
+    raw = pack_blob_frame("U", "a" * 32, meta.file_id.hex(), 0, first)
+    assert len(raw) > MAX_WS_MESSAGE
+    assert len(raw) <= MAX_BLOB_FRAME

@@ -21,7 +21,7 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 MAX_FILE_BYTES = 8 * 1024 * 1024 * 1024
-FILE_PLAIN_CHUNK = 1024 * 1024
+FILE_PLAIN_CHUNK = 8 * 1024 * 1024
 FILE_LIMIT_LABEL = "8GiB"
 FILE_KEY_LEN = 32
 FILE_ID_LEN = 16
@@ -75,6 +75,43 @@ def plaintext_len(size: int, chunks: int, index: int) -> int:
 
 def cipher_len(size: int, chunks: int, index: int) -> int:
     return plaintext_len(size, chunks, index) + GCM_TAG_LEN
+
+
+def new_file_meta(size: int, name: str, mime: str | None = None) -> FileMeta:
+    """只生成钥匙和编号。摘要在上传时边读边算，避免先把整份视频加密一遍。"""
+    chunks_n = expected_chunks(size)
+    safe_name = clean_name(name)
+    safe_mime = mime if isinstance(mime, str) and _MIME_RE.fullmatch(mime) else guess_mime(safe_name)
+    return FileMeta(
+        file_id=os.urandom(FILE_ID_LEN),
+        key=os.urandom(FILE_KEY_LEN),
+        nonce_prefix=os.urandom(NONCE_PREFIX_LEN),
+        sha256=b"\x00" * 32,
+        size=size,
+        chunks=chunks_n,
+        name=safe_name,
+        mime=safe_mime[:80],
+    )
+
+
+def encrypt_chunk(meta: FileMeta, index: int, piece: bytes) -> bytes:
+    if not isinstance(piece, (bytes, bytearray)):
+        raise AttachmentError("分片长度不对")
+    if len(piece) != plaintext_len(meta.size, meta.chunks, index):
+        raise AttachmentError("分片长度不对")
+    return AESGCM(meta.key).encrypt(
+        chunk_nonce(meta.nonce_prefix, index),
+        bytes(piece),
+        chunk_aad(meta.file_id, index, meta.chunks),
+    )
+
+
+def read_plain_chunk(fd: int, meta: FileMeta, index: int) -> bytes:
+    want = plaintext_len(meta.size, meta.chunks, index)
+    piece = os.pread(fd, want, index * FILE_PLAIN_CHUNK)
+    if len(piece) != want:
+        raise AttachmentError("文件读取中断")
+    return piece
 
 
 def decrypt_chunk(meta: FileMeta, index: int, ciphertext: bytes) -> bytes:

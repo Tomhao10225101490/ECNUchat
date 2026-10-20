@@ -24,8 +24,10 @@ PROJECT_ABSTRACT = (
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 MAX_WS_MESSAGE = 64 * 1024
-# 聊天信封仍是 64KB。附件密文单独放宽到 2MiB，才能放下 1MiB 明文加 GCM 标签的 base64。
-MAX_BLOB_FRAME = 2 * 1024 * 1024
+# 聊天信封仍是 64KB。附件密文走二进制帧，8MiB 明文加上 GCM 标签和 73 字节头。
+MAX_BLOB_FRAME = 8 * 1024 * 1024 + 64 * 1024
+BLOB_MAGIC = b"ECB1"
+BLOB_HEADER_LEN = 73
 # 群正文按收件人各发一封双棘轮信封，信封数随人数线性增长，所以封顶。
 # 不是 Sender Keys 的一条群链。见 ChatEngine.send_text。
 MAX_GROUP_MEMBERS = 8
@@ -114,8 +116,47 @@ def check_size(raw: str | bytes, limit: int | None = None) -> None:
     n = len(raw.encode("utf-8") if isinstance(raw, str) else raw)
     if n > cap:
         if cap > MAX_WS_MESSAGE:
-            raise ProtocolError("单条 WebSocket 消息超过 2MiB")
+            raise ProtocolError("单条 WebSocket 消息超过 8MiB")
         raise ProtocolError("单条 WebSocket 消息超过 64KB")
+
+
+def pack_blob_frame(kind: str, request_id: str, file_id: str, index: int, data: bytes) -> bytes:
+    """附件密文二进制帧：不走 base64，也不把密文放进 JSON。"""
+    if (
+        kind not in {"U", "D"}
+        or len(request_id) != 32
+        or len(file_id) != 32
+        or not request_id.isalnum()
+        or not file_id.isalnum()
+        or isinstance(index, bool)
+        or not isinstance(index, int)
+        or not 0 <= index <= 0xFFFFFFFF
+        or not isinstance(data, (bytes, bytearray))
+    ):
+        raise ProtocolError("分片帧无效")
+    return b"".join(
+        (
+            BLOB_MAGIC,
+            kind.encode("ascii"),
+            request_id.encode("ascii"),
+            file_id.encode("ascii"),
+            index.to_bytes(4, "big"),
+            bytes(data),
+        )
+    )
+
+
+def unpack_blob_frame(raw: bytes | bytearray) -> tuple[str, str, str, int, bytes] | None:
+    """返回 kind、request_id、file_id 十六进制、序号和密文。对不上魔数就返回 None。"""
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) < BLOB_HEADER_LEN or raw[:4] != BLOB_MAGIC:
+        return None
+    kind = bytes(raw[4:5]).decode("ascii", "replace")
+    request_id = bytes(raw[5:37]).decode("ascii", "replace")
+    file_id = bytes(raw[37:69]).decode("ascii", "replace")
+    index = int.from_bytes(raw[69:73], "big")
+    if kind not in {"U", "D"} or len(request_id) != 32 or len(file_id) != 32:
+        return None
+    return kind, request_id, file_id, index, bytes(raw[BLOB_HEADER_LEN:])
 
 
 def encode_x3dh(init: InitialMessage) -> dict[str, Any]:

@@ -36,7 +36,9 @@ async def _all(tmp_path: Path) -> None:
     server = ChatServer(store)
     log_buffer = _capture_server_log()
     try:
-        async with websockets.serve(server.handler, "127.0.0.1", 0, max_size=MAX_BLOB_FRAME) as srv:
+        async with websockets.serve(
+            server.handler, "127.0.0.1", 0, max_size=MAX_BLOB_FRAME, compression=None
+        ) as srv:
             uri = f"ws://127.0.0.1:{srv.sockets[0].getsockname()[1]}"
             alice = engine(tmp_path, "alice")
             bob = engine(tmp_path, "bob")
@@ -56,7 +58,9 @@ async def _all(tmp_path: Path) -> None:
             await carol.close()
             await dave.close()
 
-        async with websockets.serve(server.handler, "127.0.0.1", 0, max_size=MAX_BLOB_FRAME) as srv:
+        async with websockets.serve(
+            server.handler, "127.0.0.1", 0, max_size=MAX_BLOB_FRAME, compression=None
+        ) as srv:
             uri = f"ws://127.0.0.1:{srv.sockets[0].getsockname()[1]}"
             await _offline_tamper_and_delivery(tmp_path, store, uri)
     finally:
