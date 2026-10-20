@@ -43,6 +43,7 @@ def test_pinned_identity_cannot_be_silently_replaced(tmp_path) -> None:
     assert store.load_peer("bob") == (
         honest_bob.ik_sign_pub,
         honest_bob.ik_dh_pub,
+        None,
     )
     store.close()
 

@@ -20,15 +20,19 @@ X25519 就是椭圆曲线 Diffie-Hellman；每条消息用 AES-256-GCM 加密并
 - [每个人手上有哪些钥匙](#每个人手上有哪些钥匙)
 - [注册和登录在证明什么](#注册和登录在证明什么)
 - [第一条消息如何算出同一把 SK](#第一条消息如何算出同一把-sk)
+- [这条握手的后量子扩展已经做了](#这条握手的后量子扩展已经做了)
 - [为什么后面每条消息还要换钥匙](#为什么后面每条消息还要换钥匙)
+- [每条换链为什么还混入后量子封装](#每条换链为什么还混入后量子封装)
 - [乱序、重放和篡改](#乱序重放和篡改)
 - [不核对指纹时服务器能做什么](#不核对指纹时服务器能做什么)
 - [三个人的群聊是怎么加密的](#三个人的群聊是怎么加密的)
+- [群成员名单是怎么防伪造的](#群成员名单是怎么防伪造的)
 - [关掉再打开，为什么还能接着聊](#关掉再打开为什么还能接着聊)
 - [两套界面，同一套引擎](#两套界面同一套引擎)
 - [建议的读码顺序](#建议的读码顺序)
 - [测试时应该看到什么](#测试时应该看到什么)
 - [和 Signal、WhatsApp 的差别](#和-signalwhatsapp-的差别)
+- [论文对应哪段代码](#论文对应哪段代码)
 
 ## 先用大白话讲清楚
 
@@ -130,6 +134,7 @@ Bob 和 Carol 各自收到发给自己的那一封。Carol 解不开 Alice 发�
 /history
 /group add 三人组 新成员
 /fingerprint 名字
+/pq status 名字
 /theme telegram
 /theme wechat
 /help
@@ -149,7 +154,7 @@ Bob 和 Carol 各自收到发给自己的那一封。Carol 解不开 Alice 发�
 3. **密码模块**是 `src/x3dh.py`、`src/double_ratchet.py`、`src/prekeys.py`。这三个文件不许导入网络和数据库，输入输出都是字节，单测可以不连网。
 4. **服务器**是 `src/server.py` 加 `src/store.py` 里的 `ServerStore`。它保存公钥、签名、一次性预密钥池、群成员名单和离线信封，按用户名转发。它不解析出明文。
 
-网上跑的是带 `type` 的 JSON，单条超过 64KB 就拒绝。至少有这些类型：`register`、`login_challenge`、`login`、`upload_prekeys`、`fetch_bundle`、`envelope`、`error`。实际还会用到 `fetch_user`、`list_users`、`presence`、`group_create`、`group_add`、`group_info`、`group_update`，以及附件密文的 `blob_begin`、`blob_chunk`、`blob_finish`、`blob_fetch`、`blob_done`。请求带 `request_id`，这样两个请求同时回来也不会拿错回包；聊天推送不带这个关联编号。
+网上跑的是带 `type` 的 JSON，单条超过 64KB 就拒绝。至少有这些类型：`register`、`login_challenge`、`login`、`upload_prekeys`、`fetch_bundle`、`envelope`、`error`。实际还会用到 `fetch_user`、`list_users`、`presence`、`group_create`、`group_add`、`group_info`、`group_update`、`group_sync`，以及附件密文的 `blob_begin`、`blob_chunk`、`blob_finish`、`blob_fetch`、`blob_done`。请求带 `request_id`，这样两个请求同时回来也不会拿错回包；聊天推送不带这个关联编号。
 
 一条信封里给人看的头是明文的：当前棘轮公钥 `dh_pub`、本链序号 `n`、上一链发了多少条 `pn`，再加上 12 字节随机 nonce 和 base64 密文。本项目故意不再给头加一层加密，避免协议做跑偏。头公开不等于正文公开，因为没有消息钥匙就解不开 AES-256-GCM。
 
@@ -159,7 +164,7 @@ Bob 和 Carol 各自收到发给自己的那一封。Carol 解不开 Alice 发�
 
 单文件上限是 32MiB，更大的在发送前就拒绝，避免把离线队列和内存撑满。24KiB 明文加上 16 字节认证标签，再做 base64，连同 JSON 头仍然小于 64KB，所以能走原来的 WebSocket 帧。群里同一份密文只上传一次，其他成员每人仍收一封自己的棘轮信封，信封里是同一把文件钥匙。收件人先验信封，再逐块验 GCM，拼完核对整文件摘要。任一块失败就整份丢掉，历史里不留半截文件。
 
-桌面端可以用回形针选文件，也可以粘贴图片或把文件拖进会话。终端用 `/file 路径`。收到的文件写在本机附件目录，历史里只留说明和摘要。
+桌面端可以用回形针选文件，也可以粘贴图片或把文件拖进会话。终端用 `/file 路径`。收到的文件写在本机附件目录，历史里只留说明和摘要。群文件的钥匙信封带上当前群状态的 `gstate`。棘轮若已经混入后量子封装，这封钥匙信封走同一条混合链。
 
 ## 每个人手上有哪些钥匙
 
@@ -171,6 +176,7 @@ Bob 和 Carol 各自收到发给自己的那一封。Carol 解不开 Alice 发�
 - **IK_dh** 是 X25519。它像一把长期的协商钥匙，只出现在 X3DH 里。
 - **SPK** 是当前这把签名预密钥，也是 X25519。图章盖的内容是 `SPK 公钥原始字节 || 用户名`，旁边记下创建时间。服务器入库前先验这个签名，验不过就拒绝注册。对方发来第一条消息前也要先验，失败时界面提示「对方预密钥签名无效」。
 - **OPK** 是一次性预密钥，一开始 20 把。服务器每发给一个人就从池子里删掉那把公钥，不能再发给下一个人。接收方用对应私钥算完共享秘密，并且第一条密文认证成功之后，立刻删除这把私钥。本地剩下不到 5 把时，客户端再生成，补满 20 把，并把新公钥上传。
+- **PQK** 是 ML-KEM-768 后量子密钥，只做封装，不签名。公钥由 `IK_sign` 签名后放进 bundle，供对方做混合握手和混合棘轮的重新封装。私钥与其他密钥一起封进口令加密的保险库。
 
 用户名是唯一的，只允许 3 到 20 位字母、数字和下划线。没有邮箱，也没有短信。
 
@@ -227,6 +233,20 @@ Bob 不用把 Alice 的私钥要过来。他把角色对调：自己的 SPK 私�
 
 客户端第一次见过对方的两把身份公钥之后会固定下来。以后 bundle 里的身份公钥变了，提示身份密钥发生变化，拒绝覆盖已经见过的指纹。
 
+## 这条握手的后量子扩展已经做了
+
+Fiedler 和 Günther 在 PKC 2025 分析的 PQXDH，是在上面这四次 Diffie-Hellman 之外再并入一次后量子密钥封装。Signal 部署用 Kyber，论文也处理 ML-KEM。封装那一项用来挡住「现在记下握手，以后量子计算机打破 X25519」。对外介绍把这篇称作 *PQXDH: A Post-Quantum Extension of X3DH*；正式题名是 *Security Analysis of Signal's PQXDH Handshake*。全文在 [docs/papers/2024-702-fiedler-guenther-pqxdh.pdf](docs/papers/2024-702-fiedler-guenther-pqxdh.pdf)。
+
+本仓库实现了这条路径。每个人注册时除了三把长期钥匙，还生成一把 ML-KEM-768 后量子密钥 `PQK`，公钥由 `IK_sign` 对（PQK 公钥 || 用户名）签名后放进 bundle（`src/prekeys.py` 的 `generate_mlkem768`、`sign_pq`）。发起方封装到对方的 `PQK`，得到 KEM 共享秘密 `ss` 和密文 `PQ_CT`：
+
+```text
+SK = HKDF-SHA256(ikm = DH1||DH2||DH3[||DH4] || ss, salt = 0^32, info = b"pqxdh-v1", 32)
+```
+
+对应的函数是 `src/x3dh.py` 的 `initiator_hybrid_secret` / `responder_hybrid_secret` / `hkdf_pq_sk`，经典 `x3dh-v1` 路径保留，域标签分开。他们指出的 KEM 绑定用两层处理：目录里的 `PQK` 公钥由身份签名背书；初始消息里另带发起方自己的 `IK_PQ` 公钥和 `PQ_CT`，`IK_sign` 的签名覆盖 `IK_dh || EK || OPK || IK_PQ || PQ_CT`，两端核对同一份握手转写，换掉任何一个字节验签即失败。两端都支持 PQ 时，客户端拒绝没有 PQ 的经典握手，防止服务器把会话静默降级回经典。
+
+没有把 X25519 的输出说成后量子，也没有实现 Kyber——用的是标准化后的 ML-KEM-768，由 Python `cryptography`（需要 44.0+）提供。
+
 ## 为什么后面每条消息还要换钥匙
 
 如果 `SK` 直接加密所有聊天，那么 `SK` 一旦泄露，历史和未来全都能解开。双棘轮把 `SK` 只当成启动根钥匙，后面分成两种「往前滚」：
@@ -280,6 +300,22 @@ out = HKDF-SHA256(ikm = dh_out, salt = rk, info = b"dr-v1", length = 64)
 
 **破密恢复**讲的是将来，而且不要说成「一泄露就立刻恢复」。准确的时间点是：对方刚回复，双方都换过棘轮公钥之后。旧的链钥匙推不出新的 DH 输出，也就解不开回复之后的新消息。回复发生之前，发送方还在旧链上，这一段还没有 DH 棘轮意义上的恢复。
 
+Bienstock 等人在 CRYPTO 2022 用通用可组合功能 `F_DR` 分析的就是这套双棘轮。对外介绍把它称作 *A Universally Composable Analysis of the Double Ratchet*；正式题名是 *A More Complete Analysis of the Signal Double Ratchet Algorithm*。`kdf_ck` 是他们的对称棘轮，`kdf_rk` 是 DH 棘轮，`_skip_message_keys` 是乱序和丢包仍能解开的立即解密，`encrypt` / `decrypt` 不把用过的消息钥匙留在状态里。他们同时指出一个本仓库仍然留着的窗口：发送棘轮私钥 `dhs_priv` 要留到对方下一把公钥到来，这段时间里连续两次取走状态，可以拼出本轮已经发出的消息钥匙。补上这个窗口的 Triple Ratchet 没有实现。全文在 [docs/papers/2022-355-bienstock-etal-double-ratchet.pdf](docs/papers/2022-355-bienstock-etal-double-ratchet.pdf)。
+
+## 每条换链为什么还混入后量子封装
+
+握手混合了 PQ，棘轮也要混合，否则「先记录握手密文」换成了「先记录棘轮密文」，量子对手换个目标而已。混合棘轮的规则是：**每一把新发送链都再混入一次新鲜的 ML-KEM 共享秘密**。
+
+开新链的一方（第一次发送或每次回复）在算出 DH 输出之外，再对对方的长期 `PQK` 公钥封装一次：
+
+```text
+新 RK || 新 CK = HKDF-SHA256(ikm = dh_out || ss, salt = rk, info = b"pq-dr-v1", 64)
+```
+
+封装密文 `pq_ct` 随这条链的每条消息外带（信封 JSON 里的 `pq_ct` 字段），收链的一方用自己的 `PQK` 私钥解封后按同一个 `kdf_rk_pq` 得到同一条链。实现是 `src/double_ratchet.py` 的 `kdf_rk_pq`，与经典 `dr-v1` 域分离；`init_sender`、`init_receiver`、`_prepare_sending_chain`、`_dh_ratchet` 在有对端 `PQK` 时都走混合路径。双方都已记录对端 `PQK` 之后，新链缺 `pq_ct` 直接拒绝——中间人剥掉封装把棘轮降级回经典是行不通的；换一个字节的 `pq_ct`，解封或 GCM 都会失败。
+
+旧会话的迁移是渐进的：启动时没有对端 `PQK` 的会话，在收发前自动补拉 bundle 并核验 PQK 签名（`ChatEngine._upgrade_pq_key`），之后的链全部混合。升级之前的旧消息仍是经典密文，记录后可用量子计算机打破；升级之后不再依赖 X25519 的抗量子性。终端用 `/pq status 名字` 查看握手类型和棘轮是否已混入 PQ。注意这不是 Triple Ratchet：`dhs_priv` 的窗口照旧，`PQK` 是长期密钥，每次只是对它重新封装。
+
 ## 乱序、重放和篡改
 
 网络不保证先发先到。收到的序号 `n` 如果比期望序号大，就把中间那些还没到的 `MK` 算出来，放进跳过缓存。缓存键是 `dh_pub || n`，最多 40 把。再多就拒绝，避免别人发一个巨大序号，逼客户端算出成千上万把钥匙。
@@ -308,11 +344,27 @@ python3 scripts/demo_attack.py
 
 ## 三个人的群聊是怎么加密的
 
-群最多 8 个人。一条群消息不是「大家共用一把发送钥匙」，而是 Alice 对 Bob 跑一遍她和 Bob 的双棘轮，再对 Carol 跑一遍她和 Carol 的双棘轮，发出 2 封信封。服务器按收件人分发。Bob 只能解开写着给 Bob 的那封，Carol 只能解开写着给 Carol 的那封。
+群最多 8 个人。一条群消息不是大家共用一把发送者钥匙。`ChatEngine.send_text` 对每个其他成员各跑那一对已经建立的双棘轮，发出多封信封。服务器按收件人分发。Bob 只能解开写着给 Bob 的那封，Carol 只能解开写着给 Carol 的那封。
 
-所以群和单聊用的是同一套棘轮。人数增加，信封数量线性增加，因此限制 8 人。这不是 WhatsApp 的 Sender Keys，也不是 MLS。答辩时要讲清楚：没有「一条发送链、全群共用」的优化。
+Rösler、Mainka 和 Schwenk 在 EuroS&P 2018 指出，Signal 和 WhatsApp 当时的群先用两人会话分发 Sender Key，群正文再走发送者自己的对称链，两人双棘轮上的 future secrecy 到不了这条群链。逐人信封是对这个威胁分析的回应：每一封仍有那一对的前向安全，对方回复并换过棘轮公钥之后也仍有破密恢复。正式题名是 *More is Less: On the End-to-End Security of Group Chats in Signal, WhatsApp, and Threema*；对外介绍收成 *More is Less: On the Security of Instant Messaging Groups*。全文在 [docs/papers/2017-713-rosler-etal-group-chats.pdf](docs/papers/2017-713-rosler-etal-group-chats.pdf)。
 
-`/group add 群名 新成员` 只能由已经在群里的人发起。新成员只进入之后的新消息；旧消息不会补发给他，因为他没有那些已经丢掉的消息钥匙。
+人数增加，信封数量线性增加，因此 `MAX_GROUP_MEMBERS` 是 8。这不是 MLS。新成员只进入之后的新消息；旧消息不会补发给他，因为他没有那些已经丢掉的消息钥匙。
+
+## 群成员名单是怎么防伪造的
+
+成员名单仍然存在服务器上，但不再是服务器说了算。EuroS&P 2018 指出的「群管理没有端到端保护」，本仓库补成**带签名、哈希链接的群状态**（`src/groups.py`）：
+
+- 创世状态（纪元 1）由创建者用 `IK_sign` 签名，绑定群名、创建者、完整成员表和空前驱。
+- 每次拉人是一条新状态：纪元加一，成员表只增一人，前驱哈希必须指向上一状态，签署者必须是上一状态的成员。服务器入库前验签，客户端收到 `group_update` 时再独立验一遍。
+- 群消息的密文里带 `gstate` = 发送者所用群状态的 SHA-256。接收方只接受「该状态在已验证链上、且发送者在该状态成员表里」的消息。
+
+这三条合起来：服务器伪造不了任何成员表（没有合法成员的签名），往群里塞幽灵成员、或者给两名成员看两份不同的名单，都会在客户端被拒或通过哈希链断开暴露；它剩下的能力只有漏投，而漏投会被 `group_sync` 补链发现。演示脚本：
+
+```bash
+python3 scripts/demo_group_attack.py
+```
+
+会打印四种情形：创世状态通过、非成员签名拉人被拒、用真签名删成员被拒（成员只增不减）、合法成员拉人通过。仍未覆盖的部分照旧：没有成员入群同意的端到端协商，没有群签名让成员互证，也不是 MLS。
 
 ## 关掉再打开，为什么还能接着聊
 
@@ -382,10 +434,64 @@ python3 -m pytest -q
 本仓库按课程步骤自己把协议拼起来，没有使用 libsignal 或别的现成棘轮库。和那两套产品相比，故意没做这些：
 
 - **没有多设备。** 一台客户端一份加密数据库，新手机不能把旧链同步过去。
-- **没有 PQXDH。** 没有 Kyber 之类的后量子握手。
+- **没有 Kyber。** 握手是 X25519 + ML-KEM-768 的混合 PQXDH，没有部署 Kyber。
 - **没有密封发送者。** 信封上的发送方和接收方是明文，服务器知道谁在和谁通信，只是不知道正文。
 - **没有头加密。** `dh_pub`、`n`、`pn` 可以直接看见。
-- **群不是 Sender Keys。** 收件人增加，独立双棘轮也增加，所以最多 8 人。
+- **群不是 Sender Keys。** `send_text` 按收件人各发一封双棘轮信封，所以最多 8 人。这是对 EuroS&P 2018 群威胁分析的回应；成员表由签名哈希链保护，但成员入群同意和群签名仍没有。
+- **没有 Triple Ratchet。** 发送棘轮私钥会留到对方下一把公钥到来。CRYPTO 2022 指出的那个窗口还在。
 - **身份钥匙不是 XEdDSA。** Ed25519 只签名，X25519 只做 Diffie-Hellman。
 
 KDF 标签和题目一致：`x3dh-v1`、`dr-v1`、HMAC 的 `0x01` / `0x02`，附加数据是用户名和 4 字节大端序号。没有协议偏离需要单独解释。
+
+## 论文对应哪段代码
+
+对外介绍以三篇为主引用。正式题名更长，两套名字指向同一份 ePrint PDF。书目在 [docs/papers/references.bib](docs/papers/references.bib)，逐段说明在 [docs/papers/README.md](docs/papers/README.md)。
+
+| 对外介绍 | 代码 | 本仓库满足的部分 | 本仓库不满足的部分 |
+| --- | --- | --- | --- |
+| Bienstock 等，*A Universally Composable Analysis of the Double Ratchet*，CRYPTO 2022 | `kdf_ck` 对称棘轮；`kdf_rk`、`_dh_ratchet`、`_prepare_sending_chain` 是 DH 棘轮；`_skip_message_keys` 处理乱序和丢包；`encrypt` / `decrypt` 用过消息钥匙即弃 | 双棘轮这四块积木的形状，与他们证明能实现 `F_DR` 的构造一致 | 没有在本仓库上重跑 UC 证明。`dhs_priv` 仍留在窗口里，没有 Triple Ratchet / `F_TR`。跳过缓存超过 40 把就拒绝 |
+| Fiedler、Günther，*PQXDH: A Post-Quantum Extension of X3DH*，PKC 2025 | `src/x3dh.py` 的 `initiator_hybrid_secret`、`responder_hybrid_secret`、`hkdf_pq_sk` | 混合 PQXDH：四次 X25519 之外并入 ML-KEM-768，域分离 `pqxdh-v1`，PQK 公钥和 KEM 密文进 IK_sign 签名做 KEM 绑定；双棘轮换链时经 `kdf_rk_pq` 混入新鲜封装 | 没有 Kyber，也没有在他们证明的模型里重跑安全界。`PQK` 是长期密钥，泄露后混合棘轮退回经典 DH 的保障 |
+| Rösler、Mainka、Schwenk，*More is Less: On the Security of Instant Messaging Groups*，EuroS&P 2018 | `ChatEngine.send_text` 对每个其他成员调用 `_send_one`；`src/groups.py` 的签名群状态 | 每人独立双棘轮信封，群正文不走 Sender Keys；成员表由签名哈希链端到端保护，伪造名单被拒 | 成员入群同意没有端到端协商，没有群签名，也没有做成 MLS |
+
+正式题名分别是 *A More Complete Analysis of the Signal Double Ratchet Algorithm*、*Security Analysis of Signal's PQXDH Handshake*、*More is Less: On the End-to-End Security of Group Chats in Signal, WhatsApp, and Threema*。三份全文是 `docs/papers/2022-355-bienstock-etal-double-ratchet.pdf`、`docs/papers/2024-702-fiedler-guenther-pqxdh.pdf`、`docs/papers/2017-713-rosler-etal-group-chats.pdf`。
+
+X25519、Ed25519、HKDF、AES-256-GCM，以及 2016 年的破密恢复定义、2017/2020 年的 Signal 多阶段证明、2019 年的棘轮拆分，仍写在同一篇文献说明里。Curve25519 的设计论文只链接到作者页面。这些 PDF 使用各自的知识共享许可，不在本仓库的 MIT 许可之下。2022 年 Bienstock 等人的那篇是署名-非商业性使用。
+
+上面三篇的定理都没有在本仓库上重新证明。屏幕指纹不覆盖 `IK_dh`。头 `dh_pub`、`n`、`pn` 是明文。
+
+## 本次扩展：两个研究生创新点
+
+这一节是对比经典复现新增的部分，其余章节保持原样。两个创新点都回答「服务器不可信时 Signal 式的设计没答好的问题」。
+
+### 创新点一：群成员名单的端到端防伪（签名群状态）
+
+原来的成员表由服务器记录，恶意服务器可以往群里塞幽灵成员，或者给不同成员看不同的名单——EuroS&P 2018 指出的群管理端到端保护缺失。本扩展把成员名单改成**带签名、哈希链接的群状态**，核心在 [src/groups.py](src/groups.py)：
+
+- 创世状态（纪元 1）由创建者用 `IK_sign` 签名，绑定群名、创建者、完整成员表。
+- 每次拉人新增一条状态：纪元加一、成员只增一人、前驱哈希指向上一条、签署者必须是上一状态的成员。
+- 服务器入库前验签（`src/server.py`），客户端收到 `group_update` 时再独立验签；缺链时用 `group_sync` 补链。
+- 每条群消息的密文里带 `gstate`（发送者所用群状态的哈希），接收方只接受「状态在已验证链上、且发送者在该状态成员表里」的消息。
+
+效果：服务器伪造成员表、制造名单分歧都会被拒绝或通过断链暴露，剩下的能力只有漏投（DoS）。演示脚本：
+
+```bash
+python3 scripts/demo_group_attack.py
+```
+
+测试覆盖在 `tests/test_groups.py` 和 `tests/test_e2e.py`（幽灵成员被拒、合法拉人被接受）。
+
+### 创新点二：混合 PQXDH 与混合棘轮（后量子）
+
+对应「先记录、后破解」的威胁：今天录下密文，等量子计算机打破 X25519。本扩展分三层：
+
+1. **混合握手**。每个用户新增 ML-KEM-768 后量子密钥 `PQK`，公钥由 `IK_sign` 签名后放进 bundle。握手在经典四次 X25519 之外再对 `PQK` 封装一次，`SK = HKDF(DH1||…||DH4||ss, info="pqxdh-v1")`；`PQK` 公钥和 KEM 密文都进初始消息的身份签名，处理 PKC 2025 要求的 KEM 绑定。两端都支持 PQ 时拒绝没有 PQ 的经典握手。
+2. **混合棘轮**。双棘轮每次换链都对长期 `PQK` 重新封装一次（`kdf_rk_pq`，`info="pq-dr-v1"`），密文随链外带；双方都固定对端 `PQK` 之后，新链缺封装即拒绝，防止降级回经典。
+3. **旧会话自动迁移**。没有 `PQK` 的旧会话在收发前自动补拉 bundle、核验签名后升级，升级后的链全部混入 PQ；升级前的旧消息仍是经典密文。
+
+核心代码在 [src/prekeys.py](src/prekeys.py)、[src/x3dh.py](src/x3dh.py)、[src/double_ratchet.py](src/double_ratchet.py)，终端可用 `/pq status 名字` 查看会话的握手类型和棘轮是否已混入 PQ。测试覆盖在 `tests/test_pqxdh.py` 和 `tests/test_hybrid_ratchet.py`。ML-KEM 由 Python `cryptography` 提供，依赖升级到 44.0+。
+
+### 需要主动交代的边界
+
+- `PQK` 是长期密钥，一旦泄露，混合棘轮退回只靠经典 DH 的保障；不是 Triple Ratchet，`dhs_priv` 的窗口仍在。
+- 群没有成员「入群同意」的端到端协商，也没有群签名，不是 MLS。
+- 没有在代码上重跑论文里的 UC 证明或安全界；混合 PQXDH 实现的是半静态 KEM 公钥那一版，没有 Kyber。

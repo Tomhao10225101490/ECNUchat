@@ -259,7 +259,7 @@ class EngineWorker(QThread):
             if username == engine.username:
                 key = engine.identity.ik_sign_pub
             else:
-                key, _ = await engine.fetch_user(username)
+                key, *_ = await engine.fetch_user(username)
             self.actionResult.emit(
                 action, True, {"username": username, "fingerprint": fingerprint(key)}
             )
