@@ -131,11 +131,10 @@ class PeoplePanel(QWidget):
     ) -> None:
         incoming = list(incoming or [])
         outgoing = list(outgoing or [])
-        friends = list(friends or [])
         rejected = list(rejected or [])
         blocked = list(blocked or [])
         results = list(results or [])
-        payload = (friends, incoming, outgoing, blocked, rejected, results)
+        payload = (incoming, outgoing, blocked, rejected, results)
         if payload == getattr(self, "_payload", None):
             return
         self._payload = payload
@@ -156,15 +155,6 @@ class PeoplePanel(QWidget):
             self._body.addWidget(_section("未通过"))
             for item in rejected:
                 self._body.addWidget(self._rejected_card(item))
-        if friends:
-            self._body.addWidget(_section("好友"))
-            for item in friends:
-                self._body.addWidget(self._friend_card(item))
-        elif not incoming and not results:
-            empty = QLabel("还没有好友")
-            empty.setObjectName("secondary")
-            empty.setContentsMargins(12, 8, 12, 8)
-            self._body.addWidget(empty)
         if blocked:
             self._body.addWidget(_section("黑名单"))
             for item in blocked:
@@ -249,25 +239,6 @@ class PeoplePanel(QWidget):
         again.setObjectName(f"again-{username}")
         again.clicked.connect(lambda _checked=False, name=username: self.addClicked.emit(name))
         layout.addWidget(again, alignment=Qt.AlignmentFlag.AlignLeft)
-        return frame
-
-    def _friend_card(self, item: dict[str, Any]) -> QWidget:
-        frame, layout = _row()
-        username = str(item["username"])
-        bio = str(item.get("bio") or item.get("username") or "")
-        layout.addLayout(self._person_row(item, bio))
-        buttons = QHBoxLayout()
-        message = _button("发消息")
-        remove = _button("删除", "quiet")
-        block = _button("拉黑", "danger")
-        message.clicked.connect(lambda _checked=False, name=username: self.messageClicked.emit(name))
-        remove.clicked.connect(lambda _checked=False, name=username: self.removeClicked.emit(name))
-        block.clicked.connect(lambda _checked=False, name=username: self.blockClicked.emit(name))
-        buttons.addWidget(message)
-        buttons.addWidget(remove)
-        buttons.addWidget(block)
-        buttons.addStretch(1)
-        layout.addLayout(buttons)
         return frame
 
     def _blocked_card(self, item: dict[str, Any]) -> QWidget:
@@ -603,11 +574,6 @@ class ProfileSettings(QWidget):
         self.approval.setChecked(True)
         self.show_online.setChecked(True)
         self.searchable.setChecked(True)
-        self.moments = QComboBox()
-        self.moments.addItem("好友可见全部", "friends")
-        self.moments.addItem("只看最近三天", "three_days")
-        self.moments.addItem("不让好友看", "none")
-        layout.addWidget(self.moments)
         save_privacy = _button("保存隐私")
         save_privacy.clicked.connect(self._save_privacy)
         layout.addWidget(save_privacy, alignment=Qt.AlignmentFlag.AlignLeft)
@@ -660,7 +626,6 @@ class ProfileSettings(QWidget):
                 "require_approval": self.approval.isChecked(),
                 "show_online": self.show_online.isChecked(),
                 "searchable": self.searchable.isChecked(),
-                "moments_visibility": str(self.moments.currentData() or "friends"),
             }
         )
 
@@ -677,14 +642,11 @@ class ProfileSettings(QWidget):
         self._paint_presets()
 
     def set_privacy(self, privacy: dict[str, Any]) -> None:
-        if any(widget.hasFocus() for widget in (self.approval, self.show_online, self.searchable, self.moments)):
+        if any(widget.hasFocus() for widget in (self.approval, self.show_online, self.searchable)):
             return
         self.approval.setChecked(bool(privacy.get("require_approval", True)))
         self.show_online.setChecked(bool(privacy.get("show_online", True)))
         self.searchable.setChecked(bool(privacy.get("searchable", True)))
-        visibility = str(privacy.get("moments_visibility") or "friends")
-        index = max(0, self.moments.findData(visibility))
-        self.moments.setCurrentIndex(index)
 
     def apply_palette(self, accent: str, text: str) -> None:
         self._accent = accent

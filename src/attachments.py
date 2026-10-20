@@ -342,18 +342,26 @@ def history_body(
     sha256: bytes,
     rel_path: str,
     caption: str,
+    blob_id: str | None = None,
+    saved: bool = True,
 ) -> str:
+    obj: dict = {
+        "v": 1,
+        "kind": "file",
+        "name": name,
+        "mime": mime,
+        "size": size,
+        "sha256": sha256.hex(),
+        "caption": caption,
+        "saved": True if saved else False,
+    }
+    if blob_id:
+        obj["id"] = blob_id
+        obj["path"] = ""
+    else:
+        obj["path"] = rel_path
     return json.dumps(
-        {
-            "v": 1,
-            "kind": "file",
-            "name": name,
-            "mime": mime,
-            "size": size,
-            "sha256": sha256.hex(),
-            "path": rel_path,
-            "caption": caption,
-        },
+        obj,
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -374,6 +382,8 @@ def parse_history_body(body: str) -> dict | None:
     digest = data.get("sha256")
     rel = data.get("path")
     caption = data.get("caption", "")
+    blob_id = data.get("id")
+    saved = bool(data.get("saved", True))
     if (
         not isinstance(name, str)
         or not isinstance(mime, str)
@@ -382,10 +392,15 @@ def parse_history_body(body: str) -> dict | None:
         or not isinstance(digest, str)
         or not re.fullmatch(r"[0-9a-f]{64}", digest)
         or not isinstance(rel, str)
-        or rel.startswith("/")
-        or ".." in Path(rel).parts
         or not isinstance(caption, str)
     ):
+        return None
+    if blob_id is not None:
+        if not isinstance(blob_id, str) or not re.fullmatch(r"[0-9a-f]{32}", blob_id):
+            return None
+        if rel != "":
+            return None
+    elif rel.startswith("/") or ".." in Path(rel).parts:
         return None
     return {
         "name": name,
@@ -394,6 +409,8 @@ def parse_history_body(body: str) -> dict | None:
         "sha256": digest,
         "path": rel,
         "caption": caption,
+        "id": blob_id,
+        "saved": saved,
     }
 
 
@@ -409,6 +426,19 @@ def attachment_view(db_path: str | Path, body: str) -> dict | None:
     record = parse_history_body(body)
     if record is None:
         return None
+    if record["id"]:
+        return {
+            "name": record["name"],
+            "mime": record["mime"],
+            "size": record["size"],
+            "sha256": record["sha256"],
+            "id": record["id"],
+            "saved": record["saved"],
+            "path": "",
+            "rel": "",
+            "media": media_kind(record["mime"]),
+            "caption": record["caption"],
+        }
     try:
         path = resolve_rel(db_path, record["path"])
     except AttachmentError:
@@ -422,6 +452,7 @@ def attachment_view(db_path: str | Path, body: str) -> dict | None:
         "rel": record["path"],
         "media": media_kind(record["mime"]),
         "caption": record["caption"],
+        "saved": True,
     }
 
 
@@ -433,13 +464,17 @@ def display_text(body: str, db_path: str | Path | None = None) -> str:
     record = parse_history_body(body)
     if record is None:
         return body
-    shown = record["path"]
-    if db_path is not None:
-        try:
-            shown = str(resolve_rel(db_path, record["path"]))
-        except AttachmentError:
-            shown = record["path"]
-    line = f"[{_label(record['mime'])}] {record['name']}（{format_size(record['size'])}） {shown}"
+    shown = ""
+    if not (record["id"] and not record["saved"]):
+        shown = record["path"]
+        if db_path is not None:
+            try:
+                shown = str(resolve_rel(db_path, record["path"]))
+            except AttachmentError:
+                shown = record["path"]
+    line = f"[{_label(record['mime'])}] {record['name']}（{format_size(record['size'])}）"
+    if shown:
+        line += f" {shown}"
     caption = record["caption"].strip()
     if caption:
         return f"{caption}\n{line}"

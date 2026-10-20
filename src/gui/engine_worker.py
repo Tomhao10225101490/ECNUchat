@@ -11,7 +11,7 @@ from typing import Any
 from PySide6.QtCore import QThread, Signal
 
 from src.attachments import attachment_view, preview_text
-from src.client import ChatEngine
+from src.client import ChatEngine, split_dm_conv
 from src.protocol import fingerprint
 
 
@@ -109,7 +109,7 @@ class EngineWorker(QThread):
         for local_id, conv, _body, state, _ts in engine.store.pending_message_statuses():
             if state != "sending":
                 continue
-            peer = conv[3:] if conv.startswith("dm:") else None
+            peer, _tid = split_dm_conv(conv) if conv.startswith("dm:") else (None, None)
             recovered = (
                 peer in outbox_before and peer not in outbox_after
             ) or (
@@ -144,7 +144,9 @@ class EngineWorker(QThread):
             "connected": engine.connected,
             "online": sorted(engine.online_users),
             "groups": dict(engine.groups),
+            "conversation_privacy": engine.store.load_conversation_privacy(),
             "sessions": sessions,
+            "threads": dict(engine.threads),
             "fingerprints": fingerprints,
             "recent": recent,
             "unread": engine.store.load_unread(),
@@ -235,6 +237,18 @@ class EngineWorker(QThread):
                 row: dict[str, Any] = {"sender": sender, "body": body, "ts": ts}
                 view = attachment_view(engine.store.path, body)
                 if view is not None:
+                    view["can_save"] = engine._media_save_allowed(
+                        conv, str(view.get("mime") or "")
+                    )
+                    if (
+                        view.get("media") == "image"
+                        and not view.get("saved")
+                        and view.get("id")
+                    ):
+                        try:
+                            view["data"] = engine.media_plaintext(str(view["id"]))
+                        except Exception:
+                            view["data"] = b""
                     row["attachment"] = view
                 rows.append(row)
             self.historyReady.emit(conv, rows)
@@ -261,8 +275,35 @@ class EngineWorker(QThread):
         elif action == "open_chat":
             username = str(payload["username"])
             await engine.fetch_user(username)
+            level = str(payload.get("level") or "low")
+            if level not in {"low", "high"}:
+                level = "low"
+            engine.store.set_conversation_privacy(f"dm:{username}", level)
             self.actionResult.emit(action, True, username)
             self.snapshot.emit(self._snapshot())
+        elif action == "create_thread":
+            username = str(payload["username"])
+            level = str(payload.get("level") or "low")
+            await engine.fetch_user(username)
+            conv = engine.create_thread(username, level)
+            try:
+                await engine.announce_thread(conv)
+            except Exception:
+                engine.last_error = "聊天已创建，通知将在下次连接重试"
+            self.actionResult.emit(action, True, conv)
+            self.snapshot.emit(self._snapshot())
+        elif action == "save_attachment":
+            saved_path = engine.save_attachment(
+                str(payload["conv"]),
+                str(payload["body"]),
+                str(payload["dest"]),
+            )
+            self.actionResult.emit(
+                action, True, {"conv": str(payload["conv"]), "path": saved_path}
+            )
+        elif action == "open_media":
+            path = str(engine.media_temp_path(str(payload["id"])))
+            self.actionResult.emit(action, True, {"path": path})
         elif action == "fingerprint":
             username = str(payload["username"])
             if username == engine.username:
@@ -366,7 +407,8 @@ class EngineWorker(QThread):
         text = str(payload["text"])
         engine.store.save_message_status(local_id, conv, text, "sending")
         if conv.startswith("dm:"):
-            await engine.send_text(text, peer=conv[3:])
+            peer, _tid = split_dm_conv(conv)
+            await engine.send_text(text, peer=peer, conv=conv)
         elif conv.startswith("group:"):
             await engine.send_text(text, group=conv[6:])
         else:
@@ -390,7 +432,9 @@ class EngineWorker(QThread):
             "mime": payload.get("mime") or None,
         }
         if conv.startswith("dm:"):
-            kwargs["peer"] = conv[3:]
+            peer, _tid = split_dm_conv(conv)
+            kwargs["peer"] = peer
+            kwargs["conv"] = conv
         elif conv.startswith("group:"):
             kwargs["group"] = conv[6:]
         else:

@@ -20,6 +20,7 @@ from PySide6.QtGui import (
     QColor,
     QFont,
     QFontMetrics,
+    QImage,
     QImageReader,
     QPainter,
     QPainterPath,
@@ -411,6 +412,7 @@ class MessageDelegate(QStyledItemDelegate):
         self._pix: dict[tuple, QPixmap] = {}
         self.fail_rects: dict[int, QRect] = {}
         self.open_rects: dict[int, QRect] = {}
+        self.save_rects: dict[int, QRect] = {}
 
     def apply_palette(self, palette: Palette) -> None:
         self.palette = palette
@@ -710,9 +712,16 @@ class MessageDelegate(QStyledItemDelegate):
             self._paint_attachment(painter, item, media, text_color)
             absolute = media.translated(option_rect.topLeft()).toRect()
             self.open_rects[row] = absolute
+            if self._can_save(item):
+                chip = self._save_chip_rect(media)
+                self._paint_save_button(painter, chip)
+                self.save_rects[row] = chip.translated(option_rect.topLeft()).toRect()
+            else:
+                self.save_rects.pop(row, None)
             cursor_y += media_h + int(layout.get("text_gap") or 0)
         else:
             self.open_rects.pop(row, None)
+            self.save_rects.pop(row, None)
         painter.setPen(QColor(text_color))
         painter.setFont(self.font_body)
         text_rect = QRectF(
@@ -767,6 +776,25 @@ class MessageDelegate(QStyledItemDelegate):
     def _paint_attachment(self, painter: QPainter, item: ChatItem, rect: QRectF, text_color: str) -> None:
         attachment = item.attachment or {}
         kind = str(attachment.get("media") or "file")
+        saved = bool(attachment.get("saved", True))
+        data = attachment.get("data")
+        if not isinstance(data, (bytes, bytearray)):
+            data = None
+        if kind == "image" and data is not None:
+            pix = self._pix_from_bytes(bytes(data), int(rect.width()), int(rect.height()))
+            painter.save()
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 24))
+            painter.drawRoundedRect(rect, 8, 8)
+            if pix is not None and not pix.isNull():
+                x = rect.left() + (rect.width() - pix.width()) / 2
+                y = rect.top() + (rect.height() - pix.height()) / 2
+                painter.drawPixmap(int(x), int(y), pix)
+            painter.restore()
+            return
+        if kind in {"image", "video"} and not saved:
+            self._paint_unsaved_card(painter, attachment, rect, text_color, video=(kind == "video"))
+            return
         painter.save()
         clip = QPainterPath()
         clip.addRoundedRect(rect, 8, 8)
@@ -816,7 +844,65 @@ class MessageDelegate(QStyledItemDelegate):
         else:
             painter.setClipping(False)
             self._paint_file_card(painter, attachment, rect, text_color)
+
+    def _paint_unsaved_card(
+        self,
+        painter: QPainter,
+        attachment: dict,
+        rect: QRectF,
+        text_color: str,
+        *,
+        video: bool = False,
+    ) -> None:
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#1c2733"))
+        painter.drawRoundedRect(rect, 8, 8)
+        painter.setPen(QColor("white"))
+        painter.setFont(self.font_meta)
+        size = format_size(int(attachment.get("size") or 0))
+        label = "视频" if video else "图片"
+        name = elide(
+            f"{attachment.get('name') or label} · {size}",
+            self.font_meta,
+            int(rect.width() - 16),
+        )
+        painter.drawText(
+            QRectF(rect.left() + 8, rect.bottom() - 22, rect.width() - 16, 16),
+            name,
+        )
         painter.restore()
+
+    def _can_save(self, item: ChatItem) -> bool:
+        attachment = item.attachment if isinstance(item.attachment, dict) else {}
+        return bool(
+            attachment.get("can_save")
+            and attachment.get("media") in {"image", "video"}
+        )
+
+    def _save_chip_rect(self, media: QRectF) -> QRectF:
+        return QRectF(media.right() - 56, media.bottom() - 30, 48, 22)
+
+    def _paint_save_button(self, painter: QPainter, chip: QRectF) -> None:
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(self.palette.accent))
+        painter.drawRoundedRect(chip, 11, 11)
+        painter.setPen(QColor(self.palette.accent_text))
+        painter.setFont(self.font_meta)
+        painter.drawText(chip, Qt.AlignmentFlag.AlignCenter, "保存")
+        painter.restore()
+
+    def _pix_from_bytes(self, raw: bytes, width: int, height: int) -> QPixmap | None:
+        image = QImage()
+        if not image.loadFromData(raw) or image.isNull():
+            return None
+        return QPixmap.fromImage(image).scaled(
+            width,
+            height,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
 
     def _paint_file_card(self, painter: QPainter, attachment: dict, rect: QRectF, text_color: str) -> None:
         painter.setPen(Qt.PenStyle.NoPen)
@@ -892,6 +978,7 @@ class MessageList(QListView):
     replyRequested = Signal(object)
     deleteRequested = Signal(object)
     openRequested = Signal(object)
+    saveRequested = Signal(object)
     filesDropped = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -969,6 +1056,12 @@ class MessageList(QListView):
                     item = self._model.items[row] if row < len(self._model.items) else None
                     if item and item.local_id:
                         self.retryRequested.emit(item.local_id)
+                        return
+            for row, rect in list(self.delegate.save_rects.items()):
+                if rect.contains(event.pos()):
+                    item = self._model.items[row] if row < len(self._model.items) else None
+                    if item and item.attachment:
+                        self.saveRequested.emit(item)
                         return
             for row, rect in list(self.delegate.open_rects.items()):
                 if rect.contains(event.pos()):

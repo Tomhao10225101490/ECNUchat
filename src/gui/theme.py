@@ -260,12 +260,12 @@ def stylesheet(theme: Palette | str = "telegram") -> str:
         color: {p.text};
         outline: none;
     }}
-    QMainWindow, QDialog, QWidget#root {{
-        background: {p.bg};
-    }}
     QWidget {{
         background: transparent;
         border: none;
+    }}
+    QMainWindow, QDialog, QWidget#root {{
+        background: {p.bg};
     }}
     QWidget#nav {{
         background: {p.bg_nav};

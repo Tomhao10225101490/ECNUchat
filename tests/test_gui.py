@@ -49,6 +49,11 @@ def snapshot() -> dict:
         "online": ["alice", "bob"],
         "groups": {"三人组": ["alice", "bob", "carol"]},
         "sessions": {"bob": 2},
+        "friends": [
+            {"username": "bob", "display_name": "Bob", "bio": "", "avatar": "", "online": True},
+            {"username": "carol", "display_name": "Carol", "bio": "", "avatar": "", "online": True},
+            {"username": "dave", "display_name": "Dave", "bio": "", "avatar": "", "online": False},
+        ],
         "fingerprints": {"bob": "AAAA BBBB CCCC DDDD EEEE FFFF 0000 1111"},
         "recent": [
             {
@@ -297,6 +302,81 @@ def test_incoming_friend_request_can_be_accepted() -> None:
     qt.processEvents()
 
 
+def test_contacts_search_can_add_stranger() -> None:
+    from PySide6.QtWidgets import QPushButton
+
+    qt = app()
+    worker = FakeWorker()
+    data = snapshot()
+    data["friends"] = []
+    data["incoming"] = []
+    data["outgoing"] = []
+    data["blocked"] = []
+    data["rejected"] = []
+    window = MainWindow(worker, data)
+    window.show()
+    window._show_page(1)
+    window.search.setText("dave")
+    window.perform_search()
+    qt.processEvents()
+    assert any(
+        action == "search_users" and payload.get("query") == "dave"
+        for action, payload in worker.commands
+    )
+    window.on_action_result(
+        "search_users",
+        True,
+        {
+            "users": [
+                {
+                    "username": "dave",
+                    "display_name": "Dave",
+                    "bio": "",
+                    "avatar": "",
+                    "online": False,
+                    "relation": "none",
+                }
+            ]
+        },
+    )
+    qt.processEvents()
+    add = window.people_panel.findChild(QPushButton, "add-dave")
+    assert add is not None
+    add.click()
+    qt.processEvents()
+    action, payload = worker.commands[-1]
+    assert action == "friend_request"
+    assert payload["username"] == "dave"
+    window.hide()
+
+
+def test_threads_persist_and_contact_click_does_not_chat() -> None:
+    qt = app()
+    worker = FakeWorker()
+    data = snapshot()
+    data["threads"] = {
+        "dm:bob#abc123": {
+            "peer": "bob",
+            "tid": "abc123",
+            "title": "bob · 2",
+            "created": time.time(),
+        }
+    }
+    window = MainWindow(worker, data)
+    window.show()
+    window._show_page(1)
+    qt.processEvents()
+    before = len(worker.commands)
+    window._activate_contact("dm:bob")
+    assert len(worker.commands) == before
+
+    window._show_page(0)
+    qt.processEvents()
+    keys = {item.key for item in window.conversations._model.items}
+    assert "dm:bob#abc123" in keys
+    window.hide()
+
+
 def test_stage_send_and_paint_file_bubble(tmp_path) -> None:
     from PySide6.QtGui import QImage
 
@@ -467,11 +547,12 @@ def test_contacts_sections_partial_search_and_preview(tmp_path) -> None:
     worker = FakeWorker()
     window = MainWindow(worker, snapshot())
     window.show()
-    window.directory = ["bob", "carol", "dave"]
+    window.directory = ["bob", "carol", "dave", "erin"]
     window._show_page(1)
     qt.processEvents()
     shown = [entry.title for entry in window.contacts.entries()]
     assert "群聊" in shown and "B" in shown and "dave" in shown
+    assert "erin" not in shown
     window.search.setText("da")
     window.perform_search()
     qt.processEvents()

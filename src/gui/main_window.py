@@ -16,6 +16,7 @@ from PySide6.QtGui import (
     QColor,
     QDesktopServices,
     QGuiApplication,
+    QImage,
     QImageReader,
     QKeySequence,
     QPainter,
@@ -316,6 +317,7 @@ class MainWindow(QMainWindow):
         self._pins = _load_set(initial.get("pins", ""))
         self._mutes = _load_set(initial.get("mutes", ""))
         self.directory: list[str] = []
+        self._friend_results: list[dict[str, Any]] = []
         self._theme_anim: QVariantAnimation | None = None
         self._theme_from = self._palette
         self._fp: BlurDialog | None = None
@@ -411,6 +413,13 @@ class MainWindow(QMainWindow):
         contacts_layout.setContentsMargins(0, 0, 0, 0)
         self.contacts = ContactBook()
         self.contacts.activated_key.connect(self._activate_contact)
+        self.contacts.messageRequested.connect(lambda name: self._open_dm(name))
+        self.contacts.removeRequested.connect(
+            lambda name: self.worker.submit("friend_remove", username=name)
+        )
+        self.contacts.blockRequested.connect(
+            lambda name: self.worker.submit("friend_block", username=name)
+        )
         self.people_panel = PeoplePanel()
         self.people_panel.acceptClicked.connect(
             lambda name: self.worker.submit("friend_respond", username=name, accept=True)
@@ -431,7 +440,7 @@ class MainWindow(QMainWindow):
             lambda name: self.worker.submit("friend_remove", username=name)
         )
         self.people_panel.messageClicked.connect(
-            lambda name: self.worker.submit("open_chat", username=name)
+            lambda name: self._open_dm(name)
         )
         self.people_panel.addClicked.connect(
             lambda name: self.worker.submit("friend_request", username=name, greeting="")
@@ -542,6 +551,7 @@ class MainWindow(QMainWindow):
         self.messages.replyRequested.connect(self._reply_to)
         self.messages.deleteRequested.connect(self._delete_item)
         self.messages.openRequested.connect(self._open_attachment)
+        self.messages.saveRequested.connect(self._save_attachment_item)
         self.messages.filesDropped.connect(self._on_files_dropped)
         self.new_button = NewMessageButton(self.chat_body)
         self.new_button.clicked.connect(self._jump_bottom)
@@ -878,7 +888,9 @@ class MainWindow(QMainWindow):
             self.side_stack.setCurrentWidget(self.pages)
         self.search.blockSignals(True)
         self.search.clear()
-        self.search.setPlaceholderText("搜索")
+        self.search.setPlaceholderText(
+            "搜索用户名，添加好友" if index == 1 else "搜索"
+        )
         self.search.blockSignals(False)
         if self._palette:
             self._set_palette(self._palette)
@@ -920,7 +932,16 @@ class MainWindow(QMainWindow):
         recent = {row["conv"]: row for row in self.snapshot_data.get("recent", [])}
         keys = set(recent)
         keys.update(f"group:{name}" for name in self.snapshot_data.get("groups", {}))
-        keys.update(f"dm:{name}" for name in self.snapshot_data.get("sessions", {}))
+        threads = self.snapshot_data.get("threads") or {}
+        keys.update(threads)
+        threaded_peers = {
+            str(info.get("peer")) for info in threads.values() if info.get("peer")
+        }
+        keys.update(
+            f"dm:{name}"
+            for name in self.snapshot_data.get("sessions", {})
+            if name not in threaded_peers
+        )
         if self.current_conv:
             keys.add(self.current_conv)
         ordered = sorted(
@@ -936,7 +957,7 @@ class MainWindow(QMainWindow):
         for conv in ordered:
             row = recent.get(conv, {})
             kind = "group" if str(conv).startswith("group:") else "dm"
-            peer = conv[3:] if kind == "dm" else conv[6:]
+            peer = conv[3:].split("#", 1)[0] if kind == "dm" else conv[6:]
             items.append(
                 ConvItem(
                     key=conv,
@@ -954,9 +975,27 @@ class MainWindow(QMainWindow):
         self.conversations.set_items(items, self.current_conv)
 
     def known_people(self) -> list[dict]:
-        data = dict(self.snapshot_data)
-        data["directory"] = list(self.directory)
-        return people_from_snapshot(data, self.username)
+        """联系人=好友。陌生人只在搜索里出现，避免和好友列表重复。"""
+        friends = self.snapshot_data.get("friends")
+        if friends is None:
+            # 兼容没有好友快照的旧服务端：退回原通讯录行为。
+            data = dict(self.snapshot_data)
+            data["directory"] = list(self.directory)
+            return people_from_snapshot(data, self.username)
+        online = set(self.snapshot_data.get("online", []))
+        rows = []
+        for item in friends:
+            name = str(item.get("username") or "")
+            if not name or name == self.username:
+                continue
+            rows.append(
+                {
+                    "name": name,
+                    "online": name in online,
+                    "known": True,
+                }
+            )
+        return sorted(rows, key=lambda row: row["name"].lower())
 
     def rebuild_contacts(self) -> None:
         query = self.search.text().strip() if self.page_contacts.isVisible() else ""
@@ -965,19 +1004,31 @@ class MainWindow(QMainWindow):
         if query:
             self.contacts.empty.setText("没有匹配的联系人")
         else:
-            self.contacts.empty.setText("没有联系人")
+            self.contacts.empty.setText("还没有好友，搜索用户名添加")
 
     def _fill_people(self) -> None:
         if "friends" not in self.snapshot_data:
             self.people_panel.hide()
             return
-        self.people_panel.show()
+        results = (
+            list(self._friend_results)
+            if self.page_contacts.isVisible() and self.search.text().strip()
+            else []
+        )
+        incoming = list(self.snapshot_data.get("incoming") or [])
+        outgoing = list(self.snapshot_data.get("outgoing") or [])
+        blocked = list(self.snapshot_data.get("blocked") or [])
+        rejected = list(self.snapshot_data.get("rejected") or [])
+        has_content = bool(results or incoming or outgoing or blocked or rejected)
+        self.people_panel.setVisible(has_content)
+        if not has_content:
+            return
         self.people_panel.set_model(
-            friends=list(self.snapshot_data.get("friends") or []),
-            incoming=list(self.snapshot_data.get("incoming") or []),
-            outgoing=list(self.snapshot_data.get("outgoing") or []),
-            blocked=list(self.snapshot_data.get("blocked") or []),
-            rejected=list(self.snapshot_data.get("rejected") or []),
+            incoming=incoming,
+            outgoing=outgoing,
+            blocked=blocked,
+            rejected=rejected,
+            results=results,
         )
 
     def _dm_allowed(self, username: str) -> bool:
@@ -994,9 +1045,15 @@ class MainWindow(QMainWindow):
         if "friends" in self.snapshot_data:
             self.nav_contacts.set_badge(len(self.snapshot_data.get("incoming") or []))
 
-    @staticmethod
-    def conv_title(conv: str) -> str:
-        return conv[6:] if conv.startswith("group:") else conv[3:]
+    def conv_title(self, conv: str) -> str:
+        if conv.startswith("group:"):
+            return conv[6:]
+        body = conv[3:] if conv.startswith("dm:") else conv
+        peer, _, tid = body.partition("#")
+        if tid:
+            info = (self.snapshot_data.get("threads") or {}).get(conv) or {}
+            return str(info.get("title") or peer)
+        return peer
 
     def _activate_key(self, key: str) -> None:
         if self._search_mode:
@@ -1008,10 +1065,33 @@ class MainWindow(QMainWindow):
 
     def _activate_contact(self, key: str) -> None:
         if key.startswith("dm:"):
-            self.worker.submit("open_chat", username=key[3:])
+            # 联系人点击暂不直接发起聊天，后续再设计联系人详情页。
+            return
         elif key.startswith("group:"):
             self._show_page(0)
             self.open_conversation(key)
+
+    def _open_dm(self, name: str, force_new: bool = False) -> None:
+        """点联系人打开最近线程；新建消息时总是开一个新线程。"""
+        name = name.split("#", 1)[0]
+        threads = self.snapshot_data.get("threads") or {}
+        if not force_new:
+            convs = [
+                conv for conv, info in threads.items() if info.get("peer") == name
+            ]
+            if convs:
+                convs.sort(
+                    key=lambda conv: float(
+                        (threads.get(conv) or {}).get("created") or 0
+                    )
+                )
+                self._show_page(0)
+                self.open_conversation(convs[-1])
+                return
+        level = self._ask_privacy_level(name)
+        if level is None:
+            return
+        self.worker.submit("create_thread", username=name, level=level)
 
     def open_conversation(self, conv: str) -> None:
         if self._in_open:
@@ -1053,13 +1133,17 @@ class MainWindow(QMainWindow):
         self.info_button.setEnabled(conv.startswith("dm:"))
         self.info_button.hide()
         if conv.startswith("dm:"):
-            peer = conv[3:]
+            peer = conv[3:].split("#", 1)[0]
             online = peer in set(self.snapshot_data.get("online", []))
             generation = self.snapshot_data.get("sessions", {}).get(peer, 0)
             short_fp = self.snapshot_data.get("fingerprints", {}).get(peer, "")
             fp_text = f" · 指纹 {short_fp}" if short_fp else ""
+            privacy = (self.snapshot_data.get("conversation_privacy") or {}).get(conv)
+            secret = " · 私密" if privacy == "high" else ""
             self.chat_title.setText(peer)
-            self.chat_subtitle.setText(f"{'在线' if online else '离线'} · 双棘轮代数 {generation}{fp_text}")
+            self.chat_subtitle.setText(
+                f"{'在线' if online else '离线'} · 双棘轮代数 {generation}{fp_text}{secret}"
+            )
             self.header_avatar.set_person(peer, online=online)
         else:
             name = conv[6:]
@@ -1300,7 +1384,9 @@ class MainWindow(QMainWindow):
         if len(text.encode("utf-8")) > 48 * 1024:
             self.show_toast("消息过长；加密信封必须小于 64KB", error=True)
             return
-        if self.current_conv.startswith("dm:") and not self._dm_allowed(self.current_conv[3:]):
+        if self.current_conv.startswith("dm:") and not self._dm_allowed(
+            self.current_conv[3:].split("#", 1)[0]
+        ):
             self.show_toast("需要对方同意好友申请后才能发消息", error=True)
             return
         if self.reply_bar.author:
@@ -1425,6 +1511,12 @@ class MainWindow(QMainWindow):
     def perform_search(self) -> None:
         if self.page_contacts.isVisible():
             self.rebuild_contacts()
+            query = self.search.text().strip()
+            if query:
+                self.worker.submit("search_users", query=query)
+            else:
+                self._friend_results = []
+                self._fill_people()
             return
         query = self.search.text().strip()
         if not query:
@@ -1467,7 +1559,7 @@ class MainWindow(QMainWindow):
     def new_chat(self) -> None:
         picked = self._pick_people("chat")
         if picked:
-            self.worker.submit("open_chat", username=picked[0])
+            self._open_dm(picked[0], force_new=True)
 
     def new_group(self) -> None:
         picked = self._pick_people("group")
@@ -1489,6 +1581,52 @@ class MainWindow(QMainWindow):
             names = picker.selected()
             return names[:1] or None
         return picker.group_name(), picker.selected()
+
+    def _ask_privacy_level(self, name: str) -> str | None:
+        from PySide6.QtWidgets import (
+            QDialog,
+            QHBoxLayout,
+            QLabel,
+            QPushButton,
+            QRadioButton,
+            QVBoxLayout,
+        )
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("私密等级")
+        dialog.setStyleSheet(stylesheet(self._palette))
+        dialog.setMinimumWidth(380)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(10)
+        heading = QLabel(f"与 {name} 的聊天")
+        heading.setObjectName("title")
+        layout.addWidget(heading)
+        hint = QLabel("两种等级都端到端加密，区别只在于图片/视频是否保存到本地。")
+        hint.setObjectName("caption")
+        layout.addWidget(hint)
+        normal = QRadioButton("普通：图片和视频可以保存到本地")
+        secret = QRadioButton("私密：图片和视频不保存到本地")
+        normal.setChecked(True)
+        layout.addWidget(normal)
+        layout.addWidget(secret)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("取消")
+        ok = QPushButton("开始聊天")
+        ok.setObjectName("primary")
+        cancel.clicked.connect(dialog.reject)
+        result = {"level": None}
+        ok.clicked.connect(
+            lambda: result.__setitem__("level", "high" if secret.isChecked() else "low")
+            or dialog.accept()
+        )
+        buttons.addWidget(cancel)
+        buttons.addWidget(ok)
+        layout.addLayout(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return result["level"]
 
     def _ask(self, title: str, fields: list[tuple[str, str]]) -> list[str] | None:
         dialog = QDialog(self)
@@ -1534,7 +1672,9 @@ class MainWindow(QMainWindow):
 
     def show_fingerprint(self) -> None:
         if self.current_conv and self.current_conv.startswith("dm:"):
-            self.worker.submit("fingerprint", username=self.current_conv[3:])
+            self.worker.submit(
+                "fingerprint", username=self.current_conv[3:].split("#", 1)[0]
+            )
 
     def _show_fingerprint_card(self, username: str, fingerprint: str) -> None:
         if self._fp is None:
@@ -1582,14 +1722,26 @@ class MainWindow(QMainWindow):
         if action == "open_chat":
             self._show_page(0)
             self.open_conversation(f"dm:{data}")
+        elif action == "create_thread":
+            self._show_page(0)
+            self.open_conversation(str(data))
         elif action == "create_group":
             self._show_page(0)
             self.open_conversation(f"group:{data}")
+        elif action == "save_attachment" and isinstance(data, dict):
+            self.show_toast(f"已保存到 {data.get('path')}")
+        elif action == "open_media" and isinstance(data, dict):
+            path = str(data.get("path") or "")
+            if path:
+                self._show_video(path, "视频", delete_after=True)
         elif action == "fingerprint" and isinstance(data, dict):
             self._show_fingerprint_card(str(data["username"]), str(data["fingerprint"]))
         elif action == "users" and isinstance(data, dict):
             self.directory = [str(name) for name in data.get("users") or []]
             self.rebuild_contacts()
+        elif action == "search_users" and isinstance(data, dict):
+            self._friend_results = list(data.get("users") or [])
+            self._fill_people()
 
     def on_connection(self, connected: bool, text: str) -> None:
         self._connected = connected
@@ -1787,17 +1939,49 @@ class MainWindow(QMainWindow):
 
     def _open_attachment(self, item: ChatItem) -> None:
         attachment = item.attachment or {}
+        kind = str(attachment.get("media") or "file")
+        saved = bool(attachment.get("saved", True))
+        data = attachment.get("data")
+        if not isinstance(data, (bytes, bytearray)):
+            data = None
+        if kind == "image" and not saved and data is not None:
+            self._show_image_bytes(bytes(data), str(attachment.get("name") or "图片"))
+            return
+        if kind == "video" and not saved and attachment.get("id"):
+            self.worker.submit("open_media", id=str(attachment.get("id")))
+            return
         path = str(attachment.get("path") or "")
         if not path or not Path(path).is_file():
             self.show_toast("文件不在本机", error=True)
             return
-        kind = str(attachment.get("media") or "file")
         if kind == "image":
             self._show_image(path, str(attachment.get("name") or "图片"))
         elif kind == "video":
             self._show_video(path, str(attachment.get("name") or "视频"))
         else:
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _save_attachment_item(self, item: ChatItem) -> None:
+        attachment = item.attachment or {}
+        if not attachment.get("can_save"):
+            return
+        if not self.current_conv:
+            return
+        suggested = Path.home() / "Downloads" / str(attachment.get("name") or "media")
+        dest, _selected = QFileDialog.getSaveFileName(
+            self,
+            "保存媒体",
+            str(suggested),
+            "所有文件 (*)",
+        )
+        if not dest:
+            return
+        self.worker.submit(
+            "save_attachment",
+            conv=self.current_conv,
+            body=str(item.raw),
+            dest=dest,
+        )
 
     def _show_image(self, path: str, title: str) -> None:
         dialog = QDialog(self)
@@ -1823,7 +2007,34 @@ class MainWindow(QMainWindow):
         layout.addWidget(label)
         dialog.exec()
 
-    def _show_video(self, path: str, title: str) -> None:
+    def _show_image_bytes(self, raw: bytes, title: str) -> None:
+        image = QImage()
+        if not image.loadFromData(raw) or image.isNull():
+            self.show_toast("图片无法加载", error=True)
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(720, 540)
+        layout = QVBoxLayout(dialog)
+        label = QLabel()
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pixmap = QPixmap.fromImage(image)
+        screen = self.screen()
+        limit = 960
+        if screen is not None:
+            limit = int(screen.availableGeometry().width() * 0.7)
+        label.setPixmap(
+            pixmap.scaled(
+                limit,
+                int(limit * 0.75),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+        layout.addWidget(label)
+        dialog.exec()
+
+    def _show_video(self, path: str, title: str, delete_after: bool = False) -> None:
         try:
             from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
             from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -1855,6 +2066,8 @@ class MainWindow(QMainWindow):
         player.setSource(QUrl.fromLocalFile(path))
         player.play()
         dialog.finished.connect(player.stop)
+        if delete_after:
+            dialog.finished.connect(lambda _result: Path(path).unlink(missing_ok=True))
         dialog.exec()
 
     def _find_file_item(self, local_id: str, attachment: dict[str, Any]) -> ChatItem | None:

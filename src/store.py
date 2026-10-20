@@ -224,6 +224,10 @@ class ClientStore:
                 blob_id TEXT PRIMARY KEY,
                 blob BLOB NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS media_meta (
+                blob_id TEXT PRIMARY KEY,
+                blob BLOB NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS dropbox (
                 id TEXT PRIMARY KEY,
                 peer TEXT NOT NULL,
@@ -231,6 +235,17 @@ class ClientStore:
                 direction TEXT NOT NULL,
                 size INTEGER NOT NULL,
                 path TEXT NOT NULL,
+                created REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS conversation_privacy (
+                conv TEXT PRIMARY KEY,
+                level TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS threads (
+                conv TEXT PRIMARY KEY,
+                peer TEXT NOT NULL,
+                tid TEXT NOT NULL,
+                title TEXT NOT NULL,
                 created REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_history_conv_id ON history(conv, id);
@@ -417,6 +432,21 @@ class ClientStore:
         ).fetchall()
         return [(str(row[0]), self._open_json(row[1])) for row in rows]
 
+    def save_media_meta(self, blob_id: str, meta: dict[str, Any]) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO media_meta(blob_id, blob) VALUES(?, ?)",
+                (blob_id, self._seal_json(meta)),
+            )
+
+    def load_media_meta(self, blob_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT blob FROM media_meta WHERE blob_id=?", (blob_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return self._open_json(row[0])
+
     def load_outbox(self, peer: str) -> dict[str, Any] | None:
         row = self.conn.execute(
             "SELECT blob FROM outbox WHERE peer=?", (peer,)
@@ -505,6 +535,14 @@ class ClientStore:
         return [
             (int(row[0]), row[1], row[2], row[3], float(row[4])) for row in rows
         ]
+
+    def replace_history_body(self, conv: str, old_body: str, new_body: str) -> bool:
+        with self.conn:
+            cur = self.conn.execute(
+                "UPDATE history SET body=? WHERE conv=? AND body=?",
+                (new_body, conv, old_body),
+            )
+            return cur.rowcount > 0
 
     def save_message_status(
         self, local_id: str, conv: str, body: str, state: str
@@ -631,6 +669,48 @@ class ClientStore:
             "SELECT v FROM ui_state WHERE k=?", (key,)
         ).fetchone()
         return str(row[0]) if row else default
+
+    def get_conversation_privacy(self, conv: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT level FROM conversation_privacy WHERE conv=?", (conv,)
+        ).fetchone()
+        return str(row[0]) if row else None
+
+    def set_conversation_privacy(self, conv: str, level: str) -> None:
+        if level not in {"low", "high"}:
+            raise ValueError("私密等级必须是 low 或 high")
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO conversation_privacy(conv, level) VALUES(?,?)",
+                (conv, level),
+            )
+
+    def load_conversation_privacy(self) -> dict[str, str]:
+        rows = self.conn.execute(
+            "SELECT conv, level FROM conversation_privacy"
+        ).fetchall()
+        return {str(conv): str(level) for conv, level in rows}
+
+    def save_thread(self, conv: str, peer: str, tid: str, title: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO threads(conv, peer, tid, title, created) VALUES(?,?,?,?,?)",
+                (conv, peer, tid, title, time.time()),
+            )
+
+    def load_threads(self) -> dict[str, dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT conv, peer, tid, title, created FROM threads ORDER BY created"
+        ).fetchall()
+        return {
+            str(conv): {
+                "peer": str(peer),
+                "tid": str(tid),
+                "title": str(title),
+                "created": float(created),
+            }
+            for conv, peer, tid, title, created in rows
+        }
 
 
     def add_dropbox(

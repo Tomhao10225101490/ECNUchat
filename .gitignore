@@ -8,6 +8,7 @@ data/*.db
 *.log
 *.db-shm
 *.db-wal
+data/*.attachments/
 .idea/
 .vscode/
 *.egg-info/
