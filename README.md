@@ -318,15 +318,24 @@ Bob 不用把 Alice 的私钥要过来。他把角色对调：自己的 SPK 私�
 
 Fiedler 和 Günther 在 PKC 2025 分析的 PQXDH，是在上面这四次 Diffie-Hellman 之外再并入一次后量子密钥封装。Signal 部署用 Kyber，论文也处理 ML-KEM。封装那一项用来挡住「现在记下握手，以后量子计算机打破 X25519」。对外介绍把这篇称作 *PQXDH: A Post-Quantum Extension of X3DH*；正式题名是 *Security Analysis of Signal's PQXDH Handshake*。全文在 [docs/papers/2024-702-fiedler-guenther-pqxdh.pdf](docs/papers/2024-702-fiedler-guenther-pqxdh.pdf)。
 
-本仓库实现了这条路径。每个人注册时除了三把长期钥匙，还生成一把 ML-KEM-768 后量子密钥 `PQK`，公钥由 `IK_sign` 对（PQK 公钥 || 用户名）签名后放进 bundle（`src/prekeys.py` 的 `generate_mlkem768`、`sign_pq`）。发起方封装到对方的 `PQK`，得到 KEM 共享秘密 `ss` 和密文 `PQ_CT`：
+本仓库实现了这条路径，并且把 Signal 规范里的一次性封装公钥也做上了。每个人注册时除了三把长期钥匙，还生成一把 ML-KEM-768 长期密钥 `PQK`，再生成 8 把一次性 `PQOPK`。长期公钥由 `IK_sign` 对（PQK 公钥 || 用户名）签名；一次性公钥的签名输入多一个前缀 `pq-opk-v1`，不能拿去冒充长期钥（`src/prekeys.py` 的 `generate_mlkem768`、`sign_pq`、`sign_pq_opk`）。
+
+发起新会话时向服务器要一把 `PQOPK`（`fetch_bundle` 带 `consume_pq_opk`）。有就把 KEM 封装到它上面；服务器没给，才封装到签过名的长期 `PQK`。补拉长期公钥做棘轮升级时不带这个标志，避免把一次性池子烧掉。得到共享秘密 `ss` 和密文 `PQ_CT` 之后：
 
 ```text
-SK = HKDF-SHA256(ikm = DH1||DH2||DH3[||DH4] || ss, salt = 0^32, info = b"pqxdh-v1", 32)
+SK = HKDF-SHA256(
+    ikm = DH1||DH2||DH3[||DH4] || ss || SHA-256(封装公钥),
+    salt = 0^32,
+    info = b"pqxdh-v1",
+    32
+)
 ```
 
-对应的函数是 `src/x3dh.py` 的 `initiator_hybrid_secret` / `responder_hybrid_secret` / `hkdf_pq_sk`，经典 `x3dh-v1` 路径保留，域标签分开。他们指出的 KEM 绑定用两层处理：目录里的 `PQK` 公钥由身份签名背书；初始消息里另带发起方自己的 `IK_PQ` 公钥和 `PQ_CT`，`IK_sign` 的签名覆盖 `IK_dh || EK || OPK || IK_PQ || PQ_CT`，两端核对同一份握手转写，换掉任何一个字节验签即失败。两端都支持 PQ 时，客户端拒绝没有 PQ 的经典握手，防止服务器把会话静默降级回经典。
+对应的函数是 `src/x3dh.py` 的 `initiator_hybrid_secret` / `responder_hybrid_secret` / `hkdf_pq_sk`，经典 `x3dh-v1` 路径保留，域标签分开。封装公钥的哈希放进 `ikm`，一次性公钥和长期公钥不能互换。初始消息的 `IK_sign` 覆盖 `IK_dh || EK || OPK || IK_PQ || PQ_EK || PQ_CT`。换掉密文或封装公钥，验签即失败。首条 GCM 成功之后，接收方才删除用掉的 `PQOPK` 私钥；池子少于 2 把时补到 8 把再上传。两端都支持 PQ 时，客户端拒绝没有 PQ 的经典握手，服务器不能把 KEM 整个拿掉。它能做的是扣留一次性钥，迫使这次握手落到长期 `PQK`。终端 `/pq status 名字` 会写明这次用的是 `pqopk` 还是 `pqk`。
 
-没有把 X25519 的输出说成后量子，也没有实现 Kyber——用的是标准化后的 ML-KEM-768，由 Python `cryptography`（需要 44.0+）提供。
+混合棘轮换链时仍然封装到长期 `PQK`，不封装到已经删除的一次性钥。长期 `PQK` 以后泄露，握手若用过一次性钥并且私钥已删，这次 `SK` 仍算不出来；泄露之后的新棘轮链则退回经典 DH 的保障。
+
+没有把 X25519 的输出说成后量子，也没有实现 Kyber——用的是标准化后的 ML-KEM-768，由 Python `cryptography`（需要 44.0+）提供。同一把长期公钥上的封装和解封会缓存密钥对象，避免每次换链都 `from_seed_bytes`。
 
 ## 为什么后面每条消息还要换钥匙
 
@@ -534,7 +543,7 @@ KDF 标签和题目一致：`x3dh-v1`、`dr-v1`、HMAC 的 `0x01` / `0x02`，附
 | 对外介绍 | 代码 | 本仓库满足的部分 | 本仓库不满足的部分 |
 | --- | --- | --- | --- |
 | Bienstock 等，*A Universally Composable Analysis of the Double Ratchet*，CRYPTO 2022 | `kdf_ck` 对称棘轮；`kdf_rk`、`_dh_ratchet`、`_prepare_sending_chain` 是 DH 棘轮；`_skip_message_keys` 处理乱序和丢包；`encrypt` / `decrypt` 用过消息钥匙即弃 | 双棘轮这四块积木的形状，与他们证明能实现 `F_DR` 的构造一致 | 没有在本仓库上重跑 UC 证明。`dhs_priv` 仍留在窗口里，没有 Triple Ratchet / `F_TR`。跳过缓存超过 40 把就拒绝 |
-| Fiedler、Günther，*PQXDH: A Post-Quantum Extension of X3DH*，PKC 2025 | `src/x3dh.py` 的 `initiator_hybrid_secret`、`responder_hybrid_secret`、`hkdf_pq_sk` | 混合 PQXDH：四次 X25519 之外并入 ML-KEM-768，域分离 `pqxdh-v1`，PQK 公钥和 KEM 密文进 IK_sign 签名做 KEM 绑定；双棘轮换链时经 `kdf_rk_pq` 混入新鲜封装 | 没有 Kyber，也没有在他们证明的模型里重跑安全界。`PQK` 是长期密钥，泄露后混合棘轮退回经典 DH 的保障 |
+| Fiedler、Günther，*PQXDH: A Post-Quantum Extension of X3DH*，PKC 2025 | `initiator_hybrid_secret`、`responder_hybrid_secret`、`hkdf_pq_sk`；`IdentityKeys.pq_opks` | 混合 PQXDH：四次 X25519 之外并入 ML-KEM-768。握手优先用一次性 PQOPK，没有则用签过名的长期 PQK。域分离 `pqxdh-v1`，封装公钥的 SHA-256 进 HKDF，`PQ_EK` 与 `PQ_CT` 进 IK_sign | 没有 Kyber，也没有重跑他们的安全界。服务器可以扣留 PQOPK 迫使最后手段。混合棘轮仍封装长期 PQK，这把长期钥泄露后退回经典 DH |
 | Rösler、Mainka、Schwenk，*More is Less: On the Security of Instant Messaging Groups*，EuroS&P 2018 | `ChatEngine.send_text` 对每个其他成员调用 `_send_one`；`src/groups.py` 的签名群状态 | 每人独立双棘轮信封，群正文不走 Sender Keys；成员表由签名哈希链端到端保护，伪造名单被拒 | 成员入群同意没有端到端协商，没有群签名，也没有做成 MLS |
 
 正式题名分别是 *A More Complete Analysis of the Signal Double Ratchet Algorithm*、*Security Analysis of Signal's PQXDH Handshake*、*More is Less: On the End-to-End Security of Group Chats in Signal, WhatsApp, and Threema*。三份全文是 `docs/papers/2022-355-bienstock-etal-double-ratchet.pdf`、`docs/papers/2024-702-fiedler-guenther-pqxdh.pdf`、`docs/papers/2017-713-rosler-etal-group-chats.pdf`。
@@ -568,14 +577,21 @@ python3 scripts/demo_group_attack.py
 
 对应「先记录、后破解」的威胁：今天录下密文，等量子计算机打破 X25519。本扩展分三层：
 
-1. **混合握手**。每个用户新增 ML-KEM-768 后量子密钥 `PQK`，公钥由 `IK_sign` 签名后放进 bundle。握手在经典四次 X25519 之外再对 `PQK` 封装一次，`SK = HKDF(DH1||…||DH4||ss, info="pqxdh-v1")`；`PQK` 公钥和 KEM 密文都进初始消息的身份签名，处理 PKC 2025 要求的 KEM 绑定。两端都支持 PQ 时拒绝没有 PQ 的经典握手。
-2. **混合棘轮**。双棘轮每次换链都对长期 `PQK` 重新封装一次（`kdf_rk_pq`，`info="pq-dr-v1"`），密文随链外带；双方都固定对端 `PQK` 之后，新链缺封装即拒绝，防止降级回经典。
-3. **旧会话自动迁移**。没有 `PQK` 的旧会话在收发前自动补拉 bundle、核验签名后升级，升级后的链全部混入 PQ；升级前的旧消息仍是经典密文。
+1. **混合握手，带一次性封装公钥**。每个用户有长期 ML-KEM-768 `PQK`，另有 8 把一次性 `PQOPK`。握手优先封装到 `PQOPK`；服务器没给时才封装到签过名的长期 `PQK`。`SK = HKDF(DH…||ss||SHA-256(封装公钥), info="pqxdh-v1")`。`PQ_EK` 和 `PQ_CT` 都进初始消息的身份签名。首条 GCM 成功后删除用掉的一次性私钥。两端都支持 PQ 时拒绝没有 KEM 的经典握手。
+2. **混合棘轮**。双棘轮每次换链都对长期 `PQK` 重新封装一次（`kdf_rk_pq`，`info="pq-dr-v1"`），密文随链外带；双方都固定对端 `PQK` 之后，新链缺封装即拒绝。这里不用一次性钥：一次性钥只保护握手，棘轮要能在以后的换链上继续封装。
+3. **旧会话自动迁移**。没有 `PQK` 的旧会话在收发前自动补拉 bundle、核验签名后升级，这次补拉不消耗 `PQOPK`。升级后的链全部混入 PQ；升级前的旧消息仍是经典密文。
 
-核心代码在 [src/prekeys.py](src/prekeys.py)、[src/x3dh.py](src/x3dh.py)、[src/double_ratchet.py](src/double_ratchet.py)，终端可用 `/pq status 名字` 查看会话的握手类型和棘轮是否已混入 PQ。测试覆盖在 `tests/test_pqxdh.py` 和 `tests/test_hybrid_ratchet.py`。ML-KEM 由 Python `cryptography` 提供，依赖升级到 44.0+。
+核心代码在 [src/prekeys.py](src/prekeys.py)、[src/x3dh.py](src/x3dh.py)、[src/double_ratchet.py](src/double_ratchet.py)。终端 `/pq status 名字` 会区分这次握手用的是一次性钥还是长期钥。不联网的对照脚本：
+
+```bash
+python3 scripts/demo_paper_binding.py
+```
+
+测试覆盖在 `tests/test_pqxdh.py`、`tests/test_pq_opk.py` 和 `tests/test_hybrid_ratchet.py`。ML-KEM 由 Python `cryptography` 提供，依赖 44.0+。同一把长期公钥的封装对象会缓存，换链时不再每次从种子重建。
 
 ### 需要主动交代的边界
 
-- `PQK` 是长期密钥，一旦泄露，混合棘轮退回只靠经典 DH 的保障；不是 Triple Ratchet，`dhs_priv` 的窗口仍在。
+- 握手的一次性 `PQOPK` 用完即删。混合棘轮封装的仍是长期 `PQK`；这把长期钥泄露后，之后的新链退回经典 DH。不是 Triple Ratchet，`dhs_priv` 的窗口仍在。
+- 服务器可以不给 `PQOPK`，迫使握手使用长期 `PQK`。它不能把 KEM 整个拿掉，也不能用一次性公钥的签名去冒充长期公钥。
 - 群没有成员「入群同意」的端到端协商，也没有群签名，不是 MLS。
-- 没有在代码上重跑论文里的 UC 证明或安全界；混合 PQXDH 实现的是半静态 KEM 公钥那一版，没有 Kyber。
+- 没有在代码上重跑论文里的 UC 证明或安全界，也没有 Kyber。

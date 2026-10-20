@@ -26,8 +26,9 @@ Signal Double Ratchet Algorithm*。对外介绍把这篇称作对双棘轮的通
 
 混合棘轮（本仓库的 PQXDH 配套）：握手含 KEM 时，每一把新发送链都再混入
 一次新鲜的 ML-KEM 共享秘密。发起链的一方封装到对方的长期 PQK 公钥，
-密文随这条链的每条消息携带（`RatchetMessage.pq_ct`）；收链的一方用自己
-的 PQK 私钥解封后并入 `kdf_rk_pq`，info 用 `pq-dr-v1` 与 `dr-v1` 域分离。
+不是握手里用过即删的一次性 PQOPK。密文随这条链的每条消息携带
+（`RatchetMessage.pq_ct`）；收链的一方用自己的 PQK 私钥解封后并入
+`kdf_rk_pq`，info 用 `pq-dr-v1` 与 `dr-v1` 域分离。
 双方都记录对端 PQK 公钥（`remote_pq_pk`）之后，新链缺 PQ 封装就拒绝，
 防止中间人剥掉 PQ 封装把棘轮降级回经典。旧会话没有 PQK 时会自动升级：
 客户端在收发前补拉对端 bundle，之后的链全部混入 PQ；升级前的旧消息仍是
@@ -204,6 +205,8 @@ class RatchetState:
     seen: set[bytes] = field(default_factory=set)
     retired_dh: set[bytes] = field(default_factory=set)
     dh_ratchet_count: int = 0
+    # 握手用了哪把 KEM 公钥：pqopk / pqk / None（经典）。只作记录，不参与派生。
+    handshake_pq: str | None = None
 
     def to_record(self) -> dict:
         return {
@@ -224,6 +227,7 @@ class RatchetState:
             "seen": list(self.seen),
             "retired_dh": list(self.retired_dh),
             "dh_ratchet_count": self.dh_ratchet_count,
+            "handshake_pq": self.handshake_pq,
         }
 
     @classmethod
@@ -246,6 +250,7 @@ class RatchetState:
             seen=set(rec.get("seen") or []),
             retired_dh=set(rec.get("retired_dh") or []),
             dh_ratchet_count=rec.get("dh_ratchet_count", 0),
+            handshake_pq=rec.get("handshake_pq"),
         )
 
 
@@ -255,6 +260,7 @@ def init_sender(
     local_user: str,
     remote_user: str,
     remote_pq_pk: bytes | None = None,
+    handshake_pq: str | None = None,
 ) -> RatchetState:
     """A 算完 SK 后生成 R_A，用 SPK_B 做第一次 DH 棘轮，只得到发送链。
 
@@ -279,6 +285,7 @@ def init_sender(
         cks=cks,
         remote_pq_pk=remote_pq_pk,
         dh_ratchet_count=1,
+        handshake_pq=handshake_pq,
     )
 
 
@@ -291,6 +298,7 @@ def init_receiver(
     remote_pq_pk: bytes | None = None,
     pq_ct: bytes | None = None,
     local_pq_priv: bytes | None = None,
+    handshake_pq: str | None = None,
 ) -> RatchetState:
     """B 用 SPK 私钥和头里的 R_A 重算 DH / KDF_RK，得到接收链。
 
@@ -313,6 +321,7 @@ def init_receiver(
         ckr=ckr,
         remote_pq_pk=remote_pq_pk,
         dh_ratchet_count=1,
+        handshake_pq=handshake_pq,
     )
 
 

@@ -7,7 +7,7 @@
 | 对外介绍 | 正式题名 | 全文 | 落到本仓库的哪一段 |
 | --- | --- | --- | --- |
 | Bienstock 等，*A Universally Composable Analysis of the Double Ratchet*，CRYPTO 2022 | *A More Complete Analysis of the Signal Double Ratchet Algorithm*。Bienstock、Fairoze、Garg、Mukherjee、Raghuraman。CRYPTO 2022，LNCS 13507，pp. 782–811。DOI `10.1007/978-3-031-15802-5_27`。ePrint 2022/355 | [PDF](2022-355-bienstock-etal-double-ratchet.pdf) | `kdf_ck`、`kdf_rk`、`_skip_message_keys`、`encrypt` / `decrypt`。没有 Triple Ratchet |
-| Fiedler、Günther，*PQXDH: A Post-Quantum Extension of X3DH*，PKC 2025 | *Security Analysis of Signal's PQXDH Handshake*。Fiedler、Günther。PKC 2025，LNCS 15675，pp. 137–169。DOI `10.1007/978-3-031-91823-0_5`。ePrint 2024/702 | [PDF](2024-702-fiedler-guenther-pqxdh.pdf) | `src/x3dh.py` 的混合四次 DH + ML-KEM-768（半静态 PQK），`src/double_ratchet.py` 的 `kdf_rk_pq`。没有 Kyber / 临时封装公钥 |
+| Fiedler、Günther，*PQXDH: A Post-Quantum Extension of X3DH*，PKC 2025 | *Security Analysis of Signal's PQXDH Handshake*。Fiedler、Günther。PKC 2025，LNCS 15675，pp. 137–169。DOI `10.1007/978-3-031-91823-0_5`。ePrint 2024/702 | [PDF](2024-702-fiedler-guenther-pqxdh.pdf) | `src/x3dh.py` 的混合四次 DH + ML-KEM-768。握手优先一次性 PQOPK，否则签过名的长期 PQK；`kdf_rk_pq` 仍封装长期 PQK。没有 Kyber |
 | Rösler、Mainka、Schwenk，*More is Less: On the Security of Instant Messaging Groups*，EuroS&P 2018 | *More is Less: On the End-to-End Security of Group Chats in Signal, WhatsApp, and Threema*。EuroS&P 2018，pp. 415–429。DOI `10.1109/EuroSP.2018.00036`。ePrint 2017/713 | [PDF](2017-713-rosler-etal-group-chats.pdf) | `ChatEngine.send_text` 对每个其他成员各发一封双棘轮信封；成员表是 `src/groups.py` 的签名哈希链 |
 
 这三篇覆盖三件事：双棘轮在通用可组合定义下还挡住什么、经典 X3DH 的后量子扩展本仓库做了多少、群为什么不走 Sender Keys。曲线、签名、HKDF、GCM，以及 2016–2019 年的破密恢复定义和棘轮拆分，仍然对着正在调用的算法，写在下面的对照表里。
@@ -164,10 +164,12 @@ Fiedler 和 Günther 在 PKC 2025 分析 Signal 已经部署的 PQXDH。对外�
 
 他们的归约需要密钥封装的一个绑定性质，并证明 Kyber 和 ML-KEM 满足他们定义的那一版。缺少域分离会把具体安全界降下来。Bhargavan、Jacomme、Kiefer 和 Schmidt 在 USENIX Security 2024 用 ProVerif 和 CryptoVerif 核过同一份规范，并把发现送回修订版。那篇的全文在 USENIX 页面：<https://www.usenix.org/conference/usenixsecurity24/presentation/bhargavan>。USENIX 的版本不放进本仓库。
 
-本仓库实现了这条路径，但停在「半静态 KEM 公钥」版本：目录里公布一把由身份签名的长期 PQK（ML-KEM-768，`sign_pq` 对「PQK 公钥 || 用户名」签名），发起方封装，KEM 共享秘密按 `info = b"pqxdh-v1"` 与经典 `x3dh-v1` 域分离后并入 HKDF（`initiator_hybrid_secret` / `responder_hybrid_secret` / `hkdf_pq_sk`）。KEM 绑定用两层处理：目录里的 PQK 公钥由身份签名背书，初始消息的 IK_sign 签名覆盖 `IK_dh || EK_A || OPK || IK_PQ || PQ_CT`。没有实现临时封装公钥那一版，也没有 Kyber。双棘轮侧的配合在 `kdf_rk_pq`（`info = b"pq-dr-v1"`）：每次换链对长期 PQK 重新封装，密文随链外带，双方都固定对端 PQK 后缺失即拒（防降级）；旧会话在收发前补拉 bundle 核验签名后升级。这不改变经典四次 DH 的顺序，也不把 X25519 输出说成后量子。
+本仓库实现了这条路径，并补上一次性封装公钥。目录里公布一把由身份签名的长期 PQK（ML-KEM-768，`sign_pq` 对「PQK 公钥 || 用户名」签名），另外维护 8 把一次性 PQOPK。一次性公钥由 `sign_pq_opk` 对「前缀 `pq-opk-v1` || 公钥 || 用户名」签名，这个前缀使它不能冒充长期 PQK。发起新会话时若 bundle 里有 PQOPK，就封装到它上面；服务器不给时才封装到长期 PQK。KEM 共享秘密与封装公钥的 SHA-256 按 `info = b"pqxdh-v1"` 与经典 `x3dh-v1` 域分离后并入 HKDF（`initiator_hybrid_secret` / `responder_hybrid_secret` / `hkdf_pq_sk`）。初始消息的 IK_sign 签名覆盖 `IK_dh || EK_A || OPK || IK_PQ || PQ_EK || PQ_CT`。首条密文认证成功后才删除用掉的一次性私钥。没有 Kyber。
+
+双棘轮侧的配合在 `kdf_rk_pq`（`info = b"pq-dr-v1"`）：每次换链对长期 PQK 重新封装，不用已经删除的一次性钥。密文随链外带，双方都固定对端 PQK 后缺失即拒（防降级）。旧会话在收发前补拉 bundle 核验签名后升级，这次补拉不消耗 PQOPK。这不改变经典四次 DH 的顺序，也不把 X25519 输出说成后量子。服务器仍可以扣留一次性钥，迫使握手落到长期 PQK；长期 PQK 泄露之后，新的棘轮链退回经典 DH 的保障。对照输出见 `scripts/demo_paper_binding.py`。
 
 ## 答辩时不能说成什么
 
 上面的定理没有被在本仓库上重新跑过，也没有做机器证明。它们说明这些构造为什么是现在这样，以及哪些安全结论依赖哪些假设。
 
-不能从这些 PDF 推出的话有四句。第一，PySide6 界面、服务器转发和 SQLite 保险库不在任何一篇的定理里。保险库是 PBKDF2-HMAC-SHA256、600000 次、16 字节盐，再 AES-256-GCM，只保护本机私钥和棘轮状态。第二，2019 和 2022 的立即解密没有 40 条上限；超过 40 条空隙时本仓库选择拒绝。第三，2022 年的 Triple Ratchet 是论文给出的更强构造，代码里没有；2025 年的 PQXDH 只实现了半静态 KEM 公钥那一版，且没有在他们的证明模型里重跑安全界。第四，屏幕指纹不覆盖 `IK_dh`；第一次取 bundle 时，协商身份和签名身份的绑定弱于 XEdDSA 那一版 Signal。钉住之后，这一对公钥再变会被拒绝。
+不能从这些 PDF 推出的话有四句。第一，PySide6 界面、服务器转发和 SQLite 保险库不在任何一篇的定理里。保险库是 PBKDF2-HMAC-SHA256、600000 次、16 字节盐，再 AES-256-GCM，只保护本机私钥和棘轮状态。第二，2019 和 2022 的立即解密没有 40 条上限；超过 40 条空隙时本仓库选择拒绝。第三，2022 年的 Triple Ratchet 是论文给出的更强构造，代码里没有，`dhs_priv` 的窗口还在。2025 年的 PQXDH 这里做成了「一次性 PQOPK，否则签过名的长期 PQK」，但没有 Kyber，也没有在他们的证明模型里重跑安全界；服务器扣留一次性钥时握手会落到长期钥，混合棘轮的封装目标也仍是这把长期钥。第四，屏幕指纹不覆盖 `IK_dh`；第一次取 bundle 时，协商身份和签名身份的绑定弱于 XEdDSA 那一版 Signal。钉住之后，这一对公钥再变会被拒绝。

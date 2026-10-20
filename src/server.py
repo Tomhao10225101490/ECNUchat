@@ -19,7 +19,7 @@ from src.groups import (
     verify_group_state_sig,
     verify_state_transition,
 )
-from src.prekeys import MLKEM768_PUB_LEN, verify_pq, verify_spk
+from src.prekeys import MLKEM768_PUB_LEN, verify_pq, verify_pq_opk, verify_spk
 from src.protocol import (
     MAX_GROUP_MEMBERS,
     PROJECT_NAME,
@@ -36,6 +36,41 @@ from src.protocol import (
     validate_username,
 )
 from src.store import ServerStore
+
+# 一次性 KEM 公钥 1184 字节。16 把加签名仍低于单帧 64KB。
+MAX_PQ_OPK_UPLOAD = 16
+
+
+def _decode_pq_opks(
+    raw: Any, ik_sign_pub: bytes, username: str
+) -> tuple[list[tuple[bytes, bytes]] | None, str | None]:
+    """解析并验签一次性 PQ 预密钥。失败时返回错误文案，不入库。"""
+    if raw is None:
+        return [], None
+    if not isinstance(raw, list):
+        return None, "一次性 PQ 预密钥格式无效"
+    if len(raw) > MAX_PQ_OPK_UPLOAD:
+        return None, "一次性 PQ 预密钥一次最多 16 把"
+    items: list[tuple[bytes, bytes]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return None, "一次性 PQ 预密钥格式无效"
+        pub = b64d(item.get("pub"))
+        sig = b64d(item.get("sig"))
+        if (
+            pub is None
+            or len(pub) != MLKEM768_PUB_LEN
+            or sig is None
+            or len(sig) != 64
+        ):
+            return None, "一次性 PQ 预密钥长度无效"
+        try:
+            verify_pq_opk(ik_sign_pub, pub, username, sig)
+        except Exception:
+            return None, "一次性 PQ 预密钥签名无效，拒绝入库"
+        items.append((pub, sig))
+    return items, None
+
 
 # 日志里禁止明文、私钥、SK、RK、CK、MK。聊天内容只允许 base64。
 logging.basicConfig(
@@ -211,6 +246,10 @@ class ChatServer:
         if len(opk_bytes) > 100 or any(len(item) != 32 for item in opk_bytes):
             await ws.send(dumps(error_msg("OPK 必须是最多 100 把 32 字节公钥")))
             return None
+        pq_opks, pq_err = _decode_pq_opks(msg.get("pq_opks"), ik_sign_pub, username)
+        if pq_err or pq_opks is None:
+            await ws.send(dumps(error_msg(pq_err or "一次性 PQ 预密钥无效")))
+            return None
         self.store.create_user(
             username,
             ik_sign_pub,
@@ -221,10 +260,16 @@ class ChatServer:
             pq_pub,
             pq_sig,
             opk_bytes,
+            pq_opks,
         )
         await self._bind(ws, username)
         await ws.send(dumps({"type": "register_ok", "username": username}))
-        log.info("register user=%s opk_count=%s", username, len(opk_bytes))
+        log.info(
+            "register user=%s opk_count=%s pq_opk_count=%s",
+            username,
+            len(opk_bytes),
+            len(pq_opks),
+        )
         return username
 
     async def on_login(self, ws: Any, username: str | None, msg: dict[str, Any]) -> str | None:
@@ -314,14 +359,37 @@ class ChatServer:
                 return
             verify_spk(user[0], spk_pub, username, spk_sig)
             spk = (spk_pub, spk_sig, float(msg.get("spk_created") or 0))
-        self.store.upload_prekeys(username, opk_bytes, spk)
-        await ws.send(dumps({"type": "upload_prekeys_ok", "count": len(opk_bytes)}))
-        log.info("upload_prekeys user=%s count=%s", username, len(opk_bytes))
+        user = self.store.get_user(username)
+        if not user:
+            await ws.send(dumps(error_msg("用户不存在")))
+            return
+        pq_opks, pq_err = _decode_pq_opks(msg.get("pq_opks"), user[0], username)
+        if pq_err or pq_opks is None:
+            await ws.send(dumps(error_msg(pq_err or "一次性 PQ 预密钥无效")))
+            return
+        self.store.upload_prekeys(username, opk_bytes, spk, pq_opks)
+        await ws.send(
+            dumps(
+                {
+                    "type": "upload_prekeys_ok",
+                    "count": len(opk_bytes),
+                    "pq_count": len(pq_opks),
+                }
+            )
+        )
+        log.info(
+            "upload_prekeys user=%s count=%s pq_count=%s",
+            username,
+            len(opk_bytes),
+            len(pq_opks),
+        )
 
     async def on_fetch_bundle(self, ws: Any, msg: dict[str, Any]) -> None:
         name = msg.get("username", "")
         validate_username(name)
-        bundle = self.store.fetch_bundle(name)
+        # 只有发起新会话才消耗一次性 PQ 预密钥。补拉长期 PQK 不能把池子烧掉。
+        consume_pq = msg.get("consume_pq_opk") is True
+        bundle = self.store.fetch_bundle(name, consume_pq_opk=consume_pq)
         if not bundle:
             await ws.send(dumps(error_msg("找不到该用户的预密钥")))
             return
@@ -338,13 +406,18 @@ class ChatServer:
                     "opk": b64e(bundle["opk_pub"]) if bundle["opk_pub"] else None,
                     "pq_pub": b64e(bundle["pq_pub"]) if bundle["pq_pub"] else None,
                     "pq_sig": b64e(bundle["pq_sig"]) if bundle["pq_sig"] else None,
+                    "pq_opk": b64e(bundle["pq_opk_pub"]) if bundle["pq_opk_pub"] else None,
+                    "pq_opk_sig": (
+                        b64e(bundle["pq_opk_sig"]) if bundle["pq_opk_sig"] else None
+                    ),
                 }
             )
         )
         log.info(
-            "fetch_bundle user=%s opk=%s",
+            "fetch_bundle user=%s opk=%s pq_opk=%s",
             name,
             "yes" if bundle["opk_pub"] else "no",
+            "yes" if bundle["pq_opk_pub"] else "no",
         )
 
     async def on_fetch_user(self, ws: Any, msg: dict[str, Any]) -> None:

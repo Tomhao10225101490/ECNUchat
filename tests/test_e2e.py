@@ -68,13 +68,20 @@ async def _e2e(tmp_path: Path) -> None:
         assert first.get("opk")
         if second.get("opk"):
             assert second["opk"] != first["opk"]
+        # 不带 consume_pq_opk 的目录查询不能烧掉一次性封装公钥。
+        assert first.get("pq_opk") is None
+        assert second.get("pq_opk") is None
 
         await alice.send_text("你好鲍勃", peer="bob")
         assert (await wait_pred(bob, lambda i: i.text == "你好鲍勃")).sender == "alice"
-        # 混合 PQXDH：双方会话都已记录对端 PQK，棘轮链携带 PQ 封装
+        # 混合 PQXDH：双方会话都已记录对端 PQK，棘轮链携带 PQ 封装。
+        # 握手优先用一次性 PQ 预密钥，首条认证成功后 Bob 删掉对应私钥。
         assert alice.sessions["bob"].remote_pq_pk is not None
         assert bob.sessions["alice"].remote_pq_pk is not None
         assert alice.sessions["bob"].dhs_pq_ct is not None
+        assert alice.sessions["bob"].handshake_pq == "pqopk"
+        assert bob.sessions["alice"].handshake_pq == "pqopk"
+        assert len(bob.identity.pq_opks) == 7
 
         await bob.send_text("你好爱丽丝", peer="alice")
         assert (await wait_pred(alice, lambda i: i.text == "你好爱丽丝")).sender == "bob"

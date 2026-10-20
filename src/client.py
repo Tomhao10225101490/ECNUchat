@@ -55,10 +55,13 @@ from src.groups import (
     verify_state_transition,
 )
 from src.prekeys import (
+    MLKEM768_PUB_LEN,
+    PqOneTimePrekey,
     generate_identity,
     generate_x25519,
     sign_bytes,
     verify_pq,
+    verify_pq_opk,
     verify_spk,
 )
 from src.protocol import (
@@ -254,6 +257,7 @@ class ChatEngine:
             self.last_error = "文件下载将在下次连接重试"
         try:
             await self._retry_pending_prekeys()
+            await self._ensure_local_prekey_pools()
         except Exception:
             self.last_error = "预密钥补充将在下次登录重试"
 
@@ -291,13 +295,57 @@ class ChatEngine:
 
     async def _retry_pending_prekeys(self) -> None:
         pending = self.store.load_pending_prekeys()
-        if not pending:
+        pending_pq = self.store.load_pending_pq_opks()
+        if not pending and not pending_pq:
             return
-        await self.request(
-            {"type": "upload_prekeys", "opks": [b64e(pub) for pub in pending]},
-            "upload_prekeys_ok",
+        payload: dict[str, Any] = {"type": "upload_prekeys"}
+        if pending:
+            payload["opks"] = [b64e(pub) for pub in pending]
+        if pending_pq:
+            payload["pq_opks"] = [
+                {"pub": b64e(pub), "sig": b64e(sig)} for pub, sig in pending_pq
+            ]
+        await self.request(payload, "upload_prekeys_ok")
+        if pending:
+            self.store.clear_pending_prekeys()
+        if pending_pq:
+            self.store.clear_pending_pq_opks()
+
+    async def _push_prekeys(
+        self, opks: list[Any], pq_opks: list[PqOneTimePrekey]
+    ) -> None:
+        """先把待上传公钥写入保险库，再发给服务器。失败则下次登录重试。"""
+        if not opks and not pq_opks:
+            return
+        if opks:
+            self.store.save_pending_prekeys([item.pub for item in opks])
+        if pq_opks:
+            self.store.save_pending_pq_opks(
+                [(item.pub, item.signature) for item in pq_opks]
+            )
+        payload: dict[str, Any] = {"type": "upload_prekeys"}
+        if opks:
+            payload["opks"] = [b64e(item.pub) for item in opks]
+        if pq_opks:
+            payload["pq_opks"] = [
+                {"pub": b64e(item.pub), "sig": b64e(item.signature)} for item in pq_opks
+            ]
+        await self.request(payload, "upload_prekeys_ok")
+        if opks:
+            self.store.clear_pending_prekeys()
+        if pq_opks:
+            self.store.clear_pending_pq_opks()
+
+    async def _ensure_local_prekey_pools(self) -> None:
+        """旧保险库没有一次性 PQ 预密钥时，登录后补池并上传。"""
+        opk_created = self.identity.refill_opks() if self.identity.needs_refill() else []
+        pq_created = (
+            self.identity.refill_pq_opks() if self.identity.needs_pq_refill() else []
         )
-        self.store.clear_pending_prekeys()
+        if not opk_created and not pq_created:
+            return
+        self.store.save_identity(self.identity)
+        await self._push_prekeys(opk_created, pq_created)
 
     async def _register(self) -> None:
         await self.request(
@@ -312,6 +360,10 @@ class ChatEngine:
                 "opks": [b64e(o.pub) for o in self.identity.opks],
                 "pq_pub": b64e(self.identity.pq_pub),
                 "pq_sig": b64e(self.identity.pq_sig),
+                "pq_opks": [
+                    {"pub": b64e(item.pub), "sig": b64e(item.signature)}
+                    for item in self.identity.pq_opks
+                ],
             },
             "register_ok",
         )
@@ -455,7 +507,10 @@ class ChatEngine:
     async def start_session(self, peer: str) -> RatchetState:
         if peer in self.sessions:
             return self.sessions[peer]
-        bundle = await self.request({"type": "fetch_bundle", "username": peer}, "bundle")
+        bundle = await self.request(
+            {"type": "fetch_bundle", "username": peer, "consume_pq_opk": True},
+            "bundle",
+        )
         ik_sign = b64d(bundle["ik_sign_pub"]) or b""
         ik_dh = b64d(bundle["ik_dh_pub"]) or b""
         spk_pub = b64d(bundle["spk_pub"]) or b""
@@ -490,17 +545,42 @@ class ChatEngine:
             self.store.save_peer(peer, ik_sign, ik_dh, pq_pub)
         ek_priv, ek_pub = generate_x25519()
         opk = b64d(bundle.get("opk"))
+        pq_opk = b64d(bundle.get("pq_opk"))
+        pq_opk_sig = b64d(bundle.get("pq_opk_sig"))
+        if (pq_opk is None) != (pq_opk_sig is None):
+            raise X3DHError("对方一次性 PQ 预密钥与签名不配套")
+        if pq_opk is not None and (
+            len(pq_opk) != MLKEM768_PUB_LEN or pq_opk_sig is None or len(pq_opk_sig) != 64
+        ):
+            raise X3DHError("对方一次性 PQ 预密钥长度无效")
         if pq_pub is not None and self.identity.pq_pub is not None:
+            # 有签过名的一次性钥就用它；服务器扣留时才落到长期 PQK。
+            # 棘轮封装目标始终是长期 PQK，不用这把一次性钥。
+            ek_target = pq_pub
+            handshake_pq = "pqk"
+            if pq_opk is not None and pq_opk_sig is not None:
+                try:
+                    verify_pq_opk(ik_sign, pq_opk, peer, pq_opk_sig)
+                except InvalidSignature as exc:
+                    self.last_error = "对方一次性 PQ 预密钥签名无效"
+                    raise X3DHError("对方一次性 PQ 预密钥签名无效") from exc
+                ek_target = pq_opk
+                handshake_pq = "pqopk"
             sk, pq_ct = initiator_hybrid_secret(
                 self.identity.ik_dh_priv,
                 ek_priv,
                 spk_pub,
                 ik_dh,
                 opk,
-                pq_pub,
+                ek_target,
             )
             state = init_sender(
-                sk, spk_pub, self.username, peer, remote_pq_pk=pq_pub
+                sk,
+                spk_pub,
+                self.username,
+                peer,
+                remote_pq_pk=pq_pub,
+                handshake_pq=handshake_pq,
             )
             self.pending_x3dh[peer] = build_initial_message(
                 self.identity.ik_sign_priv,
@@ -508,6 +588,7 @@ class ChatEngine:
                 ek_pub,
                 opk,
                 ik_pq_pub_a=self.identity.pq_pub,
+                pq_ek_pub=ek_target,
                 pq_ct=pq_ct,
             )
         else:
@@ -1032,6 +1113,8 @@ class ChatEngine:
         ratchet_msg, init = decode_ratchet_payload(payload)
         new_identity = False
         consumed_opk: bytes | None = None
+        consumed_pq: bytes | None = None
+        handshake_pq: str | None = None
         if sender not in self.sessions:
             if init is None:
                 raise X3DHError("没有会话且缺少 X3DH 初始消息")
@@ -1044,6 +1127,7 @@ class ChatEngine:
                     init.opk_pub,
                     init.signature,
                     init.ik_pq_pub,
+                    init.pq_ek_pub,
                     init.pq_ct,
                 )
             except X3DHError:
@@ -1051,6 +1135,14 @@ class ChatEngine:
                 raise
             if init.ik_dh_pub != ik_dh:
                 raise X3DHError("验签失败：身份协商公钥与服务器登记不一致")
+            hybrid = (
+                init.pq_ct is not None
+                and init.ik_pq_pub is not None
+                and init.pq_ek_pub is not None
+            )
+            if self.identity.pq_priv is not None and not hybrid:
+                # 本机支持 PQ 却收到不完整或经典的初始消息：拒绝静默降级。
+                raise X3DHError("缺少 PQ 握手，已拒绝降级")
             if server_pq is not None and init.ik_pq_pub != server_pq:
                 raise X3DHError("验签失败：PQ 公钥与服务器登记不一致")
             opk_priv = None
@@ -1063,21 +1155,37 @@ class ChatEngine:
                     raise X3DHError("本地没有对应的一次性预密钥私钥")
                 opk_priv = matching.priv
                 consumed_opk = init.opk_pub
-            hybrid = init.pq_ct is not None and init.ik_pq_pub is not None
-            if self.identity.pq_priv is not None and not hybrid:
-                # 本机支持 PQ 却收到经典初始消息：拒绝静默降级。
-                raise X3DHError("缺少 PQ 握手，已拒绝降级")
             if hybrid:
-                if self.identity.pq_priv is None:
+                if self.identity.pq_priv is None or self.identity.pq_pub is None:
                     raise X3DHError("本机身份没有 PQK 私钥，无法完成混合握手")
+                if init.pq_ek_pub is None or init.pq_ct is None:
+                    raise X3DHError("混合握手缺少封装公钥")
+                match = next(
+                    (
+                        item
+                        for item in self.identity.pq_opks
+                        if item.pub == init.pq_ek_pub
+                    ),
+                    None,
+                )
+                if match is not None:
+                    pq_priv_hs = match.priv
+                    consumed_pq = init.pq_ek_pub
+                    handshake_pq = "pqopk"
+                elif init.pq_ek_pub == self.identity.pq_pub:
+                    pq_priv_hs = self.identity.pq_priv
+                    handshake_pq = "pqk"
+                else:
+                    raise X3DHError("本地没有对应的一次性 PQ 预密钥")
                 sk = responder_hybrid_secret(
                     self.identity.spk.priv,
                     self.identity.ik_dh_priv,
                     init.ik_dh_pub,
                     init.ek_pub,
                     opk_priv,
-                    self.identity.pq_priv,
+                    pq_priv_hs,
                     init.pq_ct,
+                    init.pq_ek_pub,
                 )
             else:
                 sk = responder_secret(
@@ -1096,6 +1204,7 @@ class ChatEngine:
                 remote_pq_pk=init.ik_pq_pub if hybrid else None,
                 pq_ct=ratchet_msg.pq_ct if hybrid else None,
                 local_pq_priv=self.identity.pq_priv if hybrid else None,
+                handshake_pq=handshake_pq,
             )
             new_identity = True
         else:
@@ -1152,21 +1261,26 @@ class ChatEngine:
             self.sessions[sender] = state
             if consumed_opk is not None:
                 self.identity.take_opk(consumed_opk)
+            if consumed_pq is not None:
+                self.identity.take_pq_opk(consumed_pq)
             self.store.save_identity(self.identity)
         self.store.save_session(sender, state)
-        if new_identity and self.identity.needs_refill():
-            created = self.identity.refill_opks()
-            self.store.save_identity(self.identity)
-            self.store.save_pending_prekeys([item.pub for item in created])
-            try:
-                await self.request(
-                    {"type": "upload_prekeys", "opks": [b64e(o.pub) for o in created]},
-                    "upload_prekeys_ok",
-                )
-                self.store.clear_pending_prekeys()
-            except Exception:
-                # 明文已经认证成功且状态已提交；补池失败不能把消息伪装成解密失败。
-                self.last_error = "预密钥补充将在下次登录重试"
+        if new_identity and (
+            self.identity.needs_refill() or self.identity.needs_pq_refill()
+        ):
+            created = (
+                self.identity.refill_opks() if self.identity.needs_refill() else []
+            )
+            created_pq = (
+                self.identity.refill_pq_opks() if self.identity.needs_pq_refill() else []
+            )
+            if created or created_pq:
+                self.store.save_identity(self.identity)
+                try:
+                    await self._push_prekeys(created, created_pq)
+                except Exception:
+                    # 明文已经认证成功且状态已提交；补池失败不能把消息伪装成解密失败。
+                    self.last_error = "预密钥补充将在下次登录重试"
         return text, verified_group, verified_kind, file_meta
 
     async def list_users(self) -> dict[str, Any]:
@@ -1405,9 +1519,13 @@ async def handle_line(engine: ChatEngine, line: str) -> CommandResult:
     if cmd == "/pq" and len(parts) == 3 and parts[1] == "status":
         name = parts[2]
         if name == engine.username:
-            row = (
-                f"本机 PQK：{'已生成 (ML-KEM-768)' if engine.identity.pq_pub else '无'}"
-            )
+            if engine.identity.pq_pub:
+                row = (
+                    "本机 PQK：已生成 (ML-KEM-768)，长期封装公钥\n"
+                    f"一次性 PQ 预密钥剩余 {len(engine.identity.pq_opks)} 把"
+                )
+            else:
+                row = "本机 PQK：无"
             return CommandResult(overlay=row)
         if name not in engine.sessions:
             raise ProtocolError(f"还没有与 {name} 的会话")
@@ -1420,9 +1538,16 @@ async def handle_line(engine: ChatEngine, line: str) -> CommandResult:
                 )
             state.remote_pq_pk = upgraded
             engine.store.save_session(name, state)
+        if state.handshake_pq == "pqopk":
+            handshake = "一次性 PQ 预密钥（首条认证成功后私钥已删除）"
+        elif state.handshake_pq == "pqk":
+            handshake = "签过名的长期 PQK（服务器未提供一次性钥）"
+        else:
+            handshake = "经典 X3DH，棘轮侧已补上长期 PQK"
         return CommandResult(
             overlay=(
                 f"{name}：混合 PQXDH\n"
+                f"握手封装：{handshake}\n"
                 f"棘轮已混入 PQ：{'是' if state.dhs_pq_ct else '否（下一次换链起生效）'}\n"
                 f"棘轮代数 {state.dh_ratchet_count}"
             )

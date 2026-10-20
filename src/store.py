@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from src.double_ratchet import RatchetState
-from src.prekeys import IdentityKeys, OneTimePrekey, SignedPrekey
+from src.prekeys import IdentityKeys, OneTimePrekey, PqOneTimePrekey, SignedPrekey
 from src.protocol import b64d, b64e, decode_group_state, encode_group_state
 
 PBKDF2_ITERS = 600_000
@@ -58,6 +58,10 @@ def _identity_to_json(identity: IdentityKeys) -> bytes:
             "created": identity.spk.created,
         },
         "opks": [{"priv": b64e(o.priv), "pub": b64e(o.pub)} for o in identity.opks],
+        "pq_opks": [
+            {"priv": b64e(o.priv), "pub": b64e(o.pub), "sig": b64e(o.signature)}
+            for o in identity.pq_opks
+        ],
     }
     return json.dumps(obj, separators=(",", ":")).encode("utf-8")
 
@@ -84,6 +88,14 @@ def _identity_from_json(raw: bytes) -> IdentityKeys:
             OneTimePrekey(priv=b64d(o["priv"]) or b"", pub=b64d(o["pub"]) or b"")
             for o in obj.get("opks") or []
         ],
+        pq_opks=[
+            PqOneTimePrekey(
+                priv=b64d(o["priv"]) or b"",
+                pub=b64d(o["pub"]) or b"",
+                signature=b64d(o["sig"]) or b"",
+            )
+            for o in obj.get("pq_opks") or []
+        ],
     )
 
 
@@ -107,6 +119,7 @@ def _state_to_json(state: RatchetState) -> bytes:
         "seen": [b64e(k) for k in rec["seen"]],
         "retired_dh": [b64e(k) for k in rec["retired_dh"]],
         "dh_ratchet_count": rec["dh_ratchet_count"],
+        "handshake_pq": rec.get("handshake_pq"),
     }
     return json.dumps(obj, separators=(",", ":")).encode("utf-8")
 
@@ -135,6 +148,7 @@ def _state_from_json(raw: bytes) -> RatchetState:
             "seen": seen,
             "retired_dh": retired_dh,
             "dh_ratchet_count": obj.get("dh_ratchet_count", 0),
+            "handshake_pq": obj.get("handshake_pq"),
         }
     )
 
@@ -278,6 +292,32 @@ class ClientStore:
     def clear_pending_prekeys(self) -> None:
         with self.conn:
             self.conn.execute("DELETE FROM vault WHERE name='pending_prekeys'")
+
+    def save_pending_pq_opks(self, items: list[tuple[bytes, bytes]]) -> None:
+        raw = json.dumps(
+            [{"pub": b64e(pub), "sig": b64e(sig)} for pub, sig in items],
+            separators=(",", ":"),
+        ).encode()
+        blob = encrypt_blob(self._require_key(), raw)
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO vault(name, blob) VALUES('pending_pq_opks', ?)",
+                (blob,),
+            )
+
+    def load_pending_pq_opks(self) -> list[tuple[bytes, bytes]]:
+        row = self.conn.execute(
+            "SELECT blob FROM vault WHERE name='pending_pq_opks'"
+        ).fetchone()
+        if not row:
+            return []
+        raw = decrypt_blob(self._require_key(), row[0])
+        loaded = json.loads(raw.decode())
+        return [(b64d(item["pub"]) or b"", b64d(item["sig"]) or b"") for item in loaded]
+
+    def clear_pending_pq_opks(self) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM vault WHERE name='pending_pq_opks'")
 
     def save_session(self, peer: str, state: RatchetState) -> None:
         blob = encrypt_blob(self._require_key(), _state_to_json(state))
@@ -615,6 +655,12 @@ class ServerStore:
                 username TEXT NOT NULL,
                 opk_pub BLOB NOT NULL UNIQUE
             );
+            CREATE TABLE IF NOT EXISTS pq_one_time_prekeys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                pq_opk_pub BLOB NOT NULL UNIQUE,
+                pq_opk_sig BLOB NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS offline_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 recipient TEXT NOT NULL,
@@ -684,6 +730,7 @@ class ServerStore:
         pq_pub: bytes | None,
         pq_sig: bytes | None,
         opks: list[bytes],
+        pq_opks: list[tuple[bytes, bytes]] | None = None,
     ) -> None:
         with self.conn:
             self.conn.execute(
@@ -699,6 +746,7 @@ class ServerStore:
                     "INSERT INTO one_time_prekeys(username, opk_pub) VALUES(?,?)",
                     (username, pub),
                 )
+            self._insert_pq_opks(username, pq_opks or [])
 
     def get_user(self, username: str) -> tuple[bytes, bytes, bytes | None, bytes | None] | None:
         row = self.conn.execute(
@@ -713,11 +761,22 @@ class ServerStore:
         rows = self.conn.execute("SELECT username FROM users ORDER BY username").fetchall()
         return [r[0] for r in rows]
 
+    def _insert_pq_opks(self, username: str, items: list[tuple[bytes, bytes]]) -> None:
+        for pub, sig in items:
+            try:
+                self.conn.execute(
+                    "INSERT INTO pq_one_time_prekeys(username, pq_opk_pub, pq_opk_sig) VALUES(?,?,?)",
+                    (username, pub, sig),
+                )
+            except sqlite3.IntegrityError:
+                continue
+
     def upload_prekeys(
         self,
         username: str,
         opks: list[bytes],
         spk: tuple[bytes, bytes, float] | None = None,
+        pq_opks: list[tuple[bytes, bytes]] | None = None,
     ) -> None:
         if spk:
             self.conn.execute(
@@ -732,9 +791,19 @@ class ServerStore:
                 )
             except sqlite3.IntegrityError:
                 continue
+        self._insert_pq_opks(username, pq_opks or [])
         self.conn.commit()
 
-    def fetch_bundle(self, username: str) -> dict[str, Any] | None:
+    def count_pq_opks(self, username: str) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM pq_one_time_prekeys WHERE username=?",
+            (username,),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def fetch_bundle(
+        self, username: str, *, consume_pq_opk: bool = False
+    ) -> dict[str, Any] | None:
         user = self.get_user(username)
         if not user:
             return None
@@ -756,6 +825,20 @@ class ServerStore:
                     "DELETE FROM one_time_prekeys WHERE id=?", (opk_row[0],)
                 )
                 opk_pub = opk_row[1]
+            pq_opk_pub = None
+            pq_opk_sig = None
+            if consume_pq_opk:
+                pq_row = self.conn.execute(
+                    "SELECT id, pq_opk_pub, pq_opk_sig FROM pq_one_time_prekeys "
+                    "WHERE username=? ORDER BY id LIMIT 1",
+                    (username,),
+                ).fetchone()
+                if pq_row:
+                    self.conn.execute(
+                        "DELETE FROM pq_one_time_prekeys WHERE id=?", (pq_row[0],)
+                    )
+                    pq_opk_pub = pq_row[1]
+                    pq_opk_sig = pq_row[2]
         return {
             "ik_sign_pub": ik_sign_pub,
             "ik_dh_pub": ik_dh_pub,
@@ -765,6 +848,8 @@ class ServerStore:
             "spk_sig": spk[1],
             "spk_created": spk[2],
             "opk_pub": opk_pub,
+            "pq_opk_pub": pq_opk_pub,
+            "pq_opk_sig": pq_opk_sig,
         }
 
     def enqueue_offline(self, recipient: str, payload: str) -> None:

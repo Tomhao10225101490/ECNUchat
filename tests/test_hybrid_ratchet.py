@@ -36,6 +36,7 @@ def _hybrid_bootstrap():
         opk.priv,
         bob.pq_priv,
         handshake_ct,
+        bob.pq_pub,
     )
     a = init_sender(sk, bob.spk.pub, "alice", "bob", remote_pq_pk=bob.pq_pub)
     first, _ = encrypt(a, b"hello-0")

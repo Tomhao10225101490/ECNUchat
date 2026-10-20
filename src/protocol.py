@@ -122,6 +122,8 @@ def encode_x3dh(init: InitialMessage) -> dict[str, Any]:
     }
     if init.ik_pq_pub is not None:
         payload["ik_pq_pub"] = b64e(init.ik_pq_pub)
+    if init.pq_ek_pub is not None:
+        payload["pq_ek"] = b64e(init.pq_ek_pub)
     if init.pq_ct is not None:
         payload["pq_ct"] = b64e(init.pq_ct)
     return payload
@@ -142,6 +144,11 @@ def decode_x3dh(data: dict[str, Any] | None) -> InitialMessage | None:
         ik_pq_pub=(
             _fixed(data.get("ik_pq_pub"), MLKEM768_PUB_LEN, "IK_PQ 公钥")
             if data.get("ik_pq_pub") is not None
+            else None
+        ),
+        pq_ek_pub=(
+            _fixed(data.get("pq_ek"), MLKEM768_PUB_LEN, "PQ 封装公钥")
+            if data.get("pq_ek") is not None
             else None
         ),
         pq_ct=(

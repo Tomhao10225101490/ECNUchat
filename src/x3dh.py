@@ -3,20 +3,24 @@
 经典路径是 Marlinspike、Perrin 的 X3DH。混合路径是本仓库对 Fiedler、
 Günther，PKC 2025（ePrint 2024/702，*Security Analysis of Signal's
 PQXDH Handshake*）的实现：在同样的 DH 组合之外并入一次 ML-KEM-768
-密钥封装，双方把 KEM 共享秘密与 DH 材料拼接后放进 HKDF，info 用独立的
-`pqxdh-v1` 与经典 `x3dh-v1` 域分离。
+密钥封装。优先封装到一次性 PQOPK；目录没有时才封装到签过名的长期 PQK。
+双方把 KEM 共享秘密、DH 材料、以及封装公钥的 SHA-256 拼进 HKDF，info
+用独立的 `pqxdh-v1` 与经典 `x3dh-v1` 域分离。
 
-他们指出的 KEM 绑定在这里用两层处理：
-1. 目录里的 PQK 公钥由 IK_sign 对 (PQK 公钥 || 用户名) 签名（prekeys）。
-2. 发起方把自己的 PQK 公钥与 KEM 密文放进初始消息，IK_sign 的签名覆盖
-   IK_dh || EK || OPK || IK_PQ || PQ_CT，两端核对同一份握手转写。
+KEM 绑定分三层：
+1. 长期 PQK 由 IK_sign 对 (PQK 公钥 || 用户名) 签名。
+2. 一次性 PQOPK 由 IK_sign 对 (前缀 || 公钥 || 用户名) 签名，前缀与长期钥分开。
+3. 初始消息的 IK_sign 覆盖 IK_dh || EK || OPK || IK_PQ || PQ_EK || PQ_CT。
+   HKDF 再混入 SHA-256(PQ_EK)，一次性公钥和最后手段公钥不能互换。
 
 边界照旧：X25519 就是题目里的椭圆曲线 Diffie-Hellman；SK 只用来初始化
-双棘轮，绝不直接加密聊天内容；本模块只做字节进、字节出。
+双棘轮，绝不直接加密聊天内容；本模块只做字节进、字节出。混合棘轮的
+封装目标仍是长期 PQK，不是用过即删的 PQOPK。
 """
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 
 from cryptography.exceptions import InvalidSignature
@@ -31,7 +35,12 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 )
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from src.prekeys import MLKEM_SUPPORTED, decapsulate_mlkem, encapsulate_mlkem
+from src.prekeys import (
+    MLKEM768_PUB_LEN,
+    MLKEM_SUPPORTED,
+    decapsulate_mlkem,
+    encapsulate_mlkem,
+)
 
 X3DH_INFO = b"x3dh-v1"
 PQXDH_INFO = b"pqxdh-v1"
@@ -65,20 +74,26 @@ def hkdf_sk(ikm: bytes) -> bytes:
     ).derive(ikm)
 
 
-def hkdf_pq_sk(dh_material: bytes, kem_ss: bytes) -> bytes:
-    """混合 X3DH：ikm = DH1||DH2||DH3[||DH4] || KEM 共享秘密，info=pqxdh-v1。
+def hkdf_pq_sk(dh_material: bytes, kem_ss: bytes, pq_ek_pub: bytes) -> bytes:
+    """混合 X3DH：ikm = DH || ss || SHA-256(封装公钥)，info=pqxdh-v1。
 
-    KEM 共享秘密长度不必是 32 的倍数；域标签与经典 x3dh-v1 分开，
-    两次派生不会撞车。
+    封装公钥可以是一次性 PQOPK，也可以是长期 PQK。把它的哈希放进 ikm，
+    两端必须对同一把公钥达成一致；只换公钥、不换密文，SK 对不上。
+    域标签与经典 x3dh-v1 分开。
     """
     if len(dh_material) == 0 or len(dh_material) % 32 != 0:
         raise X3DHError("共享材料长度必须是 32 的倍数")
+    if len(pq_ek_pub) != MLKEM768_PUB_LEN:
+        raise X3DHError("封装公钥长度无效")
+    if len(kem_ss) == 0:
+        raise X3DHError("KEM 共享秘密为空")
+    binding = hashlib.sha256(pq_ek_pub).digest()
     return HKDF(
         algorithm=hashes.SHA256(),
         length=X3DH_SK_LEN,
         salt=X3DH_SALT,
         info=PQXDH_INFO,
-    ).derive(dh_material + kem_ss)
+    ).derive(dh_material + kem_ss + binding)
 
 
 def _initiator_dh_material(
@@ -122,9 +137,10 @@ def initiator_hybrid_secret(
     opk_pub_b: bytes | None,
     pq_pk_b: bytes,
 ) -> tuple[bytes, bytes]:
-    """A 侧 PQXDH：经典四次 DH + 一次对 B 的 PQK 的封装，返回 (SK, PQ_CT)。
+    """A 侧 PQXDH：经典 DH + 一次对 pq_pk_b 的封装，返回 (SK, PQ_CT)。
 
-    PQ_CT 必须随初始消息发出并进 IK_sign 签名（见 initial_signed_payload）。
+    pq_pk_b 是对方的一次性 PQOPK，或没有一次性钥时的长期 PQK。
+    PQ_CT 和这把封装公钥都要进初始消息签名。
     """
     material = _initiator_dh_material(
         ik_dh_priv_a, ek_priv_a, spk_pub_b, ik_dh_pub_b, opk_pub_b
@@ -132,7 +148,7 @@ def initiator_hybrid_secret(
     if not MLKEM_SUPPORTED:
         raise X3DHError("当前环境不支持 ML-KEM")
     kem_ss, pq_ct = encapsulate_mlkem(pq_pk_b)
-    return hkdf_pq_sk(material, kem_ss), pq_ct
+    return hkdf_pq_sk(material, kem_ss, pq_pk_b), pq_ct
 
 
 def _responder_dh_material(
@@ -176,15 +192,20 @@ def responder_hybrid_secret(
     opk_priv_b: bytes | None,
     pq_priv_b: bytes,
     pq_ct: bytes,
+    pq_ek_pub: bytes,
 ) -> bytes:
-    """B 侧 PQXDH：解封 A 的 PQ_CT，把 KEM 共享秘密并入同一 HKDF。"""
+    """B 侧 PQXDH：用封装公钥对应的私钥解封，并入同一 HKDF。
+
+    ML-KEM 解错钥匙不会抛异常，而是给出另一串共享秘密。调用方必须传入
+    与封装时同一把 pq_ek_pub，否则 SK 与发起方不一致，GCM 会失败。
+    """
     material = _responder_dh_material(
         spk_priv_b, ik_dh_priv_b, ik_dh_pub_a, ek_pub_a, opk_priv_b
     )
     if not MLKEM_SUPPORTED:
         raise X3DHError("当前环境不支持 ML-KEM")
     kem_ss = decapsulate_mlkem(pq_priv_b, pq_ct)
-    return hkdf_pq_sk(material, kem_ss)
+    return hkdf_pq_sk(material, kem_ss, pq_ek_pub)
 
 
 def initial_signed_payload(
@@ -192,6 +213,7 @@ def initial_signed_payload(
     ek_pub_a: bytes,
     opk_pub_b: bytes | None,
     ik_pq_pub_a: bytes | None = None,
+    pq_ek_pub: bytes | None = None,
     pq_ct: bytes | None = None,
 ) -> bytes:
     return (
@@ -199,6 +221,7 @@ def initial_signed_payload(
         + ek_pub_a
         + (opk_pub_b or b"")
         + (ik_pq_pub_a or b"")
+        + (pq_ek_pub or b"")
         + (pq_ct or b"")
     )
 
@@ -209,10 +232,11 @@ def sign_initial(
     ek_pub_a: bytes,
     opk_pub_b: bytes | None,
     ik_pq_pub_a: bytes | None = None,
+    pq_ek_pub: bytes | None = None,
     pq_ct: bytes | None = None,
 ) -> bytes:
     data = initial_signed_payload(
-        ik_dh_pub_a, ek_pub_a, opk_pub_b, ik_pq_pub_a, pq_ct
+        ik_dh_pub_a, ek_pub_a, opk_pub_b, ik_pq_pub_a, pq_ek_pub, pq_ct
     )
     return Ed25519PrivateKey.from_private_bytes(ik_sign_priv_a).sign(data)
 
@@ -224,10 +248,11 @@ def verify_initial(
     opk_pub_b: bytes | None,
     signature: bytes,
     ik_pq_pub_a: bytes | None = None,
+    pq_ek_pub: bytes | None = None,
     pq_ct: bytes | None = None,
 ) -> None:
     data = initial_signed_payload(
-        ik_dh_pub_a, ek_pub_a, opk_pub_b, ik_pq_pub_a, pq_ct
+        ik_dh_pub_a, ek_pub_a, opk_pub_b, ik_pq_pub_a, pq_ek_pub, pq_ct
     )
     try:
         Ed25519PublicKey.from_public_bytes(ik_sign_pub_a).verify(signature, data)
@@ -242,6 +267,7 @@ class InitialMessage:
     opk_pub: bytes | None
     signature: bytes
     ik_pq_pub: bytes | None = None
+    pq_ek_pub: bytes | None = None
     pq_ct: bytes | None = None
 
 
@@ -251,6 +277,7 @@ def build_initial_message(
     ek_pub_a: bytes,
     opk_pub_b: bytes | None,
     ik_pq_pub_a: bytes | None = None,
+    pq_ek_pub: bytes | None = None,
     pq_ct: bytes | None = None,
 ) -> InitialMessage:
     return InitialMessage(
@@ -263,8 +290,10 @@ def build_initial_message(
             ek_pub_a,
             opk_pub_b,
             ik_pq_pub_a,
+            pq_ek_pub,
             pq_ct,
         ),
         ik_pq_pub=ik_pq_pub_a,
+        pq_ek_pub=pq_ek_pub,
         pq_ct=pq_ct,
     )
