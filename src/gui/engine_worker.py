@@ -174,6 +174,10 @@ class EngineWorker(QThread):
             "privacy": dict(engine.privacy),
             "moments": list(engine.moments),
             "dropbox": engine.store.list_dropbox(),
+            "group_incoming": list(engine.group_incoming),
+            "group_outgoing": list(engine.group_outgoing),
+            "group_requests": list(engine.group_requests),
+            "group_joining": list(engine.group_joining),
         }
 
     def _emit_file_progress(self, local_id: str, done: int, total: int) -> None:
@@ -316,6 +320,31 @@ class EngineWorker(QThread):
         elif action == "search_users":
             found = await engine.search_users(str(payload.get("query") or ""))
             self.actionResult.emit(action, True, found)
+        elif action == "search_groups":
+            found = await engine.search_groups(str(payload.get("query") or ""))
+            self.actionResult.emit(action, True, found)
+        elif action == "group_respond":
+            await engine.respond_group(str(payload["group"]), bool(payload.get("accept")))
+            note = "已同意入群" if payload.get("accept") else "已拒绝入群"
+            self.actionResult.emit(action, True, note)
+            self.snapshot.emit(self._snapshot())
+        elif action == "group_approve":
+            await engine.approve_group(
+                str(payload["group"]),
+                str(payload["username"]),
+                bool(payload.get("accept")),
+            )
+            note = "已同意入群" if payload.get("accept") else "已拒绝入群"
+            self.actionResult.emit(action, True, note)
+            self.snapshot.emit(self._snapshot())
+        elif action == "group_join":
+            await engine.request_group(str(payload["group"]))
+            self.actionResult.emit(action, True, "已申请加入，等待对方同意")
+            self.snapshot.emit(self._snapshot())
+        elif action == "group_deny":
+            await engine.approve_group(str(payload["group"]), str(payload["username"]), False)
+            self.actionResult.emit(action, True, "已拒绝入群")
+            self.snapshot.emit(self._snapshot())
         elif action == "profile_set":
             saved = await engine.profile_set(
                 str(payload.get("display_name") or ""),

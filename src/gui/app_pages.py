@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -88,12 +89,10 @@ def _pixmap(data_b64: str, edge: int) -> QPixmap | None:
     image = QImage()
     if not image.loadFromData(raw, "JPEG") or image.isNull():
         return None
-    return QPixmap.fromImage(image).scaled(
-        edge,
-        edge,
-        Qt.AspectRatioMode.KeepAspectRatio,
-        Qt.TransformationMode.SmoothTransformation,
-    )
+    pix = QPixmap.fromImage(image)
+    if pix.width() > edge:
+        pix = pix.scaledToWidth(edge, Qt.TransformationMode.SmoothTransformation)
+    return pix
 
 
 class PeoplePanel(QWidget):
@@ -107,6 +106,12 @@ class PeoplePanel(QWidget):
     unblockClicked = Signal(str)
     messageClicked = Signal(str)
     addClicked = Signal(str)
+    groupAcceptClicked = Signal(str)
+    groupRejectClicked = Signal(str)
+    groupApproveClicked = Signal(str, str)
+    groupDenyClicked = Signal(str, str)
+    groupJoinClicked = Signal(str)
+    groupOpenClicked = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -128,6 +133,10 @@ class PeoplePanel(QWidget):
         blocked: list[dict[str, Any]] | None = None,
         rejected: list[dict[str, Any]] | None = None,
         results: list[dict[str, Any]] | None = None,
+        group_invites: list[dict[str, Any]] | None = None,
+        group_outgoing: list[dict[str, Any]] | None = None,
+        group_requests: list[dict[str, Any]] | None = None,
+        group_results: list[dict[str, Any]] | None = None,
     ) -> None:
         incoming = list(incoming or [])
         outgoing = list(outgoing or [])
@@ -135,11 +144,45 @@ class PeoplePanel(QWidget):
         rejected = list(rejected or [])
         blocked = list(blocked or [])
         results = list(results or [])
-        payload = (friends, incoming, outgoing, blocked, rejected, results)
+        group_invites = list(group_invites or [])
+        group_outgoing = list(group_outgoing or [])
+        group_requests = list(group_requests or [])
+        group_results = list(group_results or [])
+        payload = (
+            friends,
+            incoming,
+            outgoing,
+            blocked,
+            rejected,
+            results,
+            group_invites,
+            group_outgoing,
+            group_requests,
+            group_results,
+        )
         if payload == getattr(self, "_payload", None):
             return
         self._payload = payload
         _clear(self._body)
+        if group_invites:
+            self._body.addWidget(_section("群邀请"))
+            for item in group_invites:
+                self._body.addWidget(self._group_invite_card(item))
+        if group_requests:
+            self._body.addWidget(_section("入群申请"))
+            for item in group_requests:
+                self._body.addWidget(self._group_request_card(item))
+        if group_outgoing:
+            self._body.addWidget(_section("等待对方入群"))
+            for item in group_outgoing:
+                self._body.addWidget(self._group_outgoing_card(item))
+        if group_results:
+            self._body.addWidget(_section("搜到的群"))
+            invited = {str(item.get("group") or "") for item in group_invites}
+            for item in group_results:
+                if item.get("relation") == "invited" and str(item.get("name") or "") in invited:
+                    continue
+                self._body.addWidget(self._group_result_card(item))
         if results:
             self._body.addWidget(_section("搜索结果"))
             for item in results:
@@ -160,7 +203,7 @@ class PeoplePanel(QWidget):
             self._body.addWidget(_section("好友"))
             for item in friends:
                 self._body.addWidget(self._friend_card(item))
-        elif not incoming and not results:
+        elif not incoming and not results and not group_invites and not group_requests and not group_results:
             empty = QLabel("还没有好友")
             empty.setObjectName("secondary")
             empty.setContentsMargins(12, 8, 12, 8)
@@ -188,6 +231,102 @@ class PeoplePanel(QWidget):
         height = min(max(height, 1), 360)
         self.setMinimumHeight(height)
         self.setMaximumHeight(height)
+
+    def _group_invite_card(self, item: dict[str, Any]) -> QWidget:
+        group = str(item.get("group") or "")
+        frame, layout = _row()
+        title = QLabel(group)
+        title.setObjectName("name")
+        meta = QLabel(f"{item.get('inviter') or '好友'} 邀请你加入")
+        meta.setObjectName("caption")
+        meta.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(meta)
+        buttons = QHBoxLayout()
+        agree = _button("同意")
+        agree.setObjectName(f"agree-{group}")
+        decline = _button("拒绝", "quiet")
+        decline.setObjectName(f"decline-{group}")
+        agree.clicked.connect(lambda _checked=False, name=group: self.groupAcceptClicked.emit(name))
+        decline.clicked.connect(lambda _checked=False, name=group: self.groupRejectClicked.emit(name))
+        buttons.addWidget(agree)
+        buttons.addWidget(decline)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+        return frame
+
+    def _group_request_card(self, item: dict[str, Any]) -> QWidget:
+        group = str(item.get("group") or "")
+        username = str(item.get("username") or "")
+        frame, layout = _row()
+        title = QLabel(group)
+        title.setObjectName("name")
+        meta = QLabel(f"{username} 申请加入")
+        meta.setObjectName("caption")
+        layout.addWidget(title)
+        layout.addWidget(meta)
+        buttons = QHBoxLayout()
+        allow = _button("同意")
+        allow.setObjectName(f"allow-{group}-{username}")
+        deny = _button("拒绝", "quiet")
+        deny.setObjectName(f"deny-{group}-{username}")
+        allow.clicked.connect(
+            lambda _checked=False, name=group, user=username: self.groupApproveClicked.emit(name, user)
+        )
+        deny.clicked.connect(
+            lambda _checked=False, name=group, user=username: self.groupDenyClicked.emit(name, user)
+        )
+        buttons.addWidget(allow)
+        buttons.addWidget(deny)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+        return frame
+
+    def _group_outgoing_card(self, item: dict[str, Any]) -> QWidget:
+        frame, layout = _row()
+        title = QLabel(str(item.get("group") or ""))
+        title.setObjectName("name")
+        meta = QLabel(f"已邀请 {item.get('username') or ''}，等待同意")
+        meta.setObjectName("caption")
+        meta.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(meta)
+        return frame
+
+    def _group_result_card(self, item: dict[str, Any]) -> QWidget:
+        name = str(item.get("name") or "")
+        relation = str(item.get("relation") or "")
+        frame, layout = _row()
+        title = QLabel(name)
+        title.setObjectName("name")
+        notes = {
+            "member": "已加入",
+            "invited": f"{item.get('inviter') or '好友'} 邀请你加入",
+            "requested": "已申请，等待同意",
+            "joining": "正在加入",
+            "discover": f"{item.get('via') or '好友'} 的群 · {item.get('size') or 0} 人",
+        }
+        meta = QLabel(notes.get(relation, "群聊"))
+        meta.setObjectName("caption")
+        meta.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(meta)
+        if relation == "member":
+            open_button = _button("打开")
+            open_button.setObjectName(f"open-group-{name}")
+            open_button.clicked.connect(lambda _checked=False, group=name: self.groupOpenClicked.emit(group))
+            layout.addWidget(open_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        elif relation == "invited":
+            agree = _button("同意")
+            agree.setObjectName(f"agree-{name}")
+            agree.clicked.connect(lambda _checked=False, group=name: self.groupAcceptClicked.emit(group))
+            layout.addWidget(agree, alignment=Qt.AlignmentFlag.AlignLeft)
+        elif relation == "discover":
+            ask = _button("申请加入")
+            ask.setObjectName(f"ask-{name}")
+            ask.clicked.connect(lambda _checked=False, group=name: self.groupJoinClicked.emit(group))
+            layout.addWidget(ask, alignment=Qt.AlignmentFlag.AlignLeft)
+        return frame
 
     def _person_row(self, item: dict[str, Any], extra: str = "") -> QHBoxLayout:
         row = QHBoxLayout()
@@ -318,6 +457,10 @@ class MomentComposer(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(8)
+        hint = QLabel("写给好友。发出去之后存在服务器上。")
+        hint.setObjectName("caption")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
         self.body = QTextEdit()
         self.body.setObjectName("plain")
         self.body.setPlaceholderText("这一刻的想法…")
@@ -391,34 +534,69 @@ class MomentBoard(QWidget):
         super().__init__(parent)
         self.setObjectName("chat")
         self._host = QWidget()
-        self._body = QVBoxLayout(self._host)
-        self._body.setContentsMargins(0, 0, 0, 0)
-        self._body.setSpacing(0)
+        host = QHBoxLayout(self._host)
+        host.setContentsMargins(16, 18, 16, 28)
+        host.setSpacing(0)
+        host.addStretch(1)
+        self._column = QWidget()
+        self._column.setObjectName("momentColumn")
+        column = QVBoxLayout(self._column)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(12)
+        title = QLabel("朋友圈")
+        title.setObjectName("title")
+        hint = QLabel("文字和图片在服务器上，好友可以点赞、评论。聊天内容仍然是加密的。")
+        hint.setObjectName("caption")
+        hint.setWordWrap(True)
+        column.addWidget(title)
+        column.addWidget(hint)
+        self._cards = QVBoxLayout()
+        self._cards.setContentsMargins(0, 4, 0, 0)
+        self._cards.setSpacing(12)
+        column.addLayout(self._cards)
+        host.addWidget(self._column, 0)
+        host.addStretch(1)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         outer.addWidget(_scroll(self._host), 1)
+        self._moments: list[dict[str, Any]] | None = None
         self.set_moments([])
 
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit_column()
+
+    def _fit_column(self) -> None:
+        width = min(520, max(280, self.width() - 48))
+        if self._column.width() != width:
+            self._column.setFixedWidth(width)
+
     def set_moments(self, moments: list[dict[str, Any]]) -> None:
-        if moments == getattr(self, "_moments", None):
+        if moments == self._moments:
             return
         self._moments = list(moments)
-        _clear(self._body)
+        _clear(self._cards)
         if not moments:
             empty = QLabel("还没有动态")
             empty.setObjectName("secondary")
-            empty.setContentsMargins(16, 18, 16, 8)
-            self._body.addWidget(empty)
+            empty.setWordWrap(True)
+            self._cards.addWidget(empty)
         for item in moments:
-            self._body.addWidget(self._card(item))
-        self._body.addStretch(1)
+            self._cards.addWidget(self._card(item))
+        self._cards.addStretch(1)
+        self._fit_column()
 
     def _card(self, item: dict[str, Any]) -> QWidget:
-        frame, layout = _row()
+        frame = QFrame()
+        frame.setObjectName("momentCard")
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
         moment_id = str(item.get("id") or "")
         head = QHBoxLayout()
-        avatar = AvatarWidget(36)
+        head.setSpacing(10)
+        avatar = AvatarWidget(40)
         avatar.set_person(
             str(item.get("display_name") or item.get("author") or ""),
             avatar=str(item.get("avatar") or ""),
@@ -439,14 +617,16 @@ class MomentBoard(QWidget):
         if body:
             content = QLabel(body)
             content.setWordWrap(True)
-            content.setObjectName("name")
+            content.setObjectName("momentBody")
+            content.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             content.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             layout.addWidget(content)
-        pix = _pixmap(str(item.get("image") or ""), 280)
+        pix = _pixmap(str(item.get("image") or ""), 360)
         if pix is not None:
             picture = QLabel()
+            picture.setObjectName("momentImage")
             picture.setPixmap(pix)
-            layout.addWidget(picture)
+            layout.addWidget(picture, alignment=Qt.AlignmentFlag.AlignLeft)
         elif item.get("has_image"):
             waiting = QLabel("图片加载中")
             waiting.setObjectName("caption")
@@ -464,12 +644,22 @@ class MomentBoard(QWidget):
             actions.addWidget(delete)
         actions.addStretch(1)
         layout.addLayout(actions)
-        for comment in item.get("comments") or []:
-            line = QLabel(f"{comment.get('display_name') or comment.get('author')}：{comment.get('body')}")
-            line.setWordWrap(True)
-            line.setObjectName("secondary")
-            layout.addWidget(line)
+        comments = list(item.get("comments") or [])
+        if comments:
+            talk = QFrame()
+            talk.setObjectName("momentTalk")
+            talk_layout = QVBoxLayout(talk)
+            talk_layout.setContentsMargins(10, 8, 10, 8)
+            talk_layout.setSpacing(4)
+            for comment in comments:
+                line = QLabel(f"{comment.get('display_name') or comment.get('author')}：{comment.get('body')}")
+                line.setWordWrap(True)
+                line.setObjectName("secondary")
+                line.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+                talk_layout.addWidget(line)
+            layout.addWidget(talk)
         comment_row = QHBoxLayout()
+        comment_row.setSpacing(8)
         edit = QLineEdit()
         edit.setPlaceholderText("评论")
         send = _button("发送")

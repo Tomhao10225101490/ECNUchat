@@ -78,7 +78,7 @@ HELP_TEXT = """命令
   /friend remove 名字      删除好友，或取消自己发出的申请
   /friend block 名字       拉黑。取消拉黑用 /friend remove
   /friends                 好友、申请、未通过、黑名单
-  /search 关键字           按用户名或昵称搜索
+  /search 关键字           按用户名、昵称或群名搜索
   /chat 名字              打开单聊
   /file 路径              加密发送图片、视频或文件，最大 8GiB
   /moment 正文            发一条朋友圈。/moment 查看
@@ -89,9 +89,13 @@ HELP_TEXT = """命令
   /privacy search on|off  是否允许被搜索
   /fingerprint 名字       16 组身份指纹，线下核对
   /pq status 名字         混合握手与 PQ 棘轮状态
-  /group create 群名 成员…
-  /group add 群名 新成员
-  /group 群名             打开群
+  /group create 群名 成员…  建群并邀请。对方同意后才进群
+  /group add 群名 新成员   邀请好友，等待对方同意
+  /group accept 群名       同意入群邀请
+  /group reject 群名       拒绝入群邀请
+  /group approve 群名 名字 同意别人的入群申请
+  /group deny 群名 名字    拒绝别人的入群申请
+  /group 群名             打开已加入的群
   /users                  在线列表
   /history                当前会话记录
   /theme telegram|wechat  切换蓝色/微信绿色风格

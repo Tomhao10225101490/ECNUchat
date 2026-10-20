@@ -582,3 +582,136 @@ def test_large_video_preview_and_receive_progress(tmp_path) -> None:
     window.grab().save(str(tmp_path / "video-bubble.png"))
     window.hide()
 
+
+def _jpeg_b64() -> str:
+    import base64
+
+    from PySide6.QtCore import QBuffer, QIODevice
+    from PySide6.QtGui import QImage
+
+    image = QImage(80, 40, QImage.Format.Format_RGB32)
+    image.fill(0xFF2B5278)
+    buf = QBuffer()
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    assert image.save(buf, "JPEG", 80)
+    return base64.b64encode(bytes(buf.data())).decode("ascii")
+
+
+def test_moment_cards_stay_in_a_centered_column() -> None:
+    from PySide6.QtWidgets import QLabel, QLineEdit, QWidget
+
+    qt = app()
+    worker = FakeWorker()
+    window = MainWindow(worker, snapshot())
+    window.resize(1180, 760)
+    window.show()
+    window._show_page(2)
+    qt.processEvents()
+    window.moment_board.set_moments(
+        [
+            {
+                "id": "m1",
+                "author": "alice",
+                "display_name": "爱丽丝",
+                "body": "今天把实验记录写完了。" * 12,
+                "image": _jpeg_b64(),
+                "likes": ["bob"],
+                "comments": [{"author": "bob", "display_name": "bob", "body": "看到了"}],
+                "created": time.time(),
+                "mine": True,
+                "visibility": "friends",
+            }
+        ]
+    )
+    qt.processEvents()
+    column = window.moment_board.findChild(QWidget, "momentColumn")
+    body = window.moment_board.findChild(QLabel, "momentBody")
+    image = window.moment_board.findChild(QLabel, "momentImage")
+    edit = window.moment_board.findChild(QLineEdit)
+    assert column is not None and body is not None and image is not None and edit is not None
+    assert column.width() <= 520
+    assert window.moment_board.width() > column.width()
+    assert body.wordWrap()
+    assert body.width() <= column.width()
+    pix = image.pixmap()
+    assert pix is not None and not pix.isNull()
+    assert pix.width() <= 360
+    assert edit.width() <= column.width()
+    window.hide()
+    qt.processEvents()
+
+
+def test_empty_group_invite_and_group_search() -> None:
+    from PySide6.QtWidgets import QPushButton
+
+    qt = app()
+    worker = FakeWorker()
+    data = snapshot()
+    data["recent"] = []
+    data["groups"] = {"三人组": ["alice", "bob", "carol"], "安静群": ["alice"]}
+    data["friends"] = [
+        {"username": "bob", "display_name": "bob", "bio": "", "avatar": "preset:1", "online": True}
+    ]
+    data["incoming"] = []
+    data["outgoing"] = []
+    data["blocked"] = []
+    data["rejected"] = []
+    data["group_incoming"] = [
+        {"group": "夜谈", "username": "alice", "inviter": "bob", "kind": "invite", "status": "pending"}
+    ]
+    window = MainWindow(worker, data)
+    window.show()
+    qt.processEvents()
+    keys = [item.key for item in window.conversations._model.items]
+    assert "group:安静群" in keys
+    assert "group:三人组" in keys
+    assert "dm:bob" in keys
+    quiet = next(item for item in window.conversations._model.items if item.key == "group:安静群")
+    assert quiet.preview == "还没有消息"
+    assert "invite:夜谈" in keys
+
+    window.search.setText("安静")
+    window.perform_search()
+    qt.processEvents()
+    assert [item.key for item in window.conversations._model.items] == ["group:安静群"]
+
+    window.search.clear()
+    window.perform_search()
+    window.open_conversation("invite:夜谈")
+    qt.processEvents()
+    assert window.invite_bar.isVisible()
+    assert not window.composer_bar.isVisible()
+    assert not window.empty_state.isVisible()
+    assert window.messages.isVisible()
+    assert window.chat_subtitle.text() == "等待你同意"
+    window.composer.setPlainText("还没进群")
+    window.send_current()
+    assert window.toast.text() == "先同意加入，才能在群里发消息"
+    assert not any(command == "send" for command, _payload in worker.commands)
+
+    window.invite_ok.click()
+    qt.processEvents()
+    action, payload = worker.commands[-1]
+    assert action == "group_respond"
+    assert payload == {"group": "夜谈", "accept": True}
+
+    window._show_page(1)
+    qt.processEvents()
+    agree = window.people_panel.findChild(QPushButton, "agree-夜谈")
+    assert agree is not None
+    agree.click()
+    qt.processEvents()
+    assert ("group_respond", {"group": "夜谈", "accept": True}) in worker.commands
+
+    window._show_page(0)
+    window.search.setText("夜谈")
+    window._group_hits = [
+        {"name": "夜谈", "relation": "discover", "size": 2, "via": "bob"}
+    ]
+    window.perform_search()
+    assert [item.key for item in window.conversations._model.items] == ["invite:夜谈", "find:夜谈"]
+    window._activate_key("find:夜谈")
+    assert worker.commands[-1] == ("group_join", {"group": "夜谈"})
+    window.hide()
+    qt.processEvents()
+

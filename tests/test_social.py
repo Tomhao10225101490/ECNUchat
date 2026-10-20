@@ -175,3 +175,88 @@ async def _social(tmp_path: Path) -> None:
         await bob.close()
         await carol.close()
         await dave.close()
+
+
+def test_group_consent_search_and_empty_group(tmp_path: Path) -> None:
+    asyncio.run(_group_consent(tmp_path))
+
+
+async def _wait_member(group: str, member: str, *hosts: ChatEngine, timeout: float = 12.0) -> None:
+    await wait_until(
+        lambda: all(member in host.groups.get(group, []) for host in hosts),
+        timeout=timeout,
+    )
+
+
+async def _group_consent(tmp_path: Path) -> None:
+    store = ServerStore(tmp_path / "server.db")
+    server = ChatServer(store)
+    async with websockets.serve(server.handler, "127.0.0.1", 0, max_size=64 * 1024) as srv:
+        uri = f"ws://127.0.0.1:{srv.sockets[0].getsockname()[1]}"
+        alice = engine(tmp_path, "alice")
+        bob = engine(tmp_path, "bob")
+        carol = engine(tmp_path, "carol")
+        eve = engine(tmp_path, "eve")
+        await alice.connect(uri)
+        await bob.connect(uri)
+        await carol.connect(uri)
+        await eve.connect(uri)
+
+        await alice.friend_request("bob", "一起")
+        await bob.friend_respond("alice", True)
+        await wait_until(lambda: "bob" in alice.friend_names() and "alice" in bob.friend_names())
+        await alice.friend_request("carol", "一起")
+        await carol.friend_respond("alice", True)
+        await wait_until(lambda: "carol" in alice.friend_names())
+
+        with pytest.raises(ProtocolError, match="至少邀请"):
+            await alice.create_group("一个人", [])
+
+        await alice.create_group("安静群", ["bob"])
+        assert alice.groups["安静群"] == ["alice"]
+        assert "安静群" not in bob.groups
+        notice = alice.store.get_history("group:安静群")
+        assert notice and notice[0][0] == "系统" and "等待同意" in notice[0][1]
+        with pytest.raises(ProtocolError, match="同意"):
+            await alice.add_group_member("安静群", "bob")
+
+        invited = await bob.search_groups("安静")
+        hit = next(item for item in invited["groups"] if item["name"] == "安静群")
+        assert hit["relation"] == "invited"
+        assert hit["inviter"] == "alice"
+
+        discovered = await carol.search_groups("静群")
+        found = next(item for item in discovered["groups"] if item["name"] == "安静群")
+        assert found["relation"] == "discover"
+        assert found["via"] == "alice"
+        assert "members" not in found
+
+        hidden = await eve.search_groups("安静")
+        assert hidden["groups"] == []
+        with pytest.raises(ProtocolError, match="好友"):
+            await eve.request_group("安静群")
+
+        await bob.respond_group("安静群", True)
+        await _wait_member("安静群", "bob", alice, bob)
+        history = alice.store.get_history("group:安静群")
+        assert history and all(sender == "系统" for sender, _body, _ts in history)
+
+        await carol.request_group("安静群")
+        await wait_until(
+            lambda: any(item.get("username") == "carol" for item in alice.group_requests)
+        )
+        await alice.approve_group("安静群", "carol", True)
+        await _wait_member("安静群", "carol", alice, bob, carol)
+
+        await alice.create_group("拒绝群", ["bob"])
+        with pytest.raises(ProtocolError, match="同意"):
+            await alice.add_group_member("拒绝群", "bob")
+        await bob.respond_group("拒绝群", False)
+        assert "拒绝群" not in bob.groups
+        with pytest.raises(ProtocolError, match="同意"):
+            await alice.add_group_member("拒绝群", "bob")
+
+        await alice.close()
+        await bob.close()
+        await carol.close()
+        await eve.close()

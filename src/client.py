@@ -149,6 +149,12 @@ class ChatEngine:
     profile: dict[str, Any] = field(default_factory=dict)
     privacy: dict[str, Any] = field(default_factory=dict)
     moments: list[dict[str, Any]] = field(default_factory=list)
+    group_incoming: list[dict[str, Any]] = field(default_factory=list)
+    group_outgoing: list[dict[str, Any]] = field(default_factory=list)
+    group_requests: list[dict[str, Any]] = field(default_factory=list)
+    group_joining: list[dict[str, Any]] = field(default_factory=list)
+    _sign_queue: set[tuple[str, str]] = field(default_factory=set)
+    _group_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     _send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     ws: Any = None
     _waiters: dict[str, asyncio.Future] = field(default_factory=dict)
@@ -177,6 +183,7 @@ class ChatEngine:
             identity=identity,
         )
         engine.groups = store.load_groups()
+        engine._sign_queue = engine._load_sign_queue()
         for name in engine.groups:
             engine.group_chain[name] = store.load_group_chain(name)
         for peer in store.list_sessions():
@@ -299,6 +306,10 @@ class ChatEngine:
             await self.refresh_social()
         except Exception:
             self.last_error = "好友和朋友圈将在下次同步"
+        try:
+            await self.refresh_group_invites()
+        except Exception:
+            self.last_error = "群邀请将在下次同步"
 
     async def _retry_outboxes(self) -> None:
         """重连后重发原始加密信封，不再次推进双棘轮。"""
@@ -446,7 +457,15 @@ class ChatEngine:
                 if waiter is not None and not waiter.done():
                     waiter.set_result(msg)
                     delivered = True
-                if typ in {"envelope", "group_update", "presence", "social_update", "moment_update"} or (
+                if typ in {
+                    "envelope",
+                    "group_update",
+                    "presence",
+                    "social_update",
+                    "moment_update",
+                    "group_invite",
+                    "group_join_ready",
+                } or (
                     typ == "error" and not delivered
                 ):
                     await self._incoming_raw.put(msg)
@@ -492,6 +511,12 @@ class ChatEngine:
             except Exception:
                 self.last_error = "朋友圈刷新失败"
             await self.inbox.put(Incoming("系统", "", None, "moment"))
+        elif typ == "group_invite":
+            await self._refresh_group_invites_quietly()
+            await self.inbox.put(Incoming("系统", "", None, "presence"))
+        elif typ == "group_join_ready":
+            await self._complete_join(str(msg.get("group") or ""), str(msg.get("username") or ""))
+            await self.inbox.put(Incoming("系统", "", None, "presence"))
         elif typ == "error":
             self.last_error = msg.get("message")
             await self.inbox.put(Incoming("", "", None, "sys", self.last_error))
@@ -526,12 +551,15 @@ class ChatEngine:
             chain_now = self.group_chain.get(name) or []
             if not chain_now or chain_now[-1].epoch < state.epoch:
                 self._fail("", name, f"群状态签名无效，已拒绝：{exc}")
+                return
+            await self._refresh_group_invites_quietly()
             return
         chain.append(state)
         self.group_chain[name] = chain
         self.groups[name] = list(state.members)
         self.store.save_group_state(state)
         self.store.save_group(name, list(state.members))
+        await self._refresh_group_invites_quietly()
 
     async def sync_group(self, name: str) -> None:
         """补拉群状态链并整体验证。漏投状态（而非伪造）靠这里发现。"""
@@ -1654,35 +1682,150 @@ class ChatEngine:
                 return sender in state.members
         return False
 
+    def _load_sign_queue(self) -> set[tuple[str, str]]:
+        raw = self.store.load_ui_value("group_sign_queue", "[]")
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return set()
+        found: set[tuple[str, str]] = set()
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    found.add((str(item[0]), str(item[1])))
+        return found
+
+    def _save_sign_queue(self) -> None:
+        self.store.save_ui_value(
+            "group_sign_queue",
+            json.dumps(sorted(self._sign_queue), ensure_ascii=False),
+        )
+
+    def _apply_group_invites(self, msg: dict[str, Any]) -> None:
+        self.group_incoming = list(msg.get("incoming") or [])
+        self.group_outgoing = list(msg.get("outgoing") or [])
+        self.group_requests = list(msg.get("requests") or [])
+        self.group_joining = list(msg.get("joining") or [])
+
+    async def _refresh_group_invites_quietly(self) -> None:
+        try:
+            await self.refresh_group_invites()
+        except Exception:
+            self.last_error = "群邀请刷新失败"
+
+    async def refresh_group_invites(self) -> None:
+        state = await self.request({"type": "group_invite_sync"}, "group_invites")
+        self._apply_group_invites(state)
+        for item in list(state.get("ready") or []):
+            await self._complete_join(str(item.get("group") or ""), str(item.get("username") or ""))
+
+    async def _complete_join(self, group: str, username: str) -> None:
+        """对方已经同意后，由当初发出邀请或点了同意的成员补签群状态。"""
+        if not group or not username or username == self.username:
+            return
+        if (group, username) not in self._sign_queue:
+            return
+        lock = self._group_locks.setdefault(group, asyncio.Lock())
+        async with lock:
+            if (group, username) not in self._sign_queue:
+                return
+            if group not in self.group_chain:
+                try:
+                    await self.sync_group(group)
+                except ProtocolError:
+                    return
+            if group not in self.group_chain:
+                return
+            if username in set(self.groups.get(group, [])):
+                self._sign_queue.discard((group, username))
+                self._save_sign_queue()
+                return
+            try:
+                await self.add_group_member(group, username)
+            except ProtocolError as exc:
+                text = str(exc)
+                if "已在" in text:
+                    self._sign_queue.discard((group, username))
+                    self._save_sign_queue()
+                    return
+                if "同意" in text or "新增" in text:
+                    return
+                self.last_error = text
+                await self.inbox.put(Incoming("", "", group, "sys", text))
+                return
+            self._sign_queue.discard((group, username))
+            self._save_sign_queue()
+
     async def create_group(self, name: str, members: list[str]) -> None:
-        all_members = list(dict.fromkeys([self.username, *members]))
+        invites = [member for member in dict.fromkeys(members) if member and member != self.username]
         state = build_genesis_state(
-            self.identity.ik_sign_priv, name, self.username, all_members
+            self.identity.ik_sign_priv, name, self.username, [self.username]
         )
         await self.request(
             {
                 "type": "group_create",
                 "group": name,
-                "members": all_members,
+                "invites": invites,
                 "state": encode_group_state(state),
             },
             "group_update",
         )
         self.group_chain[name] = [state]
-        self.groups[name] = all_members
+        self.groups[name] = [self.username]
         self.store.save_group_state(state)
-        self.store.save_group(name, all_members)
+        self.store.save_group(name, [self.username])
         self.current_group = name
         self.current_peer = None
-        notice = f"{self.username} 创建了群，成员 {', '.join(all_members)}"
+        for member in invites:
+            self._sign_queue.add((name, member))
+        self._save_sign_queue()
+        notice = f"你创建了群 {name}"
+        if invites:
+            notice += f"，已邀请 {'、'.join(invites)}，等待同意"
         self.store.add_history(f"group:{name}", "系统", notice)
-        gstate = state.state_hash().hex()
-        for other in all_members:
-            if other == self.username:
-                continue
-            await self._send_one(
-                other, notice, group=name, kind="group_meta", gstate=gstate
-            )
+        await self.refresh_group_invites()
+
+    async def invite_group_member(self, name: str, member: str) -> None:
+        result = await self.request(
+            {"type": "group_invite", "group": name, "username": member},
+            "group_invites",
+        )
+        self._apply_group_invites(result)
+        self._sign_queue.add((name, member))
+        self._save_sign_queue()
+
+    async def respond_group(self, name: str, accept: bool) -> None:
+        result = await self.request(
+            {"type": "group_respond", "group": name, "accept": bool(accept)},
+            "group_invites",
+        )
+        self._apply_group_invites(result)
+
+    async def request_group(self, name: str) -> None:
+        result = await self.request(
+            {"type": "group_join_request", "group": name},
+            "group_invites",
+        )
+        self._apply_group_invites(result)
+
+    async def approve_group(self, name: str, member: str, accept: bool) -> None:
+        result = await self.request(
+            {
+                "type": "group_approve",
+                "group": name,
+                "username": member,
+                "accept": bool(accept),
+            },
+            "group_invites",
+        )
+        self._apply_group_invites(result)
+        if accept:
+            self._sign_queue.add((name, member))
+            self._save_sign_queue()
+            await self._complete_join(name, member)
+
+    async def search_groups(self, query: str) -> dict[str, Any]:
+        return await self.request({"type": "group_search", "query": query}, "group_search")
 
     async def add_group_member(self, name: str, member: str) -> None:
         previous = self._verified_group_state(name)
@@ -1733,7 +1876,7 @@ def print_banner(engine: ChatEngine) -> None:
     console.print(Panel(body, title=PROJECT_NAME, border_style="cyan"))
     console.print(
         "[dim]/chat 名字  /fingerprint 名字  /group create 群名 成员…  "
-        "/group add 群名 新成员  /file 路径  /pq status 名字  /history  /users  /help  /quit[/dim]"
+        "/group add 群名 新成员  /group accept 群名  /file 路径  /history  /help  /quit[/dim]"
     )
 
 
@@ -1902,11 +2045,28 @@ async def handle_line(engine: ChatEngine, line: str) -> CommandResult:
             rows.extend(f"  {item['username']}" for item in engine.blocked_users)
         return CommandResult(overlay="\n".join(rows))
     if cmd == "/search" and len(parts) >= 2:
-        found = await engine.search_users(line.split(maxsplit=1)[1])
-        rows = ["用户          关系"]
-        for item in found.get("users") or []:
-            rows.append(f"{item['username']:<14}{item.get('relation') or ''}")
-        return CommandResult(overlay="\n".join(rows) if len(rows) > 1 else "没有匹配的用户")
+        query = line.split(maxsplit=1)[1]
+        found = await engine.search_users(query)
+        groups = await engine.search_groups(query)
+        rows: list[str] = []
+        users = list(found.get("users") or [])
+        if users:
+            rows.append("用户          关系")
+            for item in users:
+                rows.append(f"{item['username']:<14}{item.get('relation') or ''}")
+        labels = {
+            "member": "已加入",
+            "invited": "邀请你",
+            "requested": "已申请",
+            "joining": "正在加入",
+            "discover": "可申请",
+        }
+        found_groups = list(groups.get("groups") or [])
+        if found_groups:
+            rows.append("群聊          关系")
+            for item in found_groups:
+                rows.append(f"{item.get('name') or '':<14}{labels.get(item.get('relation'), '')}")
+        return CommandResult(overlay="\n".join(rows) if rows else "没有匹配的用户或群")
     if cmd == "/profile":
         if len(parts) == 1:
             profile = engine.profile
@@ -2012,10 +2172,22 @@ async def handle_line(engine: ChatEngine, line: str) -> CommandResult:
     if cmd == "/group" and len(parts) >= 2:
         if parts[1] == "create" and len(parts) >= 4:
             await engine.create_group(parts[2], parts[3:])
-            return CommandResult(notice=f"已创建群 {parts[2]}")
+            return CommandResult(notice=f"已创建群 {parts[2]}，等待对方同意")
         if parts[1] == "add" and len(parts) == 4:
-            await engine.add_group_member(parts[2], parts[3])
-            return CommandResult(notice=f"已将 {parts[3]} 加入 {parts[2]}")
+            await engine.invite_group_member(parts[2], parts[3])
+            return CommandResult(notice=f"已邀请 {parts[3]}，等待对方同意")
+        if parts[1] == "accept" and len(parts) == 3:
+            await engine.respond_group(parts[2], True)
+            return CommandResult(notice=f"已同意加入 {parts[2]}")
+        if parts[1] == "reject" and len(parts) == 3:
+            await engine.respond_group(parts[2], False)
+            return CommandResult(notice=f"已拒绝加入 {parts[2]}")
+        if parts[1] == "approve" and len(parts) == 4:
+            await engine.approve_group(parts[2], parts[3], True)
+            return CommandResult(notice=f"已同意 {parts[3]} 加入 {parts[2]}")
+        if parts[1] == "deny" and len(parts) == 4:
+            await engine.approve_group(parts[2], parts[3], False)
+            return CommandResult(notice=f"已拒绝 {parts[3]} 加入 {parts[2]}")
         if parts[1] not in engine.groups:
             raise ProtocolError(f"群 {parts[1]} 不存在")
         if parts[1] not in engine.group_chain:

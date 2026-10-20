@@ -801,6 +801,15 @@ class ServerStore:
                 body TEXT NOT NULL,
                 created REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS group_invites (
+                group_name TEXT NOT NULL,
+                username TEXT NOT NULL,
+                inviter TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                updated REAL NOT NULL,
+                PRIMARY KEY (group_name, username)
+            );
             """
         )
         user_cols = {
@@ -1020,6 +1029,170 @@ class ServerStore:
             (name, username),
         )
         self.conn.commit()
+
+    def list_group_names(self) -> list[str]:
+        rows = self.conn.execute("SELECT name FROM groups ORDER BY name").fetchall()
+        return [str(row[0]) for row in rows]
+
+    def upsert_group_invite(
+        self,
+        group: str,
+        username: str,
+        inviter: str,
+        kind: str,
+        status: str,
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO group_invites(group_name, username, inviter, kind, status, updated)
+                VALUES(?,?,?,?,?,?)
+                ON CONFLICT(group_name, username) DO UPDATE SET
+                    inviter=excluded.inviter,
+                    kind=excluded.kind,
+                    status=excluded.status,
+                    updated=excluded.updated
+                """,
+                (group, username, inviter, kind, status, time.time()),
+            )
+
+    def get_group_invite(self, group: str, username: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT inviter, kind, status, updated
+            FROM group_invites WHERE group_name=? AND username=?
+            """,
+            (group, username),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "group": group,
+            "username": username,
+            "inviter": str(row[0]),
+            "kind": str(row[1]),
+            "status": str(row[2]),
+            "updated": float(row[3]),
+        }
+
+    def delete_group_invite(self, group: str, username: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM group_invites WHERE group_name=? AND username=?",
+                (group, username),
+            )
+
+    def list_group_invites(
+        self,
+        *,
+        group: str | None = None,
+        username: str | None = None,
+        inviter: str | None = None,
+        status: str | None = None,
+        kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        args: list[str] = []
+        for column, value in (
+            ("group_name", group),
+            ("username", username),
+            ("inviter", inviter),
+            ("status", status),
+            ("kind", kind),
+        ):
+            if value is not None:
+                clauses.append(f"{column}=?")
+                args.append(value)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT group_name, username, inviter, kind, status, updated
+            FROM group_invites{where}
+            ORDER BY updated DESC
+            """,
+            args,
+        ).fetchall()
+        return [
+            {
+                "group": str(row[0]),
+                "username": str(row[1]),
+                "inviter": str(row[2]),
+                "kind": str(row[3]),
+                "status": str(row[4]),
+                "updated": float(row[5]),
+            }
+            for row in rows
+        ]
+
+    def pending_invite_count(self, group: str) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM group_invites WHERE group_name=? AND status='pending'",
+            (group,),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def search_groups(self, viewer: str, query: str) -> list[dict[str, Any]]:
+        """群名里的一段即可。只返回自己的群、邀请、以及好友已经在里面的群。"""
+        needle = query.strip().lower()
+        if not needle:
+            return []
+        friends = set(self.friend_names(viewer))
+        found: list[dict[str, Any]] = []
+        for name in self.list_group_names():
+            if needle not in name.lower():
+                continue
+            members = self.group_members(name)
+            invite = self.get_group_invite(name, viewer)
+            if viewer in members:
+                found.append(
+                    {
+                        "name": name,
+                        "relation": "member",
+                        "size": len(members),
+                        "members": members,
+                    }
+                )
+            elif (
+                invite is not None
+                and invite["status"] == "pending"
+                and invite["kind"] == "invite"
+            ):
+                found.append(
+                    {
+                        "name": name,
+                        "relation": "invited",
+                        "size": len(members),
+                        "inviter": invite["inviter"],
+                    }
+                )
+            elif (
+                invite is not None
+                and invite["status"] == "pending"
+                and invite["kind"] == "request"
+            ):
+                found.append(
+                    {
+                        "name": name,
+                        "relation": "requested",
+                        "size": len(members),
+                    }
+                )
+            elif invite is not None and invite["status"] == "accepted" and viewer not in members:
+                found.append({"name": name, "relation": "joining", "size": len(members)})
+            else:
+                overlap = [member for member in members if member in friends]
+                if overlap:
+                    found.append(
+                        {
+                            "name": name,
+                            "relation": "discover",
+                            "size": len(members),
+                            "via": overlap[0],
+                        }
+                    )
+            if len(found) >= 30:
+                break
+        return found
 
     def blob_get(self, blob_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(

@@ -39,6 +39,22 @@ async def make_friends(left: ChatEngine, right: ChatEngine) -> None:
     await right.friend_respond(left.username, True)
 
 
+async def accept_group(member: ChatEngine, group: str, *hosts: ChatEngine) -> None:
+    """被邀请的人点同意，邀请人的客户端补签之后，各端成员表里都有这个人。"""
+    await member.respond_group(group, True)
+    waiting = (member, *hosts)
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + 12
+    while loop.time() < deadline:
+        if all(member.username in host.groups.get(group, []) for host in waiting):
+            return
+        await asyncio.sleep(0.05)
+    missing = [
+        host.username for host in waiting if member.username not in host.groups.get(group, [])
+    ]
+    raise AssertionError(f"{member.username} 没有进入 {group}，还缺 {missing}")
+
+
 def test_e2e_chat_group_tamper_and_offline(tmp_path: Path) -> None:
     asyncio.run(_e2e(tmp_path))
 
@@ -120,7 +136,12 @@ async def _e2e(tmp_path: Path) -> None:
         assert (await wait_pred(bob, lambda i: i.error in {"重放拒绝", "GCM 失败"})).error
 
         # 群正文按成员各发一封双棘轮信封。Bob 与 Carol 各解自己的那一封。
+        # 创建时只有 alice 在成员表里，bob 和 carol 要点同意才会被签进群。
         await alice.create_group("三人组", ["bob", "carol"])
+        assert alice.groups["三人组"] == ["alice"]
+        assert "三人组" not in bob.groups
+        await accept_group(bob, "三人组", alice)
+        await accept_group(carol, "三人组", alice, bob)
         await alice.send_text("群里大家好", group="三人组")
         assert await wait_pred(bob, lambda i: i.text == "群里大家好")
         assert await wait_pred(carol, lambda i: i.text == "群里大家好")
@@ -129,7 +150,8 @@ async def _e2e(tmp_path: Path) -> None:
         dave = engine(tmp_path, "dave")
         await dave.connect(uri)
         await make_friends(alice, dave)
-        await alice.add_group_member("三人组", "dave")
+        await alice.invite_group_member("三人组", "dave")
+        await accept_group(dave, "三人组", alice, bob, carol)
         assert await wait_pred(bob, lambda i: i.group == "三人组", timeout=15)
         assert dave.username in bob.groups["三人组"]
         await alice.send_text("戴夫也能收到", group="三人组")

@@ -84,7 +84,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("e2ee-server")
 
-UNSOLICITED_TYPES = {"envelope", "presence", "social_update", "moment_update"}
+UNSOLICITED_TYPES = {
+    "envelope",
+    "presence",
+    "social_update",
+    "moment_update",
+    "group_invite",
+    "group_join_ready",
+}
 
 
 class RequestSocket:
@@ -212,10 +219,22 @@ class ChatServer:
             await self.on_group_create(ws, username, msg)
         elif typ == "group_add":
             await self.on_group_add(ws, username, msg)
+        elif typ == "group_invite":
+            await self.on_group_invite(ws, username, msg)
+        elif typ == "group_respond":
+            await self.on_group_respond(ws, username, msg)
+        elif typ == "group_join_request":
+            await self.on_group_join_request(ws, username, msg)
+        elif typ == "group_approve":
+            await self.on_group_approve(ws, username, msg)
+        elif typ == "group_invite_sync":
+            await self.on_group_invite_sync(ws, username)
+        elif typ == "group_search":
+            await self.on_group_search(ws, username, msg)
         elif typ == "group_info":
-            await self.on_group_info(ws, msg)
+            await self.on_group_info(ws, username, msg)
         elif typ == "group_sync":
-            await self.on_group_sync(ws, msg)
+            await self.on_group_sync(ws, username, msg)
         elif typ == "blob_begin":
             await self.on_blob_begin(ws, username, msg)
         elif typ == "blob_chunk":
@@ -544,44 +563,43 @@ class ChatServer:
         if self.store.group_exists(name):
             await ws.send(dumps(error_msg("群名已存在")))
             return
-        members = list(state.members)
-        if len(members) < 2:
-            await ws.send(dumps(error_msg("群至少需要两名成员")))
+        if state.signer != username or tuple(state.members) != (username,):
+            await ws.send(dumps(error_msg("创世状态只能有创建者本人，其他人要等对方同意")))
             return
-        if len(members) > MAX_GROUP_MEMBERS:
+        try:
+            invites = self._clean_invites(username, msg.get("invites"))
+        except ProtocolError as exc:
+            await ws.send(dumps(error_msg(str(exc))))
+            return
+        if not invites:
+            await ws.send(dumps(error_msg("至少邀请一名好友")))
+            return
+        if 1 + len(invites) > MAX_GROUP_MEMBERS:
             await ws.send(dumps(error_msg("群最多 8 人")))
             return
-        if state.signer != username or username not in members:
-            await ws.send(dumps(error_msg("只有创建者能签署创世状态")))
-            return
-        for m in members:
-            validate_username(m)
-            if not self.store.user_exists(m):
-                await ws.send(dumps(error_msg(f"成员 {m} 未注册")))
-                return
-            if m != username and not self.store.are_friends(username, m):
-                await ws.send(dumps(error_msg(f"{m} 还不是好友，先等对方同意申请")))
-                return
         try:
             verify_state_transition(None, state)
             verify_group_state_sig(state, self.store.get_user(state.signer)[0])
         except Exception as exc:
             await ws.send(dumps(error_msg(f"群状态签名无效：{exc}")))
             return
-        # 成员表仍是服务器状态，但现在只能是「由合法成员签署过的状态」：
-        # 服务器伪造不了，客户端还会自己再验一遍。
-        self.store.create_group(name, members)
+        # 创世名单只有创建者。邀请先记在服务器上，对方同意之后才由创建者补签拉人状态。
+        self.store.create_group(name, [username])
         self.store.save_group_state(state)
+        for member in invites:
+            self.store.upsert_group_invite(name, member, username, "invite", "pending")
         update = dumps(
             {
                 "type": "group_update",
                 "group": name,
-                "members": members,
+                "members": [username],
                 "state": encode_group_state(state),
             }
         )
-        await self._fanout_control(members, update)
-        log.info("group_create name=%s size=%s epoch=%s", name, len(members), state.epoch)
+        await self._fanout_control([username], update)
+        for member in invites:
+            await self._push_group_invite(name, member)
+        log.info("group_create name=%s invites=%s epoch=%s", name, len(invites), state.epoch)
 
     async def on_group_add(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
         try:
@@ -613,6 +631,13 @@ class ChatServer:
         if not self.store.are_friends(username, newbie):
             await ws.send(dumps(error_msg("只能把好友拉进群")))
             return
+        if newbie in last.members:
+            await ws.send(dumps(error_msg("已在群里")))
+            return
+        invite = self.store.get_group_invite(name, newbie)
+        if invite is None or invite["status"] != "accepted":
+            await ws.send(dumps(error_msg("对方还没同意入群")))
+            return
         if len(state.members) > MAX_GROUP_MEMBERS:
             await ws.send(dumps(error_msg("群最多 8 人")))
             return
@@ -623,6 +648,7 @@ class ChatServer:
             await ws.send(dumps(error_msg(f"群状态签名无效：{exc}")))
             return
         self.store.add_group_member(name, newbie)
+        self.store.delete_group_invite(name, newbie)
         self.store.save_group_state(state)
         members = list(state.members)
         update = dumps(
@@ -636,11 +662,227 @@ class ChatServer:
         await self._fanout_control(members, update)
         log.info("group_add name=%s member=%s epoch=%s", name, newbie, state.epoch)
 
-    async def on_group_info(self, ws: Any, msg: dict[str, Any]) -> None:
+    def _clean_invites(self, username: str, raw: Any) -> list[str]:
+        if raw is None:
+            return []
+        if not isinstance(raw, list):
+            raise ProtocolError("邀请名单无效")
+        cleaned: list[str] = []
+        for item in raw:
+            if not isinstance(item, str):
+                raise ProtocolError("邀请名单无效")
+            validate_username(item)
+            if item == username:
+                raise ProtocolError("不能邀请自己")
+            if item in cleaned:
+                continue
+            if not self.store.user_exists(item):
+                raise ProtocolError(f"成员 {item} 未注册")
+            if not self.store.are_friends(username, item):
+                raise ProtocolError(f"{item} 还不是好友，先等对方同意申请")
+            cleaned.append(item)
+        return cleaned
+
+    def _invite_view(self, group: str, username: str) -> dict[str, Any] | None:
+        invite = self.store.get_group_invite(group, username)
+        if invite is None:
+            return None
+        invite["size"] = len(self.store.group_members(group))
+        return invite
+
+    def _group_invite_state(self, username: str) -> dict[str, Any]:
+        incoming = self.store.list_group_invites(username=username, status="pending", kind="invite")
+        outgoing = self.store.list_group_invites(inviter=username, status="pending", kind="invite")
+        requests: list[dict[str, Any]] = []
+        for name in self.store.list_group_names():
+            if username not in self.store.group_members(name):
+                continue
+            requests.extend(
+                self.store.list_group_invites(group=name, status="pending", kind="request")
+            )
+        ready = []
+        for invite in self.store.list_group_invites(inviter=username, status="accepted"):
+            if invite["username"] in self.store.group_members(invite["group"]):
+                continue
+            ready.append(invite)
+        joining = [
+            invite
+            for invite in self.store.list_group_invites(username=username, status="accepted")
+            if username not in self.store.group_members(invite["group"])
+        ]
+        return {
+            "type": "group_invites",
+            "incoming": incoming,
+            "outgoing": outgoing,
+            "requests": requests,
+            "ready": ready,
+            "joining": joining,
+        }
+
+    async def _push_group_invite(self, group: str, username: str) -> None:
+        invite = self._invite_view(group, username)
+        if invite is None:
+            return
+        payload = {"type": "group_invite", **invite}
+        targets = {username}
+        if invite.get("inviter"):
+            targets.add(str(invite["inviter"]))
+        for member in self.store.group_members(group):
+            if invite.get("kind") == "request":
+                targets.add(member)
+        await self._fanout_control(sorted(targets), dumps(payload))
+
+    async def on_group_invite(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
+        name = str(msg.get("group") or "")
+        try:
+            validate_group_name(name)
+            newbie = str(msg.get("username") or "")
+            validate_username(newbie)
+        except ProtocolError as exc:
+            await ws.send(dumps(error_msg(str(exc))))
+            return
+        if not self.store.group_exists(name):
+            await ws.send(dumps(error_msg("群不存在")))
+            return
+        members = self.store.group_members(name)
+        if username not in members:
+            await ws.send(dumps(error_msg("只有群成员能邀请")))
+            return
+        if newbie == username:
+            await ws.send(dumps(error_msg("不能邀请自己")))
+            return
+        if newbie in members:
+            await ws.send(dumps(error_msg("已在群里")))
+            return
+        if not self.store.user_exists(newbie):
+            await ws.send(dumps(error_msg("新成员未注册")))
+            return
+        if not self.store.are_friends(username, newbie):
+            await ws.send(dumps(error_msg("只能邀请好友")))
+            return
+        existing = self.store.get_group_invite(name, newbie)
+        if existing and existing["status"] == "pending":
+            await ws.send(dumps(error_msg("已经邀请过，等待对方同意")))
+            return
+        if existing and existing["status"] == "accepted":
+            await ws.send(dumps(error_msg("对方已同意，正在加入")))
+            return
+        if len(members) + self.store.pending_invite_count(name) >= MAX_GROUP_MEMBERS:
+            await ws.send(dumps(error_msg("群最多 8 人")))
+            return
+        self.store.upsert_group_invite(name, newbie, username, "invite", "pending")
+        await ws.send(dumps(self._group_invite_state(username)))
+        await self._push_group_invite(name, newbie)
+        log.info("group_invite name=%s by=%s user=%s", name, username, newbie)
+
+    async def on_group_respond(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
+        name = str(msg.get("group") or "")
+        try:
+            validate_group_name(name)
+        except ProtocolError as exc:
+            await ws.send(dumps(error_msg(str(exc))))
+            return
+        invite = self.store.get_group_invite(name, username)
+        if invite is None or invite["status"] != "pending" or invite["kind"] != "invite":
+            await ws.send(dumps(error_msg("没有待处理的入群邀请")))
+            return
+        if bool(msg.get("accept")):
+            self.store.upsert_group_invite(name, username, invite["inviter"], "invite", "accepted")
+            await self._fanout_control(
+                [invite["inviter"]],
+                dumps({"type": "group_join_ready", "group": name, "username": username}),
+            )
+            log.info("group_accept name=%s user=%s", name, username)
+        else:
+            self.store.upsert_group_invite(name, username, invite["inviter"], "invite", "rejected")
+            log.info("group_reject name=%s user=%s", name, username)
+        await self._push_group_invite(name, username)
+        await ws.send(dumps(self._group_invite_state(username)))
+
+    async def on_group_join_request(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
+        name = str(msg.get("group") or "")
+        try:
+            validate_group_name(name)
+        except ProtocolError as exc:
+            await ws.send(dumps(error_msg(str(exc))))
+            return
+        if not self.store.group_exists(name):
+            await ws.send(dumps(error_msg("群不存在")))
+            return
+        members = self.store.group_members(name)
+        if username in members:
+            await ws.send(dumps(error_msg("已在群里")))
+            return
+        if not any(self.store.are_friends(username, member) for member in members):
+            await ws.send(dumps(error_msg("只能申请好友所在的群")))
+            return
+        existing = self.store.get_group_invite(name, username)
+        if existing and existing["status"] == "pending":
+            await ws.send(dumps(error_msg("已经申请过，等待对方同意")))
+            return
+        if existing and existing["status"] == "accepted":
+            await ws.send(dumps(error_msg("对方已同意，正在加入")))
+            return
+        if len(members) + self.store.pending_invite_count(name) >= MAX_GROUP_MEMBERS:
+            await ws.send(dumps(error_msg("群最多 8 人")))
+            return
+        self.store.upsert_group_invite(name, username, "", "request", "pending")
+        await ws.send(dumps(self._group_invite_state(username)))
+        await self._push_group_invite(name, username)
+        log.info("group_join_request name=%s user=%s", name, username)
+
+    async def on_group_approve(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
+        name = str(msg.get("group") or "")
+        newbie = str(msg.get("username") or "")
+        try:
+            validate_group_name(name)
+            validate_username(newbie)
+        except ProtocolError as exc:
+            await ws.send(dumps(error_msg(str(exc))))
+            return
+        if username not in self.store.group_members(name):
+            await ws.send(dumps(error_msg("只有群成员能同意申请")))
+            return
+        invite = self.store.get_group_invite(name, newbie)
+        if invite is None or invite["status"] != "pending" or invite["kind"] != "request":
+            await ws.send(dumps(error_msg("没有待处理的入群申请")))
+            return
+        if not self.store.are_friends(username, newbie):
+            await ws.send(dumps(error_msg("只能同意好友的入群申请")))
+            return
+        if bool(msg.get("accept")):
+            self.store.upsert_group_invite(name, newbie, username, "request", "accepted")
+            await self._fanout_control(
+                [username],
+                dumps({"type": "group_join_ready", "group": name, "username": newbie}),
+            )
+            log.info("group_approve name=%s by=%s user=%s", name, username, newbie)
+        else:
+            self.store.upsert_group_invite(name, newbie, username, "request", "rejected")
+            log.info("group_deny name=%s by=%s user=%s", name, username, newbie)
+        await self._push_group_invite(name, newbie)
+        await ws.send(dumps(self._group_invite_state(username)))
+
+    async def on_group_invite_sync(self, ws: Any, username: str) -> None:
+        await ws.send(dumps(self._group_invite_state(username)))
+
+    async def on_group_search(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
+        query = str(msg.get("query") or "").strip()
+        if len(query) > 32:
+            await ws.send(dumps(error_msg("搜索太长")))
+            return
+        await ws.send(
+            dumps({"type": "group_search", "groups": self.store.search_groups(username, query)})
+        )
+
+    async def on_group_info(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
         name = msg.get("group", "")
         validate_group_name(name)
         if not self.store.group_exists(name):
             await ws.send(dumps(error_msg("群不存在")))
+            return
+        if username not in self.store.group_members(name):
+            await ws.send(dumps(error_msg("你不在这个群里")))
             return
         state = self.store.latest_group_state(name)
         await ws.send(
@@ -654,11 +896,14 @@ class ChatServer:
             )
         )
 
-    async def on_group_sync(self, ws: Any, msg: dict[str, Any]) -> None:
+    async def on_group_sync(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
         name = msg.get("group", "")
         validate_group_name(name)
         if not self.store.group_exists(name):
             await ws.send(dumps(error_msg("群不存在")))
+            return
+        if username not in self.store.group_members(name):
+            await ws.send(dumps(error_msg("你不在这个群里")))
             return
         states = self.store.load_group_states(name)
         await ws.send(

@@ -20,7 +20,7 @@ from src.double_ratchet import GCMError, RatchetError, RatchetState, decrypt
 from src.protocol import MAX_BLOB_FRAME, MAX_WS_MESSAGE, ProtocolError, decode_ratchet_payload, dumps
 from src.server import ChatServer
 from src.store import ServerStore
-from tests.test_e2e import engine, make_friends, wait_pred
+from tests.test_e2e import accept_group, engine, make_friends, wait_pred
 
 MARKER = "明文标记-不应出现在服务器-7f3a".encode() + b"\x00photo"
 
@@ -133,6 +133,8 @@ async def _roundtrip_and_blind(server, alice, bob, log_buffer) -> None:
 
 async def _group_isolation(server, alice, bob, carol) -> None:
     await alice.create_group("文件组", ["bob", "carol"])
+    await accept_group(bob, "文件组", alice)
+    await accept_group(carol, "文件组", alice, bob)
     frames: list[dict] = []
     original = server.on_envelope
 

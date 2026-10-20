@@ -310,6 +310,8 @@ class MainWindow(QMainWindow):
         self._compact = False
         self._in_open = False
         self._search_mode = False
+        self._group_hits: list[dict[str, Any]] = []
+        self._history_hits: list[dict[str, Any]] = []
         self._typing = False
         self._pending_new = 0
         self._hidden = _load_set(initial.get("hidden", ""))
@@ -436,6 +438,26 @@ class MainWindow(QMainWindow):
         self.people_panel.addClicked.connect(
             lambda name: self.worker.submit("friend_request", username=name, greeting="")
         )
+        self.people_panel.groupAcceptClicked.connect(
+            lambda name: self.worker.submit("group_respond", group=name, accept=True)
+        )
+        self.people_panel.groupRejectClicked.connect(
+            lambda name: self.worker.submit("group_respond", group=name, accept=False)
+        )
+        self.people_panel.groupApproveClicked.connect(
+            lambda group, username: self.worker.submit(
+                "group_approve", group=group, username=username, accept=True
+            )
+        )
+        self.people_panel.groupDenyClicked.connect(
+            lambda group, username: self.worker.submit(
+                "group_deny", group=group, username=username
+            )
+        )
+        self.people_panel.groupJoinClicked.connect(
+            lambda name: self.worker.submit("group_join", group=name)
+        )
+        self.people_panel.groupOpenClicked.connect(self._open_known_group)
         self.people_panel.hide()
         contacts_layout.addWidget(self.people_panel)
         contacts_layout.addWidget(self.contacts, 1)
@@ -574,6 +596,27 @@ class MainWindow(QMainWindow):
         self.file_preview = FilePreviewBar()
         self.file_preview.cleared.connect(self._clear_staged)
         chat_layout.addWidget(self.file_preview)
+        self.invite_bar = QWidget()
+        self.invite_bar.setObjectName("composer")
+        self.invite_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        invite_layout = QHBoxLayout(self.invite_bar)
+        invite_layout.setContentsMargins(12, 10, 12, 12)
+        invite_layout.setSpacing(8)
+        self.invite_text = QLabel("")
+        self.invite_text.setWordWrap(True)
+        self.invite_text.setObjectName("secondary")
+        self.invite_ok = QPushButton("同意")
+        self.invite_ok.setObjectName("primary")
+        self.invite_ok.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.invite_no = QPushButton("拒绝")
+        self.invite_no.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.invite_ok.clicked.connect(self._invite_accept)
+        self.invite_no.clicked.connect(self._invite_reject)
+        invite_layout.addWidget(self.invite_text, 1)
+        invite_layout.addWidget(self.invite_no)
+        invite_layout.addWidget(self.invite_ok)
+        self.invite_bar.hide()
+        chat_layout.addWidget(self.invite_bar)
         chat_layout.addWidget(self.composer_bar)
         self.composer.installEventFilter(self)
         self.moment_board = MomentBoard()
@@ -903,6 +946,11 @@ class MainWindow(QMainWindow):
             self._fill_people()
         if "moments" in data:
             self.moment_board.set_moments(list(data.get("moments") or []))
+        conv = self.current_conv or ""
+        if conv.startswith("invite:") and conv[7:] in self.snapshot_data.get("groups", {}):
+            self.open_conversation(f"group:{conv[7:]}")
+        elif conv.startswith("joining:") and conv[8:] in self.snapshot_data.get("groups", {}):
+            self.open_conversation(f"group:{conv[8:]}")
         if "dropbox" in data:
             self.drop_board.set_items(list(data.get("dropbox") or []))
         if "profile" in data and hasattr(self, "profile_settings"):
@@ -919,14 +967,29 @@ class MainWindow(QMainWindow):
     def rebuild_conversations(self) -> None:
         recent = {row["conv"]: row for row in self.snapshot_data.get("recent", [])}
         keys = set(recent)
-        keys.update(f"group:{name}" for name in self.snapshot_data.get("groups", {}))
+        groups = self.snapshot_data.get("groups", {})
+        keys.update(f"group:{name}" for name in groups)
         keys.update(f"dm:{name}" for name in self.snapshot_data.get("sessions", {}))
-        if self.current_conv:
+        for item in self.snapshot_data.get("group_incoming") or []:
+            name = str(item.get("group") or "")
+            if name and name not in groups:
+                keys.add(f"invite:{name}")
+        for item in self.snapshot_data.get("group_joining") or []:
+            name = str(item.get("group") or "")
+            if name and name not in groups:
+                keys.add(f"joining:{name}")
+        for item in self.snapshot_data.get("group_requests") or []:
+            name = str(item.get("group") or "")
+            user = str(item.get("username") or "")
+            if name and user:
+                keys.add(f"request:{user}:{name}")
+        if self.current_conv and not str(self.current_conv).startswith(("find:", "wait:")):
             keys.add(self.current_conv)
         ordered = sorted(
             keys,
             key=lambda key: (
                 0 if key in self._pins else 1,
+                0 if str(key).startswith(("invite:", "request:")) else 1,
                 -(recent.get(key, {}).get("ts", 0)),
                 key,
             ),
@@ -935,13 +998,23 @@ class MainWindow(QMainWindow):
         items: list[ConvItem] = []
         for conv in ordered:
             row = recent.get(conv, {})
-            kind = "group" if str(conv).startswith("group:") else "dm"
-            peer = conv[3:] if kind == "dm" else conv[6:]
+            kind = "dm" if str(conv).startswith("dm:") else "group"
+            peer = conv[3:] if kind == "dm" else ""
+            preview = str(row.get("body", "") or "")
+            if str(conv).startswith("invite:"):
+                preview = preview or self._invite_preview(conv[7:])
+            elif str(conv).startswith("request:"):
+                user, _group = self._split_request(conv)
+                preview = preview or f"{user} 申请加入"
+            elif str(conv).startswith("joining:"):
+                preview = preview or "正在加入"
+            elif kind == "group" and not preview:
+                preview = "还没有消息"
             items.append(
                 ConvItem(
                     key=conv,
                     title=self.conv_title(conv),
-                    preview=str(row.get("body", "")),
+                    preview=preview,
                     ts=float(row.get("ts", 0) or 0),
                     online=kind == "dm" and peer in online,
                     unread=self.unread.get(conv, 0),
@@ -972,12 +1045,39 @@ class MainWindow(QMainWindow):
             self.people_panel.hide()
             return
         self.people_panel.show()
+        query = self.search.text().strip().lower() if self.page_contacts.isVisible() else ""
+        invites = list(self.snapshot_data.get("group_incoming") or [])
+        outgoing = list(self.snapshot_data.get("group_outgoing") or [])
+        requests = list(self.snapshot_data.get("group_requests") or [])
+        if query:
+            invites = [
+                item
+                for item in invites
+                if query in str(item.get("group") or "").lower()
+                or query in str(item.get("inviter") or "").lower()
+            ]
+            outgoing = [
+                item
+                for item in outgoing
+                if query in str(item.get("group") or "").lower()
+                or query in str(item.get("username") or "").lower()
+            ]
+            requests = [
+                item
+                for item in requests
+                if query in str(item.get("group") or "").lower()
+                or query in str(item.get("username") or "").lower()
+            ]
         self.people_panel.set_model(
             friends=list(self.snapshot_data.get("friends") or []),
             incoming=list(self.snapshot_data.get("incoming") or []),
             outgoing=list(self.snapshot_data.get("outgoing") or []),
             blocked=list(self.snapshot_data.get("blocked") or []),
             rejected=list(self.snapshot_data.get("rejected") or []),
+            group_invites=invites,
+            group_outgoing=outgoing,
+            group_requests=requests,
+            group_results=list(self._group_hits) if query else [],
         )
 
     def _dm_allowed(self, username: str) -> bool:
@@ -992,13 +1092,49 @@ class MainWindow(QMainWindow):
         total = sum(self.unread.values())
         self.nav_chat.set_badge(total)
         if "friends" in self.snapshot_data:
-            self.nav_contacts.set_badge(len(self.snapshot_data.get("incoming") or []))
+            pending = len(self.snapshot_data.get("incoming") or [])
+            pending += len(self.snapshot_data.get("group_incoming") or [])
+            pending += len(self.snapshot_data.get("group_requests") or [])
+            self.nav_contacts.set_badge(pending)
 
     @staticmethod
     def conv_title(conv: str) -> str:
-        return conv[6:] if conv.startswith("group:") else conv[3:]
+        if conv.startswith("invite:"):
+            return conv[7:]
+        if conv.startswith("joining:"):
+            return conv[8:]
+        if conv.startswith("find:"):
+            return conv[5:]
+        if conv.startswith("wait:"):
+            return conv[5:]
+        if conv.startswith("request:"):
+            return conv.split(":", 2)[-1]
+        if conv.startswith("group:"):
+            return conv[6:]
+        if conv.startswith("dm:"):
+            return conv[3:]
+        return conv
+
+    @staticmethod
+    def _split_request(conv: str) -> tuple[str, str]:
+        user, _sep, group = conv[len("request:") :].partition(":")
+        if not group:
+            return "", user
+        return user, group
+
+    def _invite_preview(self, name: str) -> str:
+        for item in self.snapshot_data.get("group_incoming") or []:
+            if str(item.get("group") or "") == name:
+                return f"{item.get('inviter') or '好友'} 邀请你加入"
+        return "邀请你加入"
 
     def _activate_key(self, key: str) -> None:
+        if key.startswith("find:"):
+            self.worker.submit("group_join", group=key[5:])
+            return
+        if key.startswith("wait:"):
+            self.show_toast("已申请，等待对方同意")
+            return
         if self._search_mode:
             self._search_mode = False
             self.search.blockSignals(True)
@@ -1028,13 +1164,20 @@ class MainWindow(QMainWindow):
             self.info_button.setEnabled(conv.startswith("dm:"))
             self.update_header()
             self._apply_responsive()
-            self.worker.submit("history", conv=conv)
+            if conv.startswith(("dm:", "group:")):
+                self.worker.submit("history", conv=conv)
+            else:
+                self.messages.set_messages([])
+                self.bubbles.clear()
+            self.empty_state.hide()
+            self.messages.show()
             if not self._search_mode:
                 self.rebuild_conversations()
             else:
                 self.conversations.select_key(conv, animate=False)
             self._refresh_send()
-            self.composer.setFocus()
+            if conv.startswith(("dm:", "group:")):
+                self.composer.setFocus()
         finally:
             self._in_open = False
 
@@ -1046,10 +1189,13 @@ class MainWindow(QMainWindow):
             self.info_button.setEnabled(False)
             self.info_button.hide()
             self.composer_bar.hide()
+            self.invite_bar.hide()
             return
         self.header_avatar.show()
-        self.composer_bar.show()
         conv = self.current_conv
+        pending = conv.startswith(("invite:", "request:"))
+        self.composer_bar.setVisible(conv.startswith(("dm:", "group:")))
+        self.invite_bar.setVisible(pending)
         self.info_button.setEnabled(conv.startswith("dm:"))
         self.info_button.hide()
         if conv.startswith("dm:"):
@@ -1061,13 +1207,54 @@ class MainWindow(QMainWindow):
             self.chat_title.setText(peer)
             self.chat_subtitle.setText(f"{'在线' if online else '离线'} · 双棘轮代数 {generation}{fp_text}")
             self.header_avatar.set_person(peer, online=online)
+        elif conv.startswith("invite:"):
+            name = conv[7:]
+            self.chat_title.setText(name)
+            self.chat_subtitle.setText("等待你同意")
+            self.header_avatar.set_person(name, group=True)
+            self.invite_text.setText(self._invite_preview(name))
+            self.invite_ok.setText("同意")
+            self.invite_no.show()
+        elif conv.startswith("request:"):
+            user, name = self._split_request(conv)
+            self.chat_title.setText(name)
+            self.chat_subtitle.setText(f"{user} 申请加入")
+            self.header_avatar.set_person(name, group=True)
+            self.invite_text.setText(f"同意 {user} 加入 {name}")
+            self.invite_ok.setText("同意")
+            self.invite_no.show()
+        elif conv.startswith("joining:"):
+            name = conv[8:]
+            self.chat_title.setText(name)
+            self.chat_subtitle.setText("正在加入")
+            self.header_avatar.set_person(name, group=True)
         else:
-            name = conv[6:]
+            name = conv[6:] if conv.startswith("group:") else conv
             members = self.snapshot_data.get("groups", {}).get(name, [])
             self.chat_title.setText(name)
             self.chat_subtitle.setText(f"{len(members)} 位成员")
             self.header_avatar.set_person(name, group=True)
         self._sync_typing_visibility()
+
+    def _invite_accept(self) -> None:
+        conv = self.current_conv or ""
+        if conv.startswith("invite:"):
+            self.worker.submit("group_respond", group=conv[7:], accept=True)
+        elif conv.startswith("request:"):
+            user, group = self._split_request(conv)
+            self.worker.submit("group_approve", group=group, username=user, accept=True)
+
+    def _invite_reject(self) -> None:
+        conv = self.current_conv or ""
+        if conv.startswith("invite:"):
+            self.worker.submit("group_respond", group=conv[7:], accept=False)
+        elif conv.startswith("request:"):
+            user, group = self._split_request(conv)
+            self.worker.submit("group_deny", group=group, username=user)
+
+    def _open_known_group(self, name: str) -> None:
+        self._show_page(0)
+        self.open_conversation(f"group:{name}")
 
     def show_history(self, conv: str, rows: list[dict[str, Any]]) -> None:
         if conv != self.current_conv:
@@ -1300,6 +1487,9 @@ class MainWindow(QMainWindow):
         if len(text.encode("utf-8")) > 48 * 1024:
             self.show_toast("消息过长；加密信封必须小于 64KB", error=True)
             return
+        if not self.current_conv.startswith(("dm:", "group:")):
+            self.show_toast("先同意加入，才能在群里发消息", error=True)
+            return
         if self.current_conv.startswith("dm:") and not self._dm_allowed(self.current_conv[3:]):
             self.show_toast("需要对方同意好友申请后才能发消息", error=True)
             return
@@ -1423,33 +1613,107 @@ class MainWindow(QMainWindow):
                 self.messages.notify_row(row)
 
     def perform_search(self) -> None:
-        if self.page_contacts.isVisible():
-            self.rebuild_contacts()
-            return
         query = self.search.text().strip()
+        if self.page_contacts.isVisible():
+            if not query:
+                self._group_hits = []
+            self.rebuild_contacts()
+            self._fill_people()
+            if query:
+                self.worker.submit("search_groups", query=query)
+            return
         if not query:
             self._search_mode = False
+            self._group_hits = []
+            self._history_hits = []
             self.rebuild_conversations()
             return
+        self._search_mode = True
+        self._history_hits = []
+        self._render_search()
         self.worker.submit("search", query=query)
+        self.worker.submit("search_groups", query=query)
 
     def show_search_results(self, rows: list[dict[str, Any]]) -> None:
         if not self.search.text().strip() or self.page_contacts.isVisible():
             return
+        self._history_hits = list(rows)
         self._search_mode = True
-        items = []
-        for row in rows:
-            conv = str(row["conv"])
-            items.append(
-                ConvItem(
-                    key=conv,
-                    title=self.conv_title(conv),
-                    preview=str(row["body"]),
-                    ts=float(row["ts"]),
-                    kind="group" if conv.startswith("group:") else "dm",
-                    clock=list_clock(float(row["ts"])),
+        self._render_search()
+
+    def _local_search_rows(self, query: str) -> list[dict[str, Any]]:
+        needle = query.strip().lower()
+        rows: list[dict[str, Any]] = []
+        for name in self.snapshot_data.get("groups", {}):
+            if needle in str(name).lower():
+                rows.append({"conv": f"group:{name}", "body": "群聊", "ts": 0})
+        for item in self.snapshot_data.get("group_incoming") or []:
+            name = str(item.get("group") or "")
+            inviter = str(item.get("inviter") or "")
+            if name and (needle in name.lower() or needle in inviter.lower()):
+                rows.append({"conv": f"invite:{name}", "body": f"{inviter} 邀请你加入", "ts": 0})
+        for person in self.known_people():
+            name = str(person.get("name") or "")
+            if name and needle in name.lower():
+                rows.append({"conv": f"dm:{name}", "body": "联系人", "ts": 0})
+        return rows
+
+    def _rows_from_group_hits(self, query: str) -> list[dict[str, Any]]:
+        needle = query.strip().lower()
+        rows: list[dict[str, Any]] = []
+        for item in self._group_hits:
+            name = str(item.get("name") or "")
+            if not name or needle not in name.lower():
+                continue
+            relation = str(item.get("relation") or "")
+            if relation == "member":
+                rows.append({"conv": f"group:{name}", "body": "群聊", "ts": 0})
+            elif relation == "invited":
+                inviter = str(item.get("inviter") or "好友")
+                rows.append({"conv": f"invite:{name}", "body": f"{inviter} 邀请你加入", "ts": 0})
+            elif relation == "requested":
+                rows.append({"conv": f"wait:{name}", "body": "已申请，等待对方同意", "ts": 0})
+            elif relation == "joining":
+                rows.append({"conv": f"joining:{name}", "body": "正在加入", "ts": 0})
+            else:
+                via = str(item.get("via") or "好友")
+                size = item.get("size") or 0
+                rows.append(
+                    {
+                        "conv": f"find:{name}",
+                        "body": f"{via} 的群 · {size} 人 · 申请加入",
+                        "ts": 0,
+                    }
                 )
+        return rows
+
+    def _render_search(self) -> None:
+        query = self.search.text().strip()
+        if not query or self.page_contacts.isVisible():
+            return
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in (
+            list(self._history_hits)
+            + self._local_search_rows(query)
+            + self._rows_from_group_hits(query)
+        ):
+            conv = str(row.get("conv") or "")
+            if not conv or conv in seen:
+                continue
+            seen.add(conv)
+            merged.append(row)
+        items = [
+            ConvItem(
+                key=str(row["conv"]),
+                title=self.conv_title(str(row["conv"])),
+                preview=str(row.get("body") or ""),
+                ts=float(row.get("ts") or 0),
+                kind="dm" if str(row["conv"]).startswith("dm:") else "group",
+                clock=list_clock(float(row.get("ts") or 0)),
             )
+            for row in merged
+        ]
         self.conversations.set_items(items)
 
     def _compose_menu(self) -> None:
@@ -1590,6 +1854,14 @@ class MainWindow(QMainWindow):
         elif action == "users" and isinstance(data, dict):
             self.directory = [str(name) for name in data.get("users") or []]
             self.rebuild_contacts()
+        elif action == "search_groups" and isinstance(data, dict):
+            self._group_hits = list(data.get("groups") or [])
+            if self.page_contacts.isVisible():
+                self._fill_people()
+            elif self._search_mode:
+                self._render_search()
+        elif action in {"group_respond", "group_approve", "group_join", "group_deny"} and isinstance(data, str):
+            self.show_toast(data)
 
     def on_connection(self, connected: bool, text: str) -> None:
         self._connected = connected

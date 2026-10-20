@@ -85,7 +85,7 @@ Bienstock、Fairoze、Garg、Mukherjee 和 Raghuraman 在 CRYPTO 2022 给出通�
 
 这是对 Rösler、Mainka、Schwenk，EuroS&P 2018 的回应。对外介绍把标题收成 *More is Less: On the Security of Instant Messaging Groups*；正式题名是 *More is Less: On the End-to-End Security of Group Chats in Signal, WhatsApp, and Threema*。他们写出当时 Signal / WhatsApp 的群先用两人会话分发 Sender Key，群正文再走发送者自己的对称链。那条群链不再做 DH 棘轮，两人双棘轮上的 future secrecy 停在分发钥匙的那一刻。逐人信封让每一封仍用 `kdf_ck`，并在对方回复后走 `kdf_rk`，所以那一对的前向安全和破密恢复留在这一封上。
 
-论文另外两块没有被这个扇出补上。成员增减和「谁有权管理群」在本仓库补成**签名哈希链的群状态**（`src/groups.py`）：创世状态由创建者签名；每次拉人是一条新状态，纪元加一、成员只增一人、前驱哈希指向上一条、签署者必须是上一状态成员。服务器入库前验签，客户端收 `group_update` 时再独立验签；群消息密文里带 `gstate`（发送者所用状态的 SHA-256），接收方只接受「状态在已验证链上且发送者在该成员表里」的消息。`scripts/demo_group_attack.py` 演示服务器伪造成员表被拒绝。于是服务器做不到幽灵成员和名单分歧，只剩漏投（DoS），漏投由 `group_sync` 补链暴露。群里仍没有让其他成员互相核验发送者的群签名，也没有成员入群同意的端到端协商。拉人之后，只有此后发给新成员的消息才纳入他的棘轮，旧消息不会补发给他。这不是 MLS。
+论文另外两块没有被这个扇出补上。成员增减和「谁有权管理群」在本仓库补成**签名哈希链的群状态**（`src/groups.py`）：创世状态由创建者签名，成员表里只有创建者；每次拉人是一条新状态，纪元加一、成员只增一人、前驱哈希指向上一条、签署者必须是上一状态成员。对方先在服务器的邀请表上点同意，邀请人或审批人的客户端再补签。服务器入库前验签，客户端收 `group_update` 时再独立验签；群消息密文里带 `gstate`（发送者所用状态的 SHA-256），接收方只接受「状态在已验证链上且发送者在该成员表里」的消息。`scripts/demo_group_attack.py` 演示服务器伪造成员表被拒绝。于是服务器做不到幽灵成员和名单分歧，只剩漏投（DoS），漏投由 `group_sync` 补链暴露。同意本身不在签名里：恶意服务器可以谎称对方已经同意，邀请人的客户端会签下拉人状态。群里仍然没有让其他成员互相核验发送者的群签名。拉人之后，只有此后发给新成员的消息才纳入他的棘轮，旧消息不会补发给他。这不是 MLS。
 
 ## 7. 与 Signal / WhatsApp 的差别
 
@@ -112,7 +112,7 @@ KDF 标签、字段和题目一致：`x3dh-v1`、`dr-v1`、HMAC 的 `0x01` / `0x
 
 桌面客户端使用 PySide6，版式对齐 Telegram 桌面版：左列会话列表，右列聊天，菜单里进入联系人、朋友圈、文件和设置。可切换夜间、微信绿和日间。左侧显示头像、消息预览、时间、持久化未读数与在线绿点，右侧自己的消息靠右、对方靠左。界面支持中文本地历史搜索、乐观发送状态、断线重连、未确认加密 outbox 恢复、主题淡入和“减少动态效果”。「已发送」只表示服务器接受信封，不伪称已读。打开会话后能看到对端指纹摘要和棘轮代数；验签失败、重放拒绝和 GCM 失败均以红色安全气泡呈现，便于答辩时指着屏幕讲「现在双方已经换过公钥」。Qt 主线程不处理任何密钥，专用工作线程独占 asyncio、WebSocket、SQLite 和 `ChatEngine`，所以 PBKDF2 与网络操作不会卡住动画。原 rich 终端界面继续保留，用于脚本化演示；两套界面复用同一个密码协议实现。
 
-好友关系、资料、隐私开关和朋友圈存在服务器 SQLite 里，不进双棘轮，服务器看得到这些字段。私聊必须先成为好友；建群和拉人也要求发起人与对方已是好友，签名群状态的校验仍在这之后。文件走分块密文附件，服务器只存密文块。
+好友关系、资料、隐私开关、朋友圈，以及入群邀请和入群申请，存在服务器 SQLite 里，不进双棘轮，服务器看得到这些字段。私聊必须先成为好友。建群时创世状态只有创建者；拉人除了签名群状态，还要求对方已经同意，并且发起人与对方已是好友。没有消息的群仍留在创建者的会话列表里。好友可以按群名搜到群并申请加入，不是好友的私密群搜不到。文件走分块密文附件，服务器只存密文块。
 
 ## 9. 文献与代码的对应
 
@@ -120,7 +120,7 @@ KDF 标签、字段和题目一致：`x3dh-v1`、`dr-v1`、HMAC 的 `0x01` / `0x
 
 - Bienstock、Fairoze、Garg、Mukherjee、Raghuraman，CRYPTO 2022，ePrint 2022/355。对外称 *A Universally Composable Analysis of the Double Ratchet*；正式题名 *A More Complete Analysis of the Signal Double Ratchet Algorithm*。对称棘轮 `kdf_ck`，DH 棘轮 `kdf_rk` / `_dh_ratchet` / `_prepare_sending_chain`，乱序与丢包 `_skip_message_keys`，消息钥匙用后即弃在 `encrypt` / `decrypt`。满足的是这四块积木的形状。不满足 `F_TR`：`dhs_priv` 留在窗口里，没有 Triple Ratchet。也没有把他们的 UC 证明说成已经在本仓库上成立。跳过超过 40 条会拒绝。
 - Fiedler、Günther，PKC 2025，ePrint 2024/702。对外称 *PQXDH: A Post-Quantum Extension of X3DH*；正式题名 *Security Analysis of Signal's PQXDH Handshake*。本仓库实现混合 PQXDH，函数是 `initiator_hybrid_secret`、`responder_hybrid_secret`、`hkdf_pq_sk`。握手优先封装一次性 PQOPK，否则封装签过名的长期 PQK；封装公钥进 HKDF，也进初始消息签名。不满足的是没有 Kyber，也没有在他们的证明模型里重跑安全界。服务器仍可扣留一次性钥。混合棘轮的封装目标仍是长期 PQK，这把长期钥泄露后新链退回经典 DH。
-- Rösler、Mainka、Schwenk，EuroS&P 2018，ePrint 2017/713。对外称 *More is Less: On the Security of Instant Messaging Groups*；正式题名 *More is Less: On the End-to-End Security of Group Chats in Signal, WhatsApp, and Threema*。`ChatEngine.send_text` 对每个其他成员各发一封双棘轮信封，用来回应他们关于 Sender Keys 继承不到 future secrecy 的分析。成员表方面补上 `src/groups.py` 的签名哈希链与消息 `gstate` 绑定。不满足的是成员入群同意的端到端协商和群签名。
+- Rösler、Mainka、Schwenk，EuroS&P 2018，ePrint 2017/713。对外称 *More is Less: On the Security of Instant Messaging Groups*；正式题名 *More is Less: On the End-to-End Security of Group Chats in Signal, WhatsApp, and Threema*。`ChatEngine.send_text` 对每个其他成员各发一封双棘轮信封，用来回应他们关于 Sender Keys 继承不到 future secrecy 的分析。成员表方面补上 `src/groups.py` 的签名哈希链与消息 `gstate` 绑定。入群要先在服务器邀请表上同意，再由当前成员签名。不满足的是把同意放进端到端协商，以及群签名。恶意服务器可以谎称对方已经同意。
 
 曲线、签名、派生和 AEAD 分别是：
 

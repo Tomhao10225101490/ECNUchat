@@ -296,6 +296,16 @@ def stylesheet(theme: Palette | str = "telegram") -> str:
         border: none;
         border-bottom: 1px solid {p.hairline};
     }}
+    QFrame#momentCard {{
+        background: {p.bubble_in};
+        border: none;
+        border-radius: 12px;
+    }}
+    QFrame#momentTalk {{
+        background: {p.bg_hover};
+        border: none;
+        border-radius: 8px;
+    }}
     QFrame#hair {{
         background: {p.hairline};
         min-height: 1px;
