@@ -14,6 +14,7 @@ from PySide6.QtGui import (
     QAction,
     QCloseEvent,
     QColor,
+    QCursor,
     QDesktopServices,
     QGuiApplication,
     QImageReader,
@@ -58,6 +59,14 @@ from src.gui.logic import (
     security_hint,
 )
 from src.gui.theme import PALETTES, THEME_LABELS, THEME_ORDER, Palette, lerp_palette, next_theme, stylesheet
+from src.gui.voice_bar import VoiceCapture, VoiceHoldBar
+from src.voice import (
+    MIN_VOICE_MS,
+    duration_ms,
+    hold_should_cancel,
+    pcm_to_wav,
+    peaks_from_pcm,
+)
 from src.gui.widgets import (
     ElideLabel,
     AvatarWidget,
@@ -311,6 +320,16 @@ class MainWindow(QMainWindow):
         self._in_open = False
         self._search_mode = False
         self._opening_video = False
+        self._voice_active = False
+        self._voice_cancel = False
+        self._voice_limit = False
+        self._voice_token = ""
+        self._voice_sink = None
+        self._voice_buffer = None
+        self._voice_ms = 0
+        self._voice_started = 0.0
+        self._arm_text_send = False
+        self._capture = VoiceCapture()
         self._group_hits: list[dict[str, Any]] = []
         self._friend_results: list[dict[str, Any]] = []
         self._history_hits: list[dict[str, Any]] = []
@@ -598,10 +617,14 @@ class MainWindow(QMainWindow):
         self.attach_button.clicked.connect(self._attach)
         self.composer.sendRequested.connect(self.send_current)
         self.composer.textChanged.connect(self._refresh_send)
-        self.send_button.clicked.connect(self._send_or_mic)
+        self.send_button.pressed.connect(self._composer_pressed)
+        self.send_button.released.connect(self._composer_released)
+        self.voice_hold = VoiceHoldBar()
+        self.voice_hold.hide()
         composer_layout.addWidget(self.emoji_button, alignment=Qt.AlignmentFlag.AlignBottom)
         composer_layout.addWidget(self.attach_button, alignment=Qt.AlignmentFlag.AlignBottom)
         composer_layout.addWidget(self.input_shell, 1)
+        composer_layout.addWidget(self.voice_hold, 1)
         composer_layout.addWidget(self.send_button, alignment=Qt.AlignmentFlag.AlignBottom)
         self.file_preview = FilePreviewBar()
         self.file_preview.cleared.connect(self._clear_staged)
@@ -661,6 +684,12 @@ class MainWindow(QMainWindow):
         self.toast_timer = QTimer(self)
         self.toast_timer.setSingleShot(True)
         self.toast_timer.timeout.connect(self.toast.hide)
+        self._hold_timer = QTimer(self)
+        self._hold_timer.setInterval(80)
+        self._hold_timer.timeout.connect(self._poll_hold)
+        self._play_timer = QTimer(self)
+        self._play_timer.setInterval(80)
+        self._play_timer.timeout.connect(self._poll_playback)
         self._toast_anim: QVariantAnimation | None = None
 
         find_action = QAction(self)
@@ -859,6 +888,7 @@ class MainWindow(QMainWindow):
         self.input_shell.apply_palette(palette)
         self.new_button.apply_palette(palette)
         self.send_button.apply_palette(palette)
+        self.voice_hold.apply_palette(palette)
         self.motion_switch.apply_palette(palette)
         gui_widgets.AVATAR_RING = palette.bg_side
         self.self_avatar.online_color = palette.online
@@ -1232,6 +1262,9 @@ class MainWindow(QMainWindow):
             return
         self._in_open = True
         try:
+            if self._voice_active:
+                self._cancel_voice()
+            self._stop_voice_playback()
             self.current_conv = conv
             self.unread[conv] = 0
             self._pending_new = 0
@@ -1951,8 +1984,13 @@ class MainWindow(QMainWindow):
         if action == "export_video" and isinstance(data, str):
             self.show_toast(data)
             return
-        if action == "send_file" and isinstance(data, dict):
-            self._bind_sent_attachment(str(data.get("local_id") or ""), data.get("attachment"))
+        if action in {"send_file", "send_voice"} and isinstance(data, dict):
+            local_id = str(data.get("local_id") or "")
+            if action == "send_voice" and local_id and local_id == self._voice_token:
+                self._stop_voice_playback()
+            self._bind_sent_attachment(local_id, data.get("attachment"))
+        if action == "open_voice" and isinstance(data, dict):
+            self._play_voice_result(data)
         if action == "open_chat":
             self._show_page(0)
             self.open_conversation(f"dm:{data}")
@@ -2031,15 +2069,159 @@ class MainWindow(QMainWindow):
         self.toast_timer.start(3200)
 
     def _refresh_send(self) -> None:
+        if self._voice_active:
+            return
         has_text = bool(self.composer.toPlainText().strip() or self._staged)
         self.send_button.set_active(has_text, animate=not self._reduce_motion)
-        self.send_button.setToolTip("发送" if has_text else "语音")
+        self.send_button.setToolTip("发送" if has_text else "按住说话")
 
-    def _send_or_mic(self) -> None:
-        if self.composer.toPlainText().strip() or self._staged:
+    def _has_outgoing_draft(self) -> bool:
+        return bool(self.composer.toPlainText().strip() or self._staged)
+
+    def _composer_pressed(self) -> None:
+        if self._voice_active:
+            return
+        if self._has_outgoing_draft():
+            self._arm_text_send = True
+            return
+        self._arm_text_send = False
+        self._begin_recording()
+
+    def _composer_released(self) -> None:
+        if self._arm_text_send:
+            self._arm_text_send = False
             self.send_current()
-        else:
-            self.show_toast("按住说话还没做，先发文字吧")
+            return
+        if self._voice_active:
+            self._end_recording()
+
+    def _voice_blocked_reason(self) -> str | None:
+        if not self.current_conv:
+            return "先选择一个聊天"
+        if not self.current_conv.startswith(("dm:", "group:")):
+            return "先同意加入，才能在群里发消息"
+        if self.current_conv.startswith("dm:") and not self._dm_allowed(self._dm_peer(self.current_conv)):
+            return "需要对方同意好友申请后才能发消息"
+        return None
+
+    def _begin_recording(self) -> None:
+        if self._voice_active:
+            return
+        reason = self._voice_blocked_reason()
+        if reason:
+            self.show_toast(reason, error=True)
+            return
+        self.emoji_panel.hide()
+        error = self._capture.start()
+        if error:
+            self.show_toast(error, error=True)
+            return
+        self._voice_active = True
+        self._voice_cancel = False
+        self._voice_limit = False
+        self._voice_origin = QCursor.pos()
+        self.send_button.set_recording(True)
+        self.input_shell.hide()
+        self.voice_hold.show()
+        self._sync_voice_hold()
+        self._hold_timer.start()
+
+    def _poll_hold(self) -> None:
+        if not self._voice_active:
+            return
+        self._capture.pull()
+        if self._capture.hit_limit:
+            self._voice_limit = True
+            self._end_recording()
+            return
+        pos = QCursor.pos()
+        origin = self._voice_origin
+        self._voice_cancel = hold_should_cancel(origin.x(), origin.y(), pos.x(), pos.y())
+        if not (QGuiApplication.mouseButtons() & Qt.MouseButton.LeftButton):
+            self._end_recording()
+            return
+        self._sync_voice_hold()
+
+    def _sync_voice_hold(self) -> None:
+        self.voice_hold.show_state(
+            self._capture.elapsed_ms(),
+            self._capture.levels,
+            self._voice_cancel,
+            pulse=not self._reduce_motion,
+        )
+        self.send_button.setToolTip("松开取消" if self._voice_cancel else "松开发送")
+
+    def _hide_voice_hold(self) -> None:
+        self._hold_timer.stop()
+        self.voice_hold.hide()
+        self.input_shell.show()
+        self.send_button.set_recording(False)
+
+    def _cancel_voice(self) -> None:
+        if not self._voice_active:
+            return
+        self._voice_cancel = True
+        self._end_recording()
+
+    def _end_recording(self) -> None:
+        if not self._voice_active:
+            return
+        self._voice_active = False
+        try:
+            pcm = self._capture.stop()
+        except Exception:
+            pcm = b""
+        cancel = self._voice_cancel
+        reached_limit = self._voice_limit
+        self._voice_cancel = False
+        self._voice_limit = False
+        self._hide_voice_hold()
+        self._refresh_send()
+        if cancel:
+            self.show_toast("已取消")
+            return
+        self._queue_voice(pcm, reached_limit=reached_limit)
+
+    def _queue_voice(self, pcm: bytes, *, reached_limit: bool = False) -> None:
+        length = duration_ms(pcm)
+        if length < MIN_VOICE_MS:
+            self.show_toast("按住久一点，松开发送")
+            return
+        reason = self._voice_blocked_reason()
+        if reason:
+            self.show_toast(reason, error=True)
+            return
+        if not self.current_conv:
+            return
+        wav = pcm_to_wav(pcm)
+        peaks = peaks_from_pcm(pcm)
+        local_id = uuid.uuid4().hex
+        attachment = {
+            "name": "语音",
+            "mime": "audio/wav",
+            "size": len(wav),
+            "path": "",
+            "media": "voice",
+            "caption": "",
+            "duration_ms": length,
+            "peaks": peaks,
+            "pcm": pcm,
+            "rate": 16000,
+            "encrypted": True,
+            "sha256": "",
+        }
+        self.append_message(
+            self.username,
+            "",
+            time.time(),
+            mine=True,
+            state="sending",
+            local_id=local_id,
+            attachment=attachment,
+        )
+        self.worker.submit("send_voice", local_id=local_id, conv=self.current_conv, wav=wav)
+        if reached_limit:
+            self.show_toast("已经录了 3 分钟，这段先发出去了")
 
     def _toggle_emoji(self) -> None:
         if self.emoji_panel.isVisible():
@@ -2232,6 +2414,9 @@ class MainWindow(QMainWindow):
     def _open_attachment(self, item: ChatItem) -> None:
         attachment = item.attachment or {}
         kind = str(attachment.get("media") or "file")
+        if kind == "voice":
+            self._toggle_voice(item)
+            return
         if kind == "image" and (attachment.get("id") or attachment.get("data")):
             raw = attachment.get("data")
             title = str(attachment.get("name") or "图片")
@@ -2564,6 +2749,27 @@ class MainWindow(QMainWindow):
             return
         bubble.set_state("sending")
         attachment = bubble.item.attachment
+        if isinstance(attachment, dict) and attachment.get("media") == "voice":
+            pcm = attachment.get("pcm")
+            bubble.item.progress = 0.0
+            if isinstance(pcm, (bytes, bytearray)) and pcm:
+                self.worker.submit(
+                    "send_voice",
+                    local_id=local_id,
+                    conv=self.current_conv,
+                    wav=pcm_to_wav(bytes(pcm)),
+                )
+                return
+            self.worker.submit(
+                "send_file",
+                local_id=local_id,
+                conv=self.current_conv,
+                path="",
+                caption="",
+                name="voice.wav",
+                mime="audio/wav",
+            )
+            return
         if attachment:
             bubble.item.progress = 0.0
             self.worker.submit(
@@ -2635,7 +2841,149 @@ class MainWindow(QMainWindow):
         self.empty_state.setVisible(self.current_conv is None)
         self.messages.setVisible(self.current_conv is not None)
 
+    def _toggle_voice(self, item: ChatItem) -> None:
+        attachment = item.attachment if isinstance(item.attachment, dict) else {}
+        if self._voice_token == item.key:
+            self._stop_voice_playback()
+            return
+        pcm = attachment.get("pcm")
+        if isinstance(pcm, (bytes, bytearray)) and pcm:
+            self._stop_voice_playback()
+            self._play_pcm(item, bytes(pcm), int(attachment.get("rate") or 16000))
+            return
+        if item.state == "sending":
+            self.show_toast("语音还在接收")
+            return
+        file_id = str(attachment.get("file_id") or attachment.get("id") or "")
+        if not file_id:
+            self.show_toast("语音不在本机", error=True)
+            return
+        self._stop_voice_playback()
+        self._voice_token = item.key
+        attachment["playing"] = True
+        self.messages.viewport().update()
+        self.worker.submit("open_voice", id=file_id, token=item.key)
+
+    def _play_voice_result(self, data: dict) -> None:
+        token = str(data.get("token") or "")
+        if token != self._voice_token:
+            return
+        item = self._item_by_key(token)
+        pcm = data.get("pcm")
+        if item is None or not isinstance(pcm, (bytes, bytearray)) or not pcm:
+            self._stop_voice_playback()
+            self.show_toast("语音解不开", error=True)
+            return
+        rate = int(data.get("rate") or 16000)
+        self._play_pcm(item, bytes(pcm), rate)
+
+    def _item_by_key(self, key: str) -> ChatItem | None:
+        for item in self.messages.items():
+            if item.key == key:
+                return item
+        return None
+
+    def _play_pcm(self, item: ChatItem, pcm: bytes, rate: int) -> None:
+        self._stop_voice_playback()
+        try:
+            from PySide6.QtCore import QBuffer, QIODevice
+            from PySide6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
+        except Exception:
+            self.show_toast("这台电脑暂时放不了语音", error=True)
+            return
+        if not QMediaDevices.audioOutputs():
+            self.show_toast("没有找到扬声器", error=True)
+            return
+        fmt = QAudioFormat()
+        fmt.setSampleRate(rate)
+        fmt.setChannelCount(1)
+        fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+        device = QMediaDevices.defaultAudioOutput()
+        if not device.isFormatSupported(fmt):
+            self.show_toast("这台电脑暂时放不了语音", error=True)
+            return
+        buffer = QBuffer(self)
+        buffer.setData(pcm)
+        if not buffer.open(QIODevice.OpenModeFlag.ReadOnly):
+            self.show_toast("语音解不开", error=True)
+            return
+        sink = QAudioSink(device, fmt, self)
+        sink.start(buffer)
+        if sink.error() != QAudioSink.Error.NoError:
+            sink.stop()
+            self.show_toast("语音播放失败", error=True)
+            return
+        attachment = item.attachment if isinstance(item.attachment, dict) else {}
+        attachment["playing"] = True
+        attachment["play_ratio"] = 0.0
+        self._voice_sink = sink
+        self._voice_buffer = buffer
+        self._voice_token = item.key
+        self._voice_ms = max(1, duration_ms(pcm, rate))
+        self._voice_started = time.monotonic()
+        self._play_timer.start()
+        self.messages.viewport().update()
+
+    def _poll_playback(self) -> None:
+        sink = self._voice_sink
+        if sink is None:
+            self._play_timer.stop()
+            return
+        try:
+            from PySide6.QtMultimedia import QAudioSink
+
+            state = sink.state()
+            idle = state == QAudioSink.State.IdleState
+            failed = sink.error() != QAudioSink.Error.NoError
+            heard = int(sink.processedUSecs())
+        except Exception:
+            self._stop_voice_playback()
+            return
+        ratio = min(1.0, (heard / 1000) / max(1, self._voice_ms))
+        self._set_voice_ratio(ratio)
+        if failed or (idle and heard > 50_000) or (idle and heard == 0 and time.monotonic() - self._voice_started > 1.2):
+            if failed or (idle and heard == 0):
+                self.show_toast("这台电脑暂时放不了语音", error=True)
+            self._stop_voice_playback()
+
+    def _set_voice_ratio(self, ratio: float) -> None:
+        item = self._item_by_key(self._voice_token)
+        if item is None or not isinstance(item.attachment, dict):
+            return
+        item.attachment["play_ratio"] = ratio
+        item.attachment["playing"] = True
+        self.messages.viewport().update()
+
+    def _stop_voice_playback(self) -> None:
+        self._play_timer.stop()
+        sink = self._voice_sink
+        self._voice_sink = None
+        buffer = self._voice_buffer
+        self._voice_buffer = None
+        if sink is not None:
+            sink.stop()
+        if buffer is not None:
+            buffer.close()
+        token = self._voice_token
+        self._voice_token = ""
+        for item in self.messages.items():
+            attachment = item.attachment
+            if not isinstance(attachment, dict) or attachment.get("media") != "voice":
+                continue
+            if item.key == token or attachment.get("playing") or attachment.get("play_ratio"):
+                attachment["playing"] = False
+                attachment["play_ratio"] = 0.0
+        self.messages.viewport().update()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape and self._voice_active:
+            self._cancel_voice()
+            return
+        super().keyPressEvent(event)
+
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._cancel_voice()
+        self._stop_voice_playback()
         self.worker.stop_async()
         self.worker.wait(3000)
         event.accept()

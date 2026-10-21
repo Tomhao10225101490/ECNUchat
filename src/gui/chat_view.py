@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.attachments import format_size
+from src.voice import format_duration
 from src.gui.icons import paint_icon
 from src.gui.logic import ChatItem, message_clock
 from src.gui.theme import PALETTES, RADIUS_BUBBLE, Palette
@@ -487,6 +488,8 @@ class MessageDelegate(QStyledItemDelegate):
             media_w, media_h = 220, 160
         elif attachment and media_kind == "video":
             media_w, media_h = 220, 132
+        elif attachment and media_kind == "voice":
+            media_w, media_h = 248, 40
         elif attachment:
             media_w, media_h = 220, 58
         else:
@@ -792,6 +795,9 @@ class MessageDelegate(QStyledItemDelegate):
     def _paint_attachment(self, painter: QPainter, item: ChatItem, rect: QRectF, text_color: str) -> None:
         attachment = item.attachment or {}
         kind = str(attachment.get("media") or "file")
+        if kind == "voice":
+            self._paint_voice(painter, item, rect, text_color)
+            return
         data = attachment.get("data")
         if kind == "image" and isinstance(data, (bytes, bytearray)) and data:
             pix = self._pix_from_bytes(bytes(data), int(rect.width()), int(rect.height()))
@@ -868,6 +874,74 @@ class MessageDelegate(QStyledItemDelegate):
             painter.setClipping(False)
             self._paint_file_card(painter, attachment, rect, text_color)
         painter.restore()
+
+    def _paint_voice(self, painter: QPainter, item: ChatItem, rect: QRectF, text_color: str) -> None:
+        attachment = item.attachment or {}
+        raw_peaks = attachment.get("peaks")
+        peaks: list[int] = []
+        if isinstance(raw_peaks, list):
+            for value in raw_peaks[:36]:
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue
+                peaks.append(max(0, min(100, int(value))))
+        if not peaks:
+            peaks = [8, 18, 12, 28, 16, 22, 10, 20]
+        try:
+            duration = max(0, int(attachment.get("duration_ms") or 0))
+        except (TypeError, ValueError):
+            duration = 0
+        try:
+            ratio = max(0.0, min(1.0, float(attachment.get("play_ratio") or 0)))
+        except (TypeError, ValueError):
+            ratio = 0.0
+        playing = bool(attachment.get("playing"))
+        shown = duration
+        if playing and ratio > 0:
+            shown = max(0, duration - int(duration * ratio))
+        circle = QRectF(rect.left(), rect.top() + (rect.height() - 28) / 2, 28, 28)
+        painter.setPen(Qt.PenStyle.NoPen)
+        if item.mine:
+            painter.setBrush(QColor(255, 255, 255, 48))
+        else:
+            painter.setBrush(QColor(self.palette.accent))
+        painter.drawEllipse(circle)
+        painter.setBrush(QColor("#FFFFFF"))
+        cx, cy = circle.center().x(), circle.center().y()
+        if playing:
+            painter.drawRoundedRect(QRectF(cx - 5, cy - 5, 3.2, 10), 1, 1)
+            painter.drawRoundedRect(QRectF(cx + 1.8, cy - 5, 3.2, 10), 1, 1)
+        else:
+            triangle = QPainterPath()
+            triangle.moveTo(cx - 3, cy - 6)
+            triangle.lineTo(cx + 7, cy)
+            triangle.lineTo(cx - 3, cy + 6)
+            triangle.closeSubpath()
+            painter.drawPath(triangle)
+        clock = format_duration(shown)
+        painter.setFont(self.font_meta)
+        clock_w = max(32, painter.fontMetrics().horizontalAdvance(clock) + 4)
+        painter.setPen(QColor(text_color))
+        painter.drawText(
+            QRectF(rect.right() - clock_w, rect.top(), clock_w, rect.height()),
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            clock,
+        )
+        left = circle.right() + 8
+        right = rect.right() - clock_w - 6
+        count = len(peaks)
+        span = max(8.0, right - left)
+        slot = span / count
+        bar_w = min(3.0, max(1.5, slot * 0.58))
+        played = QColor("#FFFFFF" if item.mine else self.palette.accent)
+        idle = QColor(text_color)
+        idle.setAlpha(110)
+        mid = rect.center().y()
+        painter.setPen(Qt.PenStyle.NoPen)
+        for index, peak in enumerate(peaks):
+            painter.setBrush(played if (index + 0.5) / count <= ratio else idle)
+            height = max(3.0, 3 + peak / 100 * 16)
+            x = left + index * slot + (slot - bar_w) / 2
+            painter.drawRoundedRect(QRectF(x, mid - height / 2, bar_w, height), 1.2, 1.2)
 
     def _can_save(self, item: ChatItem) -> bool:
         attachment = item.attachment if isinstance(item.attachment, dict) else {}

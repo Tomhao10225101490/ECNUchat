@@ -13,6 +13,7 @@ from PySide6.QtCore import QThread, Signal
 from src.attachments import attachment_view, preview_text
 from src.client import IMAGE_PREVIEW_LIMIT, ChatEngine, split_dm_conv
 from src.protocol import fingerprint
+from src.voice import wav_to_pcm
 
 
 @dataclass(frozen=True)
@@ -223,7 +224,7 @@ class EngineWorker(QThread):
             try:
                 await self._handle(action, payload)
             except Exception as exc:
-                if action in {"send", "send_file"}:
+                if action in {"send", "send_file", "send_voice"}:
                     local_id = str(payload.get("local_id", ""))
                     if self.engine is not None:
                         self.engine.store.update_message_status(local_id, "failed")
@@ -264,6 +265,8 @@ class EngineWorker(QThread):
             await self._send(payload)
         elif action == "send_file":
             await self._send_file(payload)
+        elif action == "send_voice":
+            await self._send_voice(payload)
         elif action == "open_chat":
             username = str(payload["username"])
             await engine.fetch_user(username)
@@ -299,6 +302,19 @@ class EngineWorker(QThread):
                 action,
                 True,
                 {"title": str(payload.get("title") or "图片"), "data": raw},
+            )
+        elif action == "open_voice":
+            raw = engine.media_plaintext(str(payload.get("id") or ""))
+            pcm, rate = wav_to_pcm(raw)
+            self.actionResult.emit(
+                action,
+                True,
+                {
+                    "pcm": pcm,
+                    "rate": rate,
+                    "id": str(payload.get("id") or ""),
+                    "token": str(payload.get("token") or ""),
+                },
             )
         elif action == "fingerprint":
             username = str(payload["username"])
@@ -435,6 +451,8 @@ class EngineWorker(QThread):
     def _decorate_attachment(self, conv: str, view: dict[str, Any]) -> dict[str, Any]:
         assert self.engine is not None
         view["can_save"] = self.engine._media_save_allowed(conv, str(view.get("mime") or ""))
+        if view.get("media") == "voice":
+            view["can_save"] = False
         if (
             view.get("media") == "image"
             and view.get("id")
@@ -494,5 +512,32 @@ class EngineWorker(QThread):
         if isinstance(view, dict):
             view = self._decorate_attachment(conv, view)
         self.actionResult.emit("send_file", True, {"local_id": local_id, "attachment": view})
+        self.snapshot.emit(self._snapshot())
+
+    async def _send_voice(self, payload: dict[str, Any]) -> None:
+        assert self.engine is not None
+        engine = self.engine
+        local_id = str(payload["local_id"])
+        conv = str(payload["conv"])
+        wav = payload.get("wav")
+        if not isinstance(wav, (bytes, bytearray)) or not wav:
+            raise ValueError("语音无效")
+        engine.store.save_message_status(local_id, conv, "语音", "sending")
+        kwargs: dict[str, Any] = {"local_id": local_id}
+        if conv.startswith("dm:"):
+            peer, _tid = split_dm_conv(conv)
+            kwargs["peer"] = peer
+            kwargs["conv"] = conv
+        elif conv.startswith("group:"):
+            kwargs["group"] = conv[6:]
+        else:
+            raise ValueError("会话 ID 无效")
+        history = await engine.send_voice(bytes(wav), **kwargs)
+        engine.store.update_message_status(local_id, "accepted")
+        self.messageState.emit(local_id, "accepted", "")
+        view = attachment_view(engine.store.path, history) if isinstance(history, str) else None
+        if isinstance(view, dict):
+            view = self._decorate_attachment(conv, view)
+        self.actionResult.emit("send_voice", True, {"local_id": local_id, "attachment": view})
         self.snapshot.emit(self._snapshot())
 

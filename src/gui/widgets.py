@@ -422,6 +422,8 @@ class SendButton(QAbstractButton):
         self._accent_text = "#FFFFFF"
         self._muted = "#8B9BB4"
         self._track = "#314558"
+        self._danger = "#FF5A5F"
+        self._recording = False
         self._morph_anim = QVariantAnimation(self)
         self._morph_anim.setDuration(180)
         self._morph_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
@@ -455,6 +457,11 @@ class SendButton(QAbstractButton):
         self._accent_text = palette.accent_text
         self._muted = palette.text_tertiary
         self._track = palette.border
+        self._danger = palette.danger
+        self.update()
+
+    def set_recording(self, recording: bool) -> None:
+        self._recording = bool(recording)
         self.update()
 
     def set_active(self, active: bool, *, animate: bool = True) -> None:
@@ -528,6 +535,11 @@ class SendButton(QAbstractButton):
             painter.drawEllipse(rect)
         dpr = self.devicePixelRatioF()
         icon_rect = QRectF(10, 10, 20, 20)
+        if self._recording:
+            painter.setBrush(QColor(self._danger))
+            painter.drawEllipse(rect)
+            paint_icon(painter, "mic", icon_rect, "#FFFFFF", dpr)
+            return
         if self._morph < 0.5:
             paint_icon(painter, "mic", icon_rect, self._muted, dpr)
         else:

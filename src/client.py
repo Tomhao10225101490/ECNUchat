@@ -56,6 +56,14 @@ from src.attachments import (
     resolve_rel,
     seal_path,
 )
+from src.voice import (
+    MAX_VOICE_MS,
+    MIN_VOICE_MS,
+    duration_ms,
+    peaks_from_pcm,
+    read_voice,
+    wav_to_pcm,
+)
 from src.double_ratchet import (
     GCMError,
     RatchetError,
@@ -833,6 +841,36 @@ class ChatEngine:
         )
         self.store.add_history(conv_key, self.username, text)
 
+    async def send_voice(
+        self,
+        wav: bytes,
+        *,
+        peer: str | None = None,
+        group: str | None = None,
+        conv: str | None = None,
+        local_id: str | None = None,
+    ) -> str:
+        """语音和文字走同一条棘轮。字节先封成密文分片，钥匙留在信封里。"""
+        try:
+            pcm, rate = wav_to_pcm(wav)
+        except ValueError as exc:
+            raise ProtocolError("语音无效") from exc
+        length = duration_ms(pcm, rate)
+        if length < MIN_VOICE_MS:
+            raise ProtocolError("语音太短")
+        if length > MAX_VOICE_MS:
+            raise ProtocolError("语音最长 3 分钟")
+        return await self.send_file(
+            data=wav,
+            filename="voice.wav",
+            mime="audio/wav",
+            peer=peer,
+            group=group,
+            conv=conv,
+            local_id=local_id,
+            voice={"ms": length, "peaks": peaks_from_pcm(pcm)},
+        )
+
     async def send_file(
         self,
         path: str | None = None,
@@ -845,6 +883,7 @@ class ChatEngine:
         data: bytes | None = None,
         filename: str | None = None,
         mime: str | None = None,
+        voice: dict | None = None,
     ) -> str:
         """上传一份密文，再给每个收件人发一封带文件钥匙的棘轮信封。"""
         if not isinstance(caption, str) or len(caption) > 2000:
@@ -888,6 +927,7 @@ class ChatEngine:
                 filename=filename,
                 mime=mime,
                 save_allowed=self._media_save_allowed(conv_key, mime or ""),
+                voice=voice,
             )
             record["gstate"] = gstate
             record["thread"] = thread
@@ -944,11 +984,13 @@ class ChatEngine:
         filename: str | None,
         mime: str | None,
         save_allowed: bool = True,
+        voice: dict | None = None,
     ) -> dict[str, Any]:
         del save_allowed
         root = attachment_root(self.store.path)
         sealed = False
         media = False
+        voice_meta = None
         if data is None:
             if not path:
                 raise ProtocolError("没有要发送的文件")
@@ -960,7 +1002,10 @@ class ChatEngine:
                 raise ProtocolError("文件超过 8GiB")
             filename = filename or file_path.name
             chosen_mime = mime or guess_mime(filename)
-            if media_kind(chosen_mime) in {"image", "video"}:
+            voice_meta = read_voice(voice, chosen_mime) if voice is not None else None
+            if voice is not None and voice_meta is None:
+                raise ProtocolError("语音无效")
+            if media_kind(chosen_mime) in {"image", "video"} or voice_meta is not None:
                 try:
                     meta = seal_path(file_path, root / "cipher", filename, chosen_mime)
                 except AttachmentError as exc:
@@ -981,7 +1026,10 @@ class ChatEngine:
             payload = bytes(data)
             filename = filename or "file"
             chosen_mime = mime or guess_mime(filename)
-            if media_kind(chosen_mime) in {"image", "video"}:
+            voice_meta = read_voice(voice, chosen_mime) if voice is not None else None
+            if voice is not None and voice_meta is None:
+                raise ProtocolError("语音无效")
+            if media_kind(chosen_mime) in {"image", "video"} or voice_meta is not None:
                 staging = root / "staging"
                 staging.mkdir(parents=True, exist_ok=True)
                 temporary = staging / f"{uuid.uuid4().hex}.bin"
@@ -1018,6 +1066,7 @@ class ChatEngine:
             "uploaded": False,
             "logged": False,
             "history": "",
+            "voice": voice_meta,
         }
 
     def _file_history_body(self, record: dict[str, Any]) -> str:
@@ -1032,6 +1081,7 @@ class ChatEngine:
                 caption=str(record.get("caption") or ""),
                 blob_id=meta.file_id.hex(),
                 saved=False,
+                voice=record.get("voice"),
             )
         return history_body(
             name=meta.name,
@@ -1167,7 +1217,7 @@ class ChatEngine:
     def _load_media_record(self, file_id: str) -> Any:
         raw = self.store.load_media_meta(file_id) or self.store.load_file_cache(file_id)
         if raw is None:
-            raise ProtocolError("没有这支视频的加密缓存")
+            raise ProtocolError("没有这份加密缓存")
         return meta_from_dict(raw)
 
     def _media_folder(self, meta: Any) -> Path:
@@ -1199,18 +1249,21 @@ class ChatEngine:
             await self._flush_outbox(peer)
             state = await self._ensure_session_for_send(peer)
             x3dh = self.pending_x3dh.get(peer)
+            inner_body: dict[str, Any] = {
+                "v": 1,
+                "text": record.get("caption") or "",
+                "group": record.get("group"),
+                "kind": "file",
+                "gstate": record.get("gstate"),
+                "file": record["meta"],
+                "thread": record.get("thread"),
+                "thread_title": record.get("thread_title"),
+                "privacy": record.get("privacy") or "low",
+            }
+            if record.get("voice"):
+                inner_body["voice"] = record["voice"]
             inner = json.dumps(
-                {
-                    "v": 1,
-                    "text": record.get("caption") or "",
-                    "group": record.get("group"),
-                    "kind": "file",
-                    "gstate": record.get("gstate"),
-                    "file": record["meta"],
-                    "thread": record.get("thread"),
-                    "thread_title": record.get("thread_title"),
-                    "privacy": record.get("privacy") or "low",
-                },
+                inner_body,
                 ensure_ascii=False,
                 separators=(",", ":"),
             ).encode("utf-8")
@@ -1351,6 +1404,7 @@ class ChatEngine:
                 "conv": conv,
                 "caption": text,
                 "logged": False,
+                "voice": extra.get("voice"),
             }
             try:
                 await self._accept_incoming(record)
@@ -1399,8 +1453,10 @@ class ChatEngine:
         meta = meta_from_dict(record["meta"])
         blob_id = meta.file_id.hex()
         local_id = f"in:{blob_id}"
+        voice = read_voice(record.get("voice"), meta.mime)
+        record["voice"] = voice
         self.store.save_incoming_file(blob_id, record)
-        media = media_kind(meta.mime) in {"image", "video"}
+        media = media_kind(meta.mime) in {"image", "video"} or voice is not None
         rel = f"files/{blob_id}/{meta.name}"
         root = attachment_root(self.store.path)
         dest = root / "cipher" / blob_id if media else root / rel
@@ -1424,10 +1480,14 @@ class ChatEngine:
             "media": media_kind(meta.mime),
             "caption": caption,
             "encrypted": media,
-            "file_id": blob_id if media_kind(meta.mime) == "video" else "",
+            "file_id": blob_id if media_kind(meta.mime) == "video" or voice is not None else "",
             "saved": not media,
-            "can_save": self._media_save_allowed(conv, meta.mime),
+            "can_save": self._media_save_allowed(conv, meta.mime) and voice is None,
         }
+        if voice is not None:
+            progress_view["media"] = "voice"
+            progress_view["duration_ms"] = voice["ms"]
+            progress_view["peaks"] = list(voice["peaks"])
         await self.inbox.put(
             Incoming(
                 str(record["sender"]),
@@ -1490,6 +1550,7 @@ class ChatEngine:
                 caption=caption,
                 blob_id=blob_id,
                 saved=False,
+                voice=voice,
             )
         else:
             partial.replace(dest)
@@ -1542,7 +1603,7 @@ class ChatEngine:
             )
 
     async def _download_to_cache(self, meta: Any, local_id: str) -> None:
-        """图片和视频只把密文分片留在 cipher/。摘要在内存里按顺序核对。"""
+        """图片、视频和语音只把密文分片留在 cipher/。摘要在内存里按顺序核对。"""
         folder = attachment_root(self.store.path) / "cipher" / meta.file_id.hex()
         await self._download_cipher(meta, folder, local_id)
 
@@ -1814,10 +1875,12 @@ class ChatEngine:
             elif verified_gstate:
                 raise ValueError
             file_payload = inner.get("file")
+            voice = None
             if verified_kind == "file":
                 if not isinstance(file_payload, dict):
                     raise ValueError
                 file_meta = meta_from_dict(file_payload)
+                voice = read_voice(inner.get("voice"), file_meta.mime) if "voice" in inner else None
             elif file_payload is not None:
                 raise ValueError
         except (
@@ -1856,6 +1919,7 @@ class ChatEngine:
             "thread": thread,
             "thread_title": thread_title,
             "privacy": privacy,
+            "voice": voice,
         }
 
     def _apply_social(self, msg: dict[str, Any]) -> None:

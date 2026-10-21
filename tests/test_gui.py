@@ -770,3 +770,86 @@ def test_empty_group_invite_and_group_search() -> None:
     window.hide()
     qt.processEvents()
 
+
+def test_voice_message_bubble_and_hold_to_send() -> None:
+    from src.voice import duration_ms, pcm_to_wav, peaks_from_pcm
+
+    qt = app()
+    worker = FakeWorker()
+    window = MainWindow(worker, snapshot())
+    window.resize(960, 640)
+    window.show()
+    window.open_conversation("dm:bob")
+    qt.processEvents()
+    pcm = b"\x10\x20" * 8000
+    window._queue_voice(pcm)
+    qt.processEvents()
+    action, payload = worker.commands[-1]
+    assert action == "send_voice"
+    assert payload["conv"] == "dm:bob"
+    assert payload["wav"].startswith(b"RIFF")
+    assert pcm in payload["wav"]
+    item = window.bubbles[payload["local_id"]].item
+    assert item.attachment["media"] == "voice"
+    assert item.attachment["duration_ms"] == duration_ms(pcm)
+    assert item.attachment["encrypted"] is True
+    window.messages.grab()
+
+    before = len(worker.commands)
+    window._queue_voice(b"\x00\x00" * 100)
+    qt.processEvents()
+    assert len(worker.commands) == before
+    assert window.toast.text() == "按住久一点，松开发送"
+
+    window.snapshot_data["friends"] = [{"username": "carol"}]
+    window._begin_recording()
+    qt.processEvents()
+    assert window._voice_active is False
+    assert "好友" in window.toast.text()
+
+    peaks = peaks_from_pcm(pcm)
+    window.show_history(
+        "dm:bob",
+        [
+            {
+                "sender": "bob",
+                "body": "",
+                "ts": time.time(),
+                "attachment": {
+                    "media": "voice",
+                    "mime": "audio/wav",
+                    "name": "语音",
+                    "size": len(pcm_to_wav(pcm)),
+                    "duration_ms": 3200,
+                    "peaks": peaks,
+                    "encrypted": True,
+                    "id": "ab" * 16,
+                    "file_id": "ab" * 16,
+                },
+            }
+        ],
+    )
+    qt.processEvents()
+    heard = [row for row in window.messages.items() if isinstance(row.attachment, dict)]
+    assert heard and heard[0].attachment["media"] == "voice"
+    window.messages.grab()
+    window._open_attachment(heard[0])
+    qt.processEvents()
+    assert worker.commands[-1][0] == "open_voice"
+    assert worker.commands[-1][1]["id"] == "ab" * 16
+    window.on_action_result(
+        "open_voice",
+        True,
+        {"pcm": pcm, "rate": 16000, "token": heard[0].key, "id": "ab" * 16},
+    )
+    qt.processEvents()
+    window._stop_voice_playback()
+    window.voice_hold.show_state(2400, peaks, False, pulse=False)
+    window.input_shell.hide()
+    window.voice_hold.show()
+    window.send_button.set_recording(True)
+    qt.processEvents()
+    window.grab()
+    window.hide()
+    qt.processEvents()
+

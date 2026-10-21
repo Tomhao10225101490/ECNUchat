@@ -20,6 +20,8 @@ from typing import Any
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from src.voice import format_duration, read_voice
+
 MAX_FILE_BYTES = 8 * 1024 * 1024 * 1024
 FILE_PLAIN_CHUNK = 8 * 1024 * 1024
 FILE_LIMIT_LABEL = "8GiB"
@@ -439,6 +441,7 @@ def history_body(
     store: str = "plain",
     blob_id: str | None = None,
     saved: bool = True,
+    voice: dict | None = None,
 ) -> str:
     payload: dict[str, Any] = {
         "v": 1,
@@ -449,6 +452,11 @@ def history_body(
         "sha256": sha256.hex(),
         "caption": caption,
     }
+    checked = read_voice(voice, mime) if voice is not None else None
+    if voice is not None and checked is None:
+        raise AttachmentError("语音无效")
+    if checked is not None:
+        payload["voice"] = {"ms": checked["ms"], "peaks": checked["peaks"]}
     if blob_id:
         payload["id"] = blob_id
         payload["path"] = ""
@@ -508,7 +516,8 @@ def parse_history_body(body: str) -> dict | None:
             parts = Path(rel).parts
             if len(parts) != 2 or parts[0] != "cache" or not re.fullmatch(r"[0-9a-f]{32}", parts[1]):
                 return None
-    return {
+    voice = read_voice(data.get("voice"), mime) if "voice" in data else None
+    parsed = {
         "name": name,
         "mime": mime,
         "size": size,
@@ -519,6 +528,9 @@ def parse_history_body(body: str) -> dict | None:
         "id": blob_id,
         "saved": saved,
     }
+    if voice is not None:
+        parsed["voice"] = voice
+    return parsed
 
 
 def resolve_rel(db_path: str | Path, rel_path: str) -> Path:
@@ -534,8 +546,9 @@ def attachment_view(db_path: str | Path, body: str) -> dict | None:
     if record is None:
         return None
     kind = media_kind(record["mime"])
+    voice = record.get("voice")
     if record.get("id"):
-        return {
+        view = {
             "name": record["name"],
             "mime": record["mime"],
             "size": record["size"],
@@ -549,13 +562,14 @@ def attachment_view(db_path: str | Path, body: str) -> dict | None:
             "encrypted": kind in {"image", "video"},
             "file_id": record["id"] if kind == "video" else "",
         }
+        return _with_voice(view, voice)
     try:
         path = resolve_rel(db_path, record["path"])
     except AttachmentError:
         return None
     encrypted = record.get("store") == "cipher"
     file_id = Path(record["path"]).name if encrypted else ""
-    return {
+    view = {
         "name": record["name"],
         "mime": record["mime"],
         "size": record["size"],
@@ -569,6 +583,18 @@ def attachment_view(db_path: str | Path, body: str) -> dict | None:
         "id": "",
         "saved": True,
     }
+    return _with_voice(view, voice)
+
+
+def _with_voice(view: dict, voice: dict | None) -> dict:
+    if not voice:
+        return view
+    view["media"] = "voice"
+    view["encrypted"] = True
+    view["file_id"] = str(view.get("id") or view.get("file_id") or "")
+    view["duration_ms"] = voice["ms"]
+    view["peaks"] = list(voice["peaks"])
+    return view
 
 
 def _label(mime: str) -> str:
@@ -579,6 +605,13 @@ def display_text(body: str, db_path: str | Path | None = None) -> str:
     record = parse_history_body(body)
     if record is None:
         return body
+    voice = record.get("voice")
+    if voice:
+        line = f"[语音] {format_duration(voice['ms'])} · 加密缓存"
+        caption = record["caption"].strip()
+        if caption:
+            return f"{caption}\n{line}"
+        return line
     shown = ""
     if record.get("id"):
         cache = " · 加密缓存"
@@ -603,6 +636,13 @@ def preview_text(body: str) -> str:
     record = parse_history_body(body)
     if record is None:
         return " ".join((body or "").split())
+    voice = record.get("voice")
+    if voice:
+        base = f"语音 {format_duration(voice['ms'])}"
+        caption = " ".join(record["caption"].split())
+        if caption:
+            return f"{caption} {base}"
+        return base
     base = f"[{_label(record['mime'])}] {record['name']}"
     caption = " ".join(record["caption"].split())
     if caption:
