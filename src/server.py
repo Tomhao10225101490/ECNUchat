@@ -20,6 +20,7 @@ from src.groups import (
     verify_state_transition,
 )
 from src.prekeys import MLKEM768_PUB_LEN, verify_pq, verify_pq_opk, verify_spk
+from src.call import unpack_call_frame
 from src.protocol import (
     MAX_BLOB_FRAME,
     MAX_GROUP_MEMBERS,
@@ -155,22 +156,37 @@ class ChatServer:
                     await ws.send(dumps(error_msg("单条 WebSocket 消息超过 8MiB")))
                     continue
                 if not isinstance(raw, str):
-                    frame = unpack_blob_frame(raw if isinstance(raw, (bytes, bytearray)) else bytes(raw))
-                    if frame is None or frame[0] != "U":
+                    framed = raw if isinstance(raw, (bytes, bytearray)) else bytes(raw)
+                    frame = unpack_blob_frame(framed)
+                    if frame is not None:
+                        if frame[0] != "U":
+                            await ws.send(dumps(error_msg("分片帧无效")))
+                            continue
+                        if username is None:
+                            await ws.send(dumps(error_msg("请先注册或登录")))
+                            continue
+                        _kind, request_id, file_id, index, data = frame
+                        try:
+                            token = socket.begin_request(request_id)
+                            await self.on_blob_chunk_raw(socket, username, file_id, index, data)
+                        except Exception as exc:
+                            log.info("error type=blob_chunk detail=%s", type(exc).__name__)
+                            await socket.send(dumps(error_msg(str(exc))))
+                        finally:
+                            socket.end_request(token)
+                        continue
+                    call = unpack_call_frame(framed)
+                    if call is None:
                         await ws.send(dumps(error_msg("分片帧无效")))
                         continue
                     if username is None:
                         await ws.send(dumps(error_msg("请先注册或登录")))
                         continue
-                    _kind, request_id, file_id, index, data = frame
                     try:
-                        token = socket.begin_request(request_id)
-                        await self.on_blob_chunk_raw(socket, username, file_id, index, data)
+                        await self.on_call_frame(socket, username, bytes(framed), call)
                     except Exception as exc:
-                        log.info("error type=blob_chunk detail=%s", type(exc).__name__)
+                        log.info("error type=call detail=%s", type(exc).__name__)
                         await socket.send(dumps(error_msg(str(exc))))
-                    finally:
-                        socket.end_request(token)
                     continue
                 try:
                     msg = loads(raw)
@@ -551,6 +567,38 @@ class ChatServer:
             self.store.enqueue_offline(dst, outgoing)
             log.info("offline_queue %s -> %s", src, dst)
         await ws.send(dumps({"type": "envelope_ok", "to": dst}))
+
+    async def on_call_frame(
+        self,
+        ws: Any,
+        username: str,
+        raw: bytes,
+        frame: tuple[str, str, bytes, int, int, bytes],
+    ) -> None:
+        """在线好友之间转发通话密文。不排队，日志只记双方和字节数。"""
+        sender, recipient, _call_id, _direction, _seq, _ciphertext = frame
+        if sender != username:
+            await ws.send(dumps(error_msg("信封发送方必须是自己")))
+            return
+        try:
+            validate_username(recipient)
+        except ProtocolError as exc:
+            await ws.send(dumps(error_msg(str(exc))))
+            return
+        if not self.store.are_friends(username, recipient):
+            await ws.send(dumps(error_msg("需要对方同意好友申请后才能发消息")))
+            return
+        log.info("call %s -> %s bytes=%s", username, recipient, len(raw))
+        peer = self.online.get(recipient)
+        if peer is None:
+            log.info("call_drop %s -> %s offline", username, recipient)
+            return
+        try:
+            await peer.send(raw)
+        except Exception:
+            self.online.pop(recipient, None)
+            log.info("call_drop %s -> %s send failure", username, recipient)
+            await self._broadcast_presence()
 
     async def on_group_create(self, ws: Any, username: str, msg: dict[str, Any]) -> None:
         try:

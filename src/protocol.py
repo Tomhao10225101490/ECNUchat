@@ -25,6 +25,7 @@ PROJECT_ABSTRACT = (
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 MAX_WS_MESSAGE = 64 * 1024
 # 聊天信封仍是 64KB。附件密文走二进制帧，8MiB 明文加上 GCM 标签和 73 字节头。
+# 通话声音是另一条二进制帧，魔数 ECC1，定义在 src/call.py，不进这条附件帧。
 MAX_BLOB_FRAME = 8 * 1024 * 1024 + 64 * 1024
 BLOB_MAGIC = b"ECB1"
 BLOB_HEADER_LEN = 73

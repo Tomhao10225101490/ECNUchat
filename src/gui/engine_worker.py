@@ -40,6 +40,8 @@ class EngineWorker(QThread):
     actionResult = Signal(str, bool, object)
     connectionChanged = Signal(bool, str)
     fatalError = Signal(str)
+    callState = Signal(object)
+    callAudio = Signal(object)
 
     def __init__(self, config: ConnectionConfig) -> None:
         super().__init__()
@@ -97,6 +99,8 @@ class EngineWorker(QThread):
         self.connectionChanged.emit(False, "正在解锁本地保险库…")
         engine = ChatEngine.open(config.username, config.password, db_path)
         engine.on_file_progress = self._emit_file_progress
+        engine.on_call = self._emit_call_state
+        engine.on_call_audio = self._emit_call_audio
         self.engine = engine
         outbox_before = set(engine.store.list_outbox_peers())
         self.connectionChanged.emit(False, "正在建立安全连接…")
@@ -186,6 +190,19 @@ class EngineWorker(QThread):
     def _emit_file_progress(self, local_id: str, done: int, total: int) -> None:
         self.fileProgress.emit(str(local_id), int(done), int(total))
 
+    def _emit_call_state(self, state: dict[str, Any]) -> None:
+        self.callState.emit(dict(state))
+
+    def _emit_call_audio(self, pcm: bytes) -> None:
+        self.callAudio.emit(bytes(pcm))
+
+    def push_call_audio(self, pcm: bytes) -> None:
+        loop = self._loop
+        engine = self.engine
+        if loop is None or engine is None or not loop.is_running():
+            return
+        loop.call_soon_threadsafe(engine.offer_call_audio, bytes(pcm))
+
     async def _pump_inbox(self) -> None:
         while not self._stopping:
             assert self.engine is not None
@@ -267,6 +284,18 @@ class EngineWorker(QThread):
             await self._send_file(payload)
         elif action == "send_voice":
             await self._send_voice(payload)
+        elif action == "call_invite":
+            await engine.call_invite(str(payload["peer"]))
+            self.actionResult.emit(action, True, engine.call_view())
+        elif action == "call_accept":
+            await engine.call_accept()
+            self.actionResult.emit(action, True, engine.call_view())
+        elif action == "call_reject":
+            await engine.call_reject()
+            self.actionResult.emit(action, True, engine.call_view())
+        elif action == "call_hangup":
+            await engine.call_hangup()
+            self.actionResult.emit(action, True, engine.call_view())
         elif action == "open_chat":
             username = str(payload["username"])
             await engine.fetch_user(username)

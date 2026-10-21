@@ -59,6 +59,8 @@ from src.gui.logic import (
     security_hint,
 )
 from src.gui.theme import PALETTES, THEME_LABELS, THEME_ORDER, Palette, lerp_palette, next_theme, stylesheet
+from src.gui.call_audio import CallCapture, CallPlayback
+from src.gui.call_overlay import CallOverlay
 from src.gui.voice_bar import VoiceCapture, VoiceHoldBar
 from src.voice import (
     MIN_VOICE_MS,
@@ -328,6 +330,10 @@ class MainWindow(QMainWindow):
         self._voice_buffer = None
         self._voice_ms = 0
         self._voice_started = 0.0
+        self._call_phase = "idle"
+        self._call_peer = ""
+        self._call_capture = CallCapture()
+        self._call_playback = CallPlayback()
         self._arm_text_send = False
         self._capture = VoiceCapture()
         self._group_hits: list[dict[str, Any]] = []
@@ -577,6 +583,12 @@ class MainWindow(QMainWindow):
         self.info_button.hide()
         self.info_button.setEnabled(False)
         self.info_button.clicked.connect(self.show_fingerprint)
+        self.call_button = IconButton("phone", 36, 18)
+        self.call_button.setObjectName("callButton")
+        self.call_button.setToolTip("语音通话")
+        self.call_button.clicked.connect(self._dial_call)
+        self.call_button.hide()
+        header_layout.addWidget(self.call_button)
         self.more_button = IconButton("more", 36, 18)
         self.more_button.setToolTip("更多")
         self.more_button.clicked.connect(self._more_menu)
@@ -707,6 +719,11 @@ class MainWindow(QMainWindow):
         self._typing_anim.setDuration(900)
         self._typing_anim.setLoopCount(-1)
         self._typing_anim.valueChanged.connect(self._on_typing_phase)
+        self.call_overlay = CallOverlay(self.chat)
+        self.call_overlay.acceptClicked.connect(lambda: self.worker.submit("call_accept"))
+        self.call_overlay.rejectClicked.connect(lambda: self.worker.submit("call_reject"))
+        self.call_overlay.hangupClicked.connect(lambda: self.worker.submit("call_hangup"))
+        self.chat.installEventFilter(self)
         self.chat_body.installEventFilter(self)
         self._show_page(0)
 
@@ -816,6 +833,8 @@ class MainWindow(QMainWindow):
         return scroll
 
     def eventFilter(self, watched, event):
+        if watched is self.chat and event.type() == QEvent.Type.Resize:
+            self._place_call_overlay()
         if watched is self.chat_body and event.type() == QEvent.Type.Resize:
             self._place_overlays()
         if watched is self.composer and event.type() == QEvent.Type.KeyPress:
@@ -834,6 +853,13 @@ class MainWindow(QMainWindow):
         )
         self.new_button.raise_()
 
+    def _place_call_overlay(self) -> None:
+        if not hasattr(self, "call_overlay"):
+            return
+        self.call_overlay.setGeometry(self.chat.rect())
+        if self.call_overlay.isVisible():
+            self.call_overlay.raise_()
+
     def _connect_worker(self) -> None:
         self.worker.snapshot.connect(self.update_snapshot)
         self.worker.incoming.connect(self.on_incoming)
@@ -844,6 +870,8 @@ class MainWindow(QMainWindow):
         self.worker.connectionChanged.connect(self.on_connection)
         self.worker.fatalError.connect(self.on_fatal)
         self.worker.fileProgress.connect(self.on_file_progress)
+        self.worker.callState.connect(self.on_call_state)
+        self.worker.callAudio.connect(self.on_call_audio)
 
     def apply_theme(self, theme: str, *, persist: bool = True, animate: bool = True) -> None:
         if theme not in PALETTES:
@@ -889,6 +917,8 @@ class MainWindow(QMainWindow):
         self.new_button.apply_palette(palette)
         self.send_button.apply_palette(palette)
         self.voice_hold.apply_palette(palette)
+        if hasattr(self, "call_overlay"):
+            self.call_overlay.apply_palette(palette)
         self.motion_switch.apply_palette(palette)
         gui_widgets.AVATAR_RING = palette.bg_side
         self.self_avatar.online_color = palette.online
@@ -904,6 +934,7 @@ class MainWindow(QMainWindow):
             self.emoji_button,
             self.attach_button,
             self.more_button,
+            self.call_button,
             self.back_button,
             self.compose_button,
             self.menu_button,
@@ -1299,6 +1330,7 @@ class MainWindow(QMainWindow):
             self.header_avatar.hide()
             self.info_button.setEnabled(False)
             self.info_button.hide()
+            self.call_button.hide()
             self.composer_bar.hide()
             self.invite_bar.hide()
             return
@@ -1309,6 +1341,7 @@ class MainWindow(QMainWindow):
         self.invite_bar.setVisible(pending)
         self.info_button.setEnabled(conv.startswith("dm:"))
         self.info_button.hide()
+        self.call_button.setVisible(conv.startswith("dm:"))
         if conv.startswith("dm:"):
             peer = self._dm_peer(conv)
             online = peer in set(self.snapshot_data.get("online", []))
@@ -1654,6 +1687,9 @@ class MainWindow(QMainWindow):
             note = str(item.get("text") or "")
             if note:
                 self.show_toast(note)
+            return
+        if item.get("kind") == "call_note":
+            self._show_call_note(str(item.get("conv") or ""), str(item.get("text") or ""))
             return
         group = item.get("group")
         sender = str(item.get("sender") or "")
@@ -2102,6 +2138,8 @@ class MainWindow(QMainWindow):
             return "先同意加入，才能在群里发消息"
         if self.current_conv.startswith("dm:") and not self._dm_allowed(self._dm_peer(self.current_conv)):
             return "需要对方同意好友申请后才能发消息"
+        if self._call_phase not in {"", "idle"}:
+            return "正在通话"
         return None
 
     def _begin_recording(self) -> None:
@@ -2981,9 +3019,101 @@ class MainWindow(QMainWindow):
             return
         super().keyPressEvent(event)
 
+    def _call_title(self, peer: str) -> str:
+        if (
+            self.current_conv
+            and self.current_conv.startswith("dm:")
+            and self._dm_peer(self.current_conv) == peer
+        ):
+            return self.conv_title(self.current_conv)
+        latest = self._latest_thread(peer)
+        if latest:
+            return self.conv_title(latest)
+        return peer
+
+    def _dial_call(self) -> None:
+        conv = self.current_conv or ""
+        if not conv.startswith("dm:"):
+            return
+        if self._call_phase not in {"", "idle"}:
+            self.show_toast("正在通话")
+            return
+        peer = self._dm_peer(conv)
+        if not self._dm_allowed(peer):
+            self.show_toast("需要对方同意好友申请后才能发消息", error=True)
+            return
+        if self._voice_active:
+            self._cancel_voice()
+        self._stop_voice_playback()
+        self.worker.submit("call_invite", peer=peer)
+
+    def on_call_state(self, state: object) -> None:
+        if not isinstance(state, dict):
+            return
+        phase = str(state.get("phase") or "idle")
+        was = self._call_phase
+        self._call_phase = phase
+        self._call_peer = str(state.get("peer") or "")
+        title = self._call_title(self._call_peer) if self._call_peer else ""
+        online = self._call_peer in set(self.snapshot_data.get("online", []))
+        self.call_overlay.set_call(state, self._palette, title, online)
+        self._place_call_overlay()
+        if phase == "active" and was != "active":
+            self._start_call_media()
+        elif phase != "active":
+            self._stop_call_media()
+
+    def on_call_audio(self, pcm: object) -> None:
+        if self._call_phase != "active" or not isinstance(pcm, (bytes, bytearray)):
+            return
+        self._call_playback.push(bytes(pcm))
+
+    def _on_call_pcm(self, pcm: bytes) -> None:
+        if self.call_overlay.muted or self._call_phase != "active":
+            return
+        push = getattr(self.worker, "push_call_audio", None)
+        if push is not None:
+            push(pcm)
+
+    def _start_call_media(self) -> None:
+        self._stop_call_media()
+        notes = []
+        mic = self._call_capture.start(self._on_call_pcm)
+        if mic:
+            notes.append(mic)
+        speaker = self._call_playback.start()
+        if speaker:
+            notes.append(speaker)
+        if notes:
+            self.show_toast("，".join(notes), error=True)
+
+    def _stop_call_media(self) -> None:
+        self._call_capture.stop()
+        self._call_playback.stop()
+
+    def _show_call_note(self, conv: str, body: str) -> None:
+        if not body:
+            return
+        peer = self._dm_peer(conv) if conv.startswith("dm:") else ""
+        viewing = bool(
+            self.current_conv
+            and self.current_conv.startswith("dm:")
+            and peer
+            and self._dm_peer(self.current_conv) == peer
+        )
+        if viewing:
+            self.append_message("系统", body, time.time(), mine=False, kind="chat")
+        if conv and conv != self.current_conv and conv not in self._mutes:
+            self.unread[conv] = self.unread.get(conv, 0) + 1
+            self.worker.submit("mark_read", unread=self.unread)
+            self.rebuild_conversations()
+
     def closeEvent(self, event: QCloseEvent) -> None:
         self._cancel_voice()
         self._stop_voice_playback()
+        if self._call_phase not in {"", "idle"}:
+            self.worker.submit("call_hangup")
+        self._stop_call_media()
         self.worker.stop_async()
         self.worker.wait(3000)
         event.accept()

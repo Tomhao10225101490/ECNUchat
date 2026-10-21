@@ -23,6 +23,8 @@ class FakeWorker(QObject):
     actionResult = Signal(str, bool, object)
     connectionChanged = Signal(bool, str)
     fatalError = Signal(str)
+    callState = Signal(object)
+    callAudio = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -30,6 +32,9 @@ class FakeWorker(QObject):
 
     def submit(self, action: str, **payload) -> None:
         self.commands.append((action, payload))
+
+    def push_call_audio(self, pcm: bytes) -> None:
+        self.commands.append(("push_call_audio", {"pcm": pcm}))
 
     def stop_async(self) -> None:
         pass
@@ -850,6 +855,97 @@ def test_voice_message_bubble_and_hold_to_send() -> None:
     window.send_button.set_recording(True)
     qt.processEvents()
     window.grab()
+    window.hide()
+    qt.processEvents()
+
+
+def test_voice_call_overlay_answers_and_hangs_up() -> None:
+    qt = app()
+    worker = FakeWorker()
+    window = MainWindow(worker, snapshot())
+    window.resize(960, 640)
+    window.show()
+    window.open_conversation("dm:bob")
+    qt.processEvents()
+    assert "双棘轮代数 2" in window.chat_subtitle.text()
+    assert window.call_button.isVisible()
+    assert window.call_button.toolTip() == "语音通话"
+
+    window.call_button.click()
+    qt.processEvents()
+    action, payload = worker.commands[-1]
+    assert action == "call_invite"
+    assert payload["peer"] == "bob"
+
+    window.snapshot_data["friends"] = [{"username": "carol"}]
+    before = len(worker.commands)
+    window.call_button.click()
+    qt.processEvents()
+    assert len(worker.commands) == before
+    assert "好友" in window.toast.text()
+
+    window.on_call_state({"phase": "outgoing", "peer": "bob", "role": "caller", "started": None})
+    qt.processEvents()
+    assert window.call_overlay.isVisible()
+    assert window.call_overlay.status_label.text() == "正在等待对方接听…"
+    assert window.call_overlay.hangup_button.isVisible()
+    assert not window.call_overlay.accept_button.isVisible()
+    window.call_overlay.hangup_button.click()
+    qt.processEvents()
+    assert worker.commands[-1][0] == "call_hangup"
+
+    window.on_call_state({"phase": "incoming", "peer": "bob", "role": "callee", "started": None})
+    qt.processEvents()
+    assert window.call_overlay.status_label.text() == "邀请你语音通话"
+    assert window.call_overlay.accept_button.text() == "接听"
+    assert window.call_overlay.reject_button.text() == "挂断"
+    assert window.call_overlay.accept_button.isVisible()
+    assert window.call_overlay.reject_button.isVisible()
+    window.call_overlay.accept_button.click()
+    qt.processEvents()
+    assert worker.commands[-1][0] == "call_accept"
+
+    window.on_call_state({"phase": "incoming", "peer": "bob", "role": "callee", "started": None})
+    qt.processEvents()
+    window.call_overlay.reject_button.click()
+    qt.processEvents()
+    assert worker.commands[-1][0] == "call_reject"
+
+    started = time.time() - 12
+    window.on_call_state({"phase": "active", "peer": "bob", "role": "caller", "started": started})
+    qt.processEvents()
+    assert window.call_overlay.status_label.text().startswith("00:1")
+    assert window.call_overlay.secure_label.text() == "端到端加密"
+    assert window.call_overlay.mute_button.text() == "静音"
+    mark = len(worker.commands)
+    window.call_overlay.mute_button.click()
+    qt.processEvents()
+    assert window.call_overlay.mute_button.text() == "取消静音"
+    assert window.call_overlay.muted is True
+    assert not any(item[0].startswith("call_") for item in worker.commands[mark:])
+    window.call_overlay.hangup_button.click()
+    qt.processEvents()
+    assert worker.commands[-1][0] == "call_hangup"
+
+    window.on_incoming(
+        {"sender": "系统", "text": "对方已取消", "kind": "call_note", "conv": "dm:bob#abcd"}
+    )
+    qt.processEvents()
+    assert any(item.body == "对方已取消" for item in window.messages.items())
+    assert window.unread.get("dm:bob#abcd") == 1
+    window.on_incoming(
+        {"sender": "系统", "text": "语音通话 00:12", "kind": "call_note", "conv": "dm:bob"}
+    )
+    qt.processEvents()
+    assert any(item.body == "语音通话 00:12" for item in window.messages.items())
+    assert window.unread.get("dm:bob", 0) == 0
+
+    window.open_conversation("group:三人组")
+    qt.processEvents()
+    assert not window.call_button.isVisible()
+    window.on_call_state({"phase": "idle"})
+    qt.processEvents()
+    assert not window.call_overlay.isVisible()
     window.hide()
     qt.processEvents()
 

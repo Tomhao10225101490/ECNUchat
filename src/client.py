@@ -28,6 +28,20 @@ from rich.panel import Panel
 from rich.text import Text
 
 from src import PROJECT_ABSTRACT, PROJECT_NAME
+from src.call import (
+    CALLEE_TIMEOUT,
+    FRAME_BYTES,
+    RING_TIMEOUT,
+    CallSession,
+    elapsed_seconds,
+    format_call_clock,
+    invite_is_fresh,
+    open_frame,
+    pack_call_frame,
+    parse_call_body,
+    seal_frame,
+    unpack_call_frame,
+)
 from src.attachments import (
     FILE_PLAIN_CHUNK,
     MAX_FILE_BYTES,
@@ -207,6 +221,12 @@ class ChatEngine:
     _incoming_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _incoming_done: set[str] = field(default_factory=set)
     on_file_progress: Any = None
+    on_call: Any = None
+    on_call_audio: Any = None
+    _call: CallSession | None = None
+    _call_out: asyncio.Queue | None = None
+    _call_timer_task: asyncio.Task | None = None
+    _call_pump_task: asyncio.Task | None = None
 
     @classmethod
     def open(cls, username: str, password: str, db_path: str) -> ChatEngine:
@@ -476,21 +496,25 @@ class ChatEngine:
         try:
             async for raw in self.ws:
                 if not isinstance(raw, str):
-                    frame = unpack_blob_frame(raw if isinstance(raw, (bytes, bytearray)) else bytes(raw))
-                    if frame is None:
+                    data = raw if isinstance(raw, (bytes, bytearray)) else bytes(raw)
+                    frame = unpack_blob_frame(data)
+                    if frame is not None:
+                        _kind, request_id, file_id, index, blob = frame
+                        waiter = self._waiters.get(request_id)
+                        if waiter is not None and not waiter.done():
+                            waiter.set_result(
+                                {
+                                    "type": "blob_fetch_ok",
+                                    "id": file_id,
+                                    "idx": index,
+                                    "_bin": blob,
+                                    "request_id": request_id,
+                                }
+                            )
                         continue
-                    _kind, request_id, file_id, index, data = frame
-                    waiter = self._waiters.get(request_id)
-                    if waiter is not None and not waiter.done():
-                        waiter.set_result(
-                            {
-                                "type": "blob_fetch_ok",
-                                "id": file_id,
-                                "idx": index,
-                                "_bin": data,
-                                "request_id": request_id,
-                            }
-                        )
+                    call = unpack_call_frame(data)
+                    if call is not None:
+                        await self._on_call_media(call)
                     continue
                 try:
                     msg = loads(raw)
@@ -840,6 +864,340 @@ class ChatEngine:
             thread_title=str(thread_title) if thread_title else None,
         )
         self.store.add_history(conv_key, self.username, text)
+
+    def call_view(self) -> dict[str, Any]:
+        session = self._call
+        if session is None:
+            return {"phase": "idle", "peer": "", "role": "", "started": None}
+        return {
+            "phase": session.phase,
+            "peer": session.peer,
+            "role": session.role,
+            "started": session.started,
+        }
+
+    def _emit_call(self) -> None:
+        callback = self.on_call
+        if callback is not None:
+            callback(self.call_view())
+
+    def _emit_call_audio(self, pcm: bytes) -> None:
+        callback = self.on_call_audio
+        if callback is not None:
+            callback(pcm)
+
+    async def call_invite(self, peer: str) -> None:
+        validate_username(peer)
+        if peer == self.username:
+            raise ProtocolError("不能给自己打电话")
+        if self._call is not None:
+            raise ProtocolError("正在通话")
+        call_id = os.urandom(16)
+        key = os.urandom(32)
+        session = CallSession(
+            call_id=call_id,
+            peer=peer,
+            key=key,
+            role="caller",
+            phase="outgoing",
+            direction=0,
+        )
+        self._call = session
+        self._emit_call()
+        try:
+            await self._send_call_signal(peer, "invite", call_id, key)
+        except Exception:
+            if self._call is session:
+                self._finish_call(session, "")
+            raise
+        if self._call is session and session.phase == "outgoing":
+            self._arm_call_timer(session, RING_TIMEOUT, "caller")
+
+    async def call_accept(self) -> None:
+        session = self._call
+        if session is None or session.phase != "incoming":
+            raise ProtocolError("没有来电")
+        await self._send_call_signal(session.peer, "accept", session.call_id)
+        if self._call is session and session.phase == "incoming":
+            self._activate_call(session)
+
+    async def call_reject(self) -> None:
+        session = self._call
+        if session is None or session.phase != "incoming":
+            raise ProtocolError("没有来电")
+        try:
+            await self._send_call_signal(session.peer, "reject", session.call_id)
+        finally:
+            self._finish_call(session, "已拒绝")
+
+    async def call_hangup(self) -> None:
+        session = self._call
+        if session is None:
+            return
+        if session.phase == "incoming":
+            await self.call_reject()
+            return
+        op = "cancel" if session.phase == "outgoing" else "hangup"
+        text = "已取消" if session.phase == "outgoing" else self._call_duration_text(session)
+        try:
+            await self._send_call_signal(session.peer, op, session.call_id)
+        finally:
+            self._finish_call(session, text)
+
+    def offer_call_audio(self, pcm: bytes) -> None:
+        session = self._call
+        queue = self._call_out
+        if session is None or queue is None or session.phase != "active":
+            return
+        if not isinstance(pcm, (bytes, bytearray)) or not pcm or len(pcm) > FRAME_BYTES or len(pcm) % 2:
+            return
+        if queue.qsize() > 4:
+            return
+        queue.put_nowait(bytes(pcm))
+
+    def _call_duration_text(self, session: CallSession) -> str:
+        return f"语音通话 {format_call_clock(elapsed_seconds(session.started))}"
+
+    def _call_history_conv(self, peer: str) -> str:
+        best_conv = f"dm:{peer}"
+        best_created = -1.0
+        for conv, info in self.threads.items():
+            if not isinstance(info, dict) or info.get("peer") != peer:
+                continue
+            created = float(info.get("created") or 0)
+            if created >= best_created:
+                best_created = created
+                best_conv = conv
+        return best_conv
+
+    def _write_call_note(self, peer: str, text: str) -> None:
+        conv = self._call_history_conv(peer)
+        self.store.add_history(conv, "系统", text)
+        self.inbox.put_nowait(Incoming("系统", text, None, "call_note", conv=conv))
+
+    def _stop_call_tasks(self) -> None:
+        current = asyncio.current_task()
+        for attr in ("_call_timer_task", "_call_pump_task"):
+            task = getattr(self, attr)
+            setattr(self, attr, None)
+            if task is not None and task is not current and not task.done():
+                task.cancel()
+        self._call_out = None
+
+    def _finish_call(self, session: CallSession, text: str) -> None:
+        if self._call is not session:
+            return
+        peer = session.peer
+        self._call = None
+        self._stop_call_tasks()
+        self._emit_call()
+        if text:
+            self._write_call_note(peer, text)
+
+    def _activate_call(self, session: CallSession) -> None:
+        if self._call is not session:
+            return
+        timer = self._call_timer_task
+        self._call_timer_task = None
+        if timer is not None and timer is not asyncio.current_task() and not timer.done():
+            timer.cancel()
+        session.phase = "active"
+        session.started = time.time()
+        self._call_out = asyncio.Queue()
+        self._call_pump_task = asyncio.create_task(self._call_audio_pump())
+        self._emit_call()
+
+    def _arm_call_timer(self, session: CallSession, seconds: float, outcome: str) -> None:
+        timer = self._call_timer_task
+        self._call_timer_task = None
+        if timer is not None and not timer.done():
+            timer.cancel()
+        self._call_timer_task = asyncio.create_task(self._call_timer(session, seconds, outcome))
+
+    async def _call_timer(self, session: CallSession, seconds: float, outcome: str) -> None:
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            return
+        if self._call is not session:
+            return
+        if outcome == "caller" and session.phase == "outgoing":
+            try:
+                await self._send_call_signal(session.peer, "cancel", session.call_id)
+            except Exception:
+                pass
+            if self._call is session and session.phase == "outgoing":
+                self._finish_call(session, "对方无应答")
+        elif outcome == "callee" and session.phase == "incoming":
+            self._finish_call(session, "未接听")
+
+    def _rollback_call_send(self, peer: str, prior: dict[str, Any] | None) -> None:
+        self.store.delete_outbox(peer)
+        if prior is None:
+            self.sessions.pop(peer, None)
+            self.pending_x3dh.pop(peer, None)
+            return
+        state = RatchetState.from_record(prior)
+        self.sessions[peer] = state
+        self.store.save_session(peer, state)
+
+    async def _send_call_signal(
+        self,
+        peer: str,
+        op: str,
+        call_id: bytes,
+        key: bytes | None = None,
+    ) -> None:
+        body: dict[str, Any] = {"op": op, "id": call_id.hex(), "ts": int(time.time())}
+        if op == "invite":
+            if key is None or len(key) != 32:
+                raise ProtocolError("通话钥匙无效")
+            body["key"] = b64e(key)
+        lock = self._peer_locks.setdefault(peer, asyncio.Lock())
+        async with lock:
+            await self._flush_outbox(peer)
+            prior = self.sessions[peer].to_record() if peer in self.sessions else None
+            state = await self._ensure_session_for_send(peer)
+            x3dh = self.pending_x3dh.get(peer)
+            inner = json.dumps(
+                {
+                    "v": 1,
+                    "text": "",
+                    "group": None,
+                    "kind": "call",
+                    "gstate": None,
+                    "call": body,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            msg, message_key = encrypt(state, inner)
+            del message_key
+            payload = encode_ratchet_payload(msg, x3dh=x3dh, group=None, kind="call")
+            self.store.save_session_with_outbox(peer, state, payload)
+            try:
+                await self.request(
+                    {
+                        "type": "envelope",
+                        "from": self.username,
+                        "to": peer,
+                        "payload": payload,
+                    },
+                    "envelope_ok",
+                )
+            except ProtocolError:
+                self._rollback_call_send(peer, prior)
+                raise
+            self.store.delete_outbox(peer)
+            if x3dh is not None:
+                self.pending_x3dh.pop(peer, None)
+
+    async def _call_audio_pump(self) -> None:
+        try:
+            while True:
+                queue = self._call_out
+                if queue is None:
+                    return
+                pcm = await queue.get()
+                if pcm is None:
+                    return
+                session = self._call
+                if session is None or session.phase != "active" or not self.connected or self.ws is None:
+                    continue
+                seq = session.send_seq
+                session.send_seq = seq + 1
+                try:
+                    ciphertext = seal_frame(session.key, session.call_id, session.direction, seq, pcm)
+                    frame = pack_call_frame(
+                        self.username,
+                        session.peer,
+                        session.call_id,
+                        session.direction,
+                        seq,
+                        ciphertext,
+                    )
+                    async with self._send_lock:
+                        if self.ws is None:
+                            return
+                        await self.ws.send(frame)
+                except Exception:
+                    continue
+        except asyncio.CancelledError:
+            return
+
+    async def _on_call_media(self, frame: tuple[str, str, bytes, int, int, bytes]) -> None:
+        try:
+            sender, recipient, call_id, direction, seq, ciphertext = frame
+            session = self._call
+            if recipient != self.username or session is None or session.phase != "active":
+                return
+            if sender != session.peer or call_id != session.call_id:
+                return
+            expected = 0 if session.role == "callee" else 1
+            if direction != expected or seq in session.recv_seen:
+                return
+            pcm = open_frame(session.key, call_id, direction, seq, ciphertext)
+        except Exception:
+            return
+        session.recv_seen.add(seq)
+        if len(session.recv_seen) > 256:
+            session.recv_seen = set(sorted(session.recv_seen)[-128:])
+        self._emit_call_audio(pcm)
+
+    async def _on_call_signal(self, sender: str, raw: object) -> None:
+        try:
+            call = raw if isinstance(raw, dict) and "op" in raw and isinstance(raw.get("id"), (bytes, bytearray)) else parse_call_body(raw)
+        except (ValueError, ProtocolError):
+            return
+        op = str(call["op"])
+        call_id = bytes(call["id"])
+        ts = int(call["ts"])
+        session = self._call
+        if op == "invite":
+            if not invite_is_fresh(ts):
+                return
+            key = call.get("key")
+            if not isinstance(key, (bytes, bytearray)) or len(key) != 32:
+                return
+            if session is not None:
+                if session.call_id == call_id:
+                    return
+                try:
+                    await self._send_call_signal(sender, "busy", call_id)
+                except Exception:
+                    self.last_error = "忙线回复没有发出去"
+                return
+            incoming = CallSession(
+                call_id=call_id,
+                peer=sender,
+                key=bytes(key),
+                role="callee",
+                phase="incoming",
+                direction=1,
+            )
+            self._call = incoming
+            self._arm_call_timer(incoming, CALLEE_TIMEOUT, "callee")
+            self._emit_call()
+            return
+        if session is None or session.call_id != call_id:
+            return
+        if op == "accept" and session.role == "caller" and session.phase == "outgoing":
+            self._activate_call(session)
+        elif op == "reject" and session.role == "caller":
+            text = self._call_duration_text(session) if session.phase == "active" else "对方已拒绝"
+            self._finish_call(session, text)
+        elif op == "cancel" and session.role == "callee":
+            text = self._call_duration_text(session) if session.phase == "active" else "对方已取消"
+            self._finish_call(session, text)
+        elif op == "hangup":
+            if session.phase == "active":
+                self._finish_call(session, self._call_duration_text(session))
+            elif session.phase == "outgoing":
+                self._finish_call(session, "对方已拒绝")
+            elif session.phase == "incoming":
+                self._finish_call(session, "对方已取消")
+        elif op == "busy" and session.role == "caller" and session.phase == "outgoing":
+            self._finish_call(session, "对方忙线中")
 
     async def send_voice(
         self,
@@ -1388,6 +1746,9 @@ class ChatEngine:
             self._fail(sender, group, str(exc))
             return
         self.last_error = None
+        if verified_kind == "call":
+            await self._on_call_signal(sender, extra.get("call"))
+            return
         conv, new_thread = self._accept_thread(sender, verified_group, extra)
         if verified_kind == "thread_init":
             if new_thread:
@@ -1850,9 +2211,11 @@ class ChatEngine:
             verified_group = inner.get("group")
             verified_kind = inner.get("kind", "chat")
             verified_gstate = inner.get("gstate")
-            if verified_kind not in {"chat", "group_meta", "file", "thread_init"}:
+            if verified_kind not in {"chat", "group_meta", "file", "thread_init", "call"}:
                 raise ValueError
             if verified_kind == "thread_init" and verified_group:
+                raise ValueError
+            if verified_kind == "call" and verified_group:
                 raise ValueError
             thread = _thread_token(inner.get("thread"))
             thread_title = inner.get("thread_title")
@@ -1876,12 +2239,17 @@ class ChatEngine:
                 raise ValueError
             file_payload = inner.get("file")
             voice = None
+            call = None
             if verified_kind == "file":
                 if not isinstance(file_payload, dict):
                     raise ValueError
                 file_meta = meta_from_dict(file_payload)
                 voice = read_voice(inner.get("voice"), file_meta.mime) if "voice" in inner else None
             elif file_payload is not None:
+                raise ValueError
+            if verified_kind == "call":
+                call = parse_call_body(inner.get("call"))
+            elif inner.get("call") is not None:
                 raise ValueError
         except (
             UnicodeDecodeError,
@@ -1920,6 +2288,7 @@ class ChatEngine:
             "thread_title": thread_title,
             "privacy": privacy,
             "voice": voice,
+            "call": call,
         }
 
     def _apply_social(self, msg: dict[str, Any]) -> None:
@@ -2369,6 +2738,17 @@ class ChatEngine:
             )
 
     async def close(self) -> None:
+        session = self._call
+        if session is not None:
+            if session.phase == "active":
+                note = self._call_duration_text(session)
+            elif session.phase == "incoming":
+                note = "未接听"
+            else:
+                note = "已取消"
+            self._finish_call(session, note)
+        else:
+            self._stop_call_tasks()
         self.persist()
         for task in self._tasks:
             task.cancel()
