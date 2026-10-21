@@ -233,6 +233,21 @@ class ClientStore:
                 file_id TEXT PRIMARY KEY,
                 blob BLOB NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS media_meta (
+                blob_id TEXT PRIMARY KEY,
+                blob BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS conversation_privacy (
+                conv TEXT PRIMARY KEY,
+                level TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS threads (
+                conv TEXT PRIMARY KEY,
+                peer TEXT NOT NULL,
+                tid TEXT NOT NULL,
+                title TEXT NOT NULL,
+                created REAL NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS dropbox (
                 id TEXT PRIMARY KEY,
                 peer TEXT NOT NULL,
@@ -423,6 +438,63 @@ class ClientStore:
         if not row:
             return None
         return self._open_json(row[0])
+
+    def save_media_meta(self, blob_id: str, meta: dict[str, Any]) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO media_meta(blob_id, blob) VALUES(?, ?)",
+                (blob_id, self._seal_json(meta)),
+            )
+
+    def load_media_meta(self, blob_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT blob FROM media_meta WHERE blob_id=?", (blob_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return self._open_json(row[0])
+
+    def get_conversation_privacy(self, conv: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT level FROM conversation_privacy WHERE conv=?", (conv,)
+        ).fetchone()
+        return str(row[0]) if row else None
+
+    def set_conversation_privacy(self, conv: str, level: str) -> None:
+        if level not in {"low", "high"}:
+            raise ValueError("私密等级必须是 low 或 high")
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO conversation_privacy(conv, level) VALUES(?,?)",
+                (conv, level),
+            )
+
+    def load_conversation_privacy(self) -> dict[str, str]:
+        rows = self.conn.execute(
+            "SELECT conv, level FROM conversation_privacy"
+        ).fetchall()
+        return {str(conv): str(level) for conv, level in rows}
+
+    def save_thread(self, conv: str, peer: str, tid: str, title: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO threads(conv, peer, tid, title, created) VALUES(?,?,?,?,?)",
+                (conv, peer, tid, title, time.time()),
+            )
+
+    def load_threads(self) -> dict[str, dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT conv, peer, tid, title, created FROM threads ORDER BY created"
+        ).fetchall()
+        return {
+            str(conv): {
+                "peer": str(peer),
+                "tid": str(tid),
+                "title": str(title),
+                "created": float(created),
+            }
+            for conv, peer, tid, title, created in rows
+        }
 
     def save_incoming_file(self, blob_id: str, record: dict[str, Any]) -> None:
         with self.conn:

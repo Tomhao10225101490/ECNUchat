@@ -20,6 +20,7 @@ from PySide6.QtGui import (
     QColor,
     QFont,
     QFontMetrics,
+    QImage,
     QImageReader,
     QPainter,
     QPainterPath,
@@ -412,6 +413,7 @@ class MessageDelegate(QStyledItemDelegate):
         self.fail_rects: dict[int, QRect] = {}
         self.open_rects: dict[int, QRect] = {}
         self.download_rects: dict[int, QRect] = {}
+        self.save_rects: dict[int, QRect] = {}
 
     def apply_palette(self, palette: Palette) -> None:
         self.palette = palette
@@ -711,6 +713,12 @@ class MessageDelegate(QStyledItemDelegate):
             self._paint_attachment(painter, item, media, text_color)
             absolute = media.translated(option_rect.topLeft()).toRect()
             self.open_rects[row] = absolute
+            if self._can_save(item):
+                chip = QRectF(media.right() - 60, media.top() + 8, 52, 22)
+                self._paint_save_chip(painter, chip)
+                self.save_rects[row] = chip.translated(option_rect.topLeft()).toRect()
+            else:
+                self.save_rects.pop(row, None)
             if (
                 str((item.attachment or {}).get("media") or "") == "video"
                 and (item.attachment or {}).get("encrypted")
@@ -729,6 +737,7 @@ class MessageDelegate(QStyledItemDelegate):
         else:
             self.open_rects.pop(row, None)
             self.download_rects.pop(row, None)
+            self.save_rects.pop(row, None)
         painter.setPen(QColor(text_color))
         painter.setFont(self.font_body)
         text_rect = QRectF(
@@ -783,6 +792,19 @@ class MessageDelegate(QStyledItemDelegate):
     def _paint_attachment(self, painter: QPainter, item: ChatItem, rect: QRectF, text_color: str) -> None:
         attachment = item.attachment or {}
         kind = str(attachment.get("media") or "file")
+        data = attachment.get("data")
+        if kind == "image" and isinstance(data, (bytes, bytearray)) and data:
+            pix = self._pix_from_bytes(bytes(data), int(rect.width()), int(rect.height()))
+            painter.save()
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 24))
+            painter.drawRoundedRect(rect, 8, 8)
+            if pix is not None and not pix.isNull():
+                x = rect.left() + (rect.width() - pix.width()) / 2
+                y = rect.top() + (rect.height() - pix.height()) / 2
+                painter.drawPixmap(int(x), int(y), pix)
+            painter.restore()
+            return
         painter.save()
         clip = QPainterPath()
         clip.addRoundedRect(rect, 8, 8)
@@ -846,6 +868,37 @@ class MessageDelegate(QStyledItemDelegate):
             painter.setClipping(False)
             self._paint_file_card(painter, attachment, rect, text_color)
         painter.restore()
+
+    def _can_save(self, item: ChatItem) -> bool:
+        attachment = item.attachment if isinstance(item.attachment, dict) else {}
+        return bool(
+            attachment.get("can_save")
+            and attachment.get("media") in {"image", "video"}
+            and item.state != "sending"
+        )
+
+    def _paint_save_chip(self, painter: QPainter, chip: QRectF) -> None:
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(self.palette.accent))
+        painter.drawRoundedRect(chip, 11, 11)
+        painter.setPen(QColor(self.palette.accent_text))
+        painter.setFont(self.font_meta)
+        painter.drawText(chip, Qt.AlignmentFlag.AlignCenter, "保存")
+        painter.restore()
+
+    def _pix_from_bytes(self, raw: bytes, width: int, height: int) -> QPixmap | None:
+        if width < 8 or height < 8:
+            return None
+        image = QImage()
+        if not image.loadFromData(raw) or image.isNull():
+            return None
+        return QPixmap.fromImage(image).scaled(
+            width,
+            height,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
 
     def _paint_file_card(self, painter: QPainter, attachment: dict, rect: QRectF, text_color: str) -> None:
         painter.setPen(Qt.PenStyle.NoPen)
@@ -922,6 +975,7 @@ class MessageList(QListView):
     deleteRequested = Signal(object)
     openRequested = Signal(object)
     downloadRequested = Signal(object)
+    saveRequested = Signal(object)
     filesDropped = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -999,6 +1053,12 @@ class MessageList(QListView):
                     item = self._model.items[row] if row < len(self._model.items) else None
                     if item and item.local_id:
                         self.retryRequested.emit(item.local_id)
+                        return
+            for row, rect in list(self.delegate.save_rects.items()):
+                if rect.contains(event.pos()):
+                    item = self._model.items[row] if row < len(self._model.items) else None
+                    if item and item.attachment:
+                        self.saveRequested.emit(item)
                         return
             for row, rect in list(self.delegate.download_rects.items()):
                 if rect.contains(event.pos()):

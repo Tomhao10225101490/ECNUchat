@@ -223,13 +223,16 @@ async def _video_cache(alice, bob, tmp_path: Path):
         and incoming.attachment.get("name") == "clip.mp4",
     )
     assert item.attachment["encrypted"] is True
-    cache = Path(item.attachment["path"])
+    assert item.attachment.get("saved") is False
+    file_id = str(item.attachment.get("file_id") or item.attachment.get("id"))
+    cache = attachment_root(bob.store.path) / "cipher" / file_id
     assert cache.is_dir()
     stored = b"".join(
         (cache / str(index)).read_bytes() for index in range(len(list(cache.iterdir())))
     )
     assert MARKER not in stored
-    file_id = str(item.attachment["file_id"])
+    plain_copy = attachment_root(bob.store.path) / "files" / file_id
+    assert not plain_copy.exists()
     opened = Path(await bob.materialize_video(file_id))
     assert opened.read_bytes() == plain
     packed = tmp_path / "clip.evideo"
@@ -246,8 +249,13 @@ async def _video_cache(alice, bob, tmp_path: Path):
         if "clip.mp4" in body
     ]
     assert history and saved["key"] not in history[0]
+    saved_copy = tmp_path / "saved-clip.mp4"
+    history_before = bob.store.get_history("dm:alice")
+    bob.save_attachment("dm:alice", history[0], str(saved_copy))
+    assert saved_copy.read_bytes() == plain
+    assert bob.store.get_history("dm:alice") == history_before
     sender_id = alice.store.load_file_job("clip-job")["meta"]["id"]
-    sender_cache = attachment_root(alice.store.path) / "cache" / sender_id
+    sender_cache = attachment_root(alice.store.path) / "cipher" / sender_id
     sender_bytes = b"".join(path.read_bytes() for path in sender_cache.iterdir())
     assert MARKER not in sender_bytes
     db = bob.store.path

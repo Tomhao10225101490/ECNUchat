@@ -437,6 +437,8 @@ def history_body(
     rel_path: str,
     caption: str,
     store: str = "plain",
+    blob_id: str | None = None,
+    saved: bool = True,
 ) -> str:
     payload: dict[str, Any] = {
         "v": 1,
@@ -445,11 +447,16 @@ def history_body(
         "mime": mime,
         "size": size,
         "sha256": sha256.hex(),
-        "path": rel_path,
         "caption": caption,
     }
-    if store != "plain":
-        payload["store"] = store
+    if blob_id:
+        payload["id"] = blob_id
+        payload["path"] = ""
+        payload["saved"] = bool(saved)
+    else:
+        payload["path"] = rel_path
+        if store != "plain":
+            payload["store"] = store
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -469,6 +476,8 @@ def parse_history_body(body: str) -> dict | None:
     rel = data.get("path")
     caption = data.get("caption", "")
     store = data.get("store", "plain")
+    blob_id = data.get("id")
+    saved = data.get("saved", True)
     if (
         not isinstance(name, str)
         or not isinstance(mime, str)
@@ -476,17 +485,29 @@ def parse_history_body(body: str) -> dict | None:
         or not isinstance(size, int)
         or not isinstance(digest, str)
         or not re.fullmatch(r"[0-9a-f]{64}", digest)
-        or not isinstance(rel, str)
-        or rel.startswith("/")
-        or ".." in Path(rel).parts
         or not isinstance(caption, str)
         or store not in {"plain", "cipher"}
+        or not isinstance(saved, bool)
     ):
         return None
-    if store == "cipher":
-        parts = Path(rel).parts
-        if len(parts) != 2 or parts[0] != "cache" or not re.fullmatch(r"[0-9a-f]{32}", parts[1]):
+    if blob_id is not None:
+        if not isinstance(blob_id, str) or not re.fullmatch(r"[0-9a-f]{32}", blob_id):
             return None
+        if rel not in (None, ""):
+            return None
+        rel = ""
+        store = "plain"
+    else:
+        if (
+            not isinstance(rel, str)
+            or rel.startswith("/")
+            or ".." in Path(rel).parts
+        ):
+            return None
+        if store == "cipher":
+            parts = Path(rel).parts
+            if len(parts) != 2 or parts[0] != "cache" or not re.fullmatch(r"[0-9a-f]{32}", parts[1]):
+                return None
     return {
         "name": name,
         "mime": mime,
@@ -495,6 +516,8 @@ def parse_history_body(body: str) -> dict | None:
         "path": rel,
         "caption": caption,
         "store": store,
+        "id": blob_id,
+        "saved": saved,
     }
 
 
@@ -510,6 +533,22 @@ def attachment_view(db_path: str | Path, body: str) -> dict | None:
     record = parse_history_body(body)
     if record is None:
         return None
+    kind = media_kind(record["mime"])
+    if record.get("id"):
+        return {
+            "name": record["name"],
+            "mime": record["mime"],
+            "size": record["size"],
+            "sha256": record["sha256"],
+            "id": record["id"],
+            "saved": record["saved"],
+            "path": "",
+            "rel": "",
+            "media": kind,
+            "caption": record["caption"],
+            "encrypted": kind in {"image", "video"},
+            "file_id": record["id"] if kind == "video" else "",
+        }
     try:
         path = resolve_rel(db_path, record["path"])
     except AttachmentError:
@@ -523,10 +562,12 @@ def attachment_view(db_path: str | Path, body: str) -> dict | None:
         "sha256": record["sha256"],
         "path": str(path),
         "rel": record["path"],
-        "media": media_kind(record["mime"]),
+        "media": kind,
         "caption": record["caption"],
         "encrypted": encrypted,
         "file_id": file_id,
+        "id": "",
+        "saved": True,
     }
 
 
@@ -538,14 +579,20 @@ def display_text(body: str, db_path: str | Path | None = None) -> str:
     record = parse_history_body(body)
     if record is None:
         return body
-    shown = record["path"]
-    if db_path is not None:
-        try:
-            shown = str(resolve_rel(db_path, record["path"]))
-        except AttachmentError:
-            shown = record["path"]
-    cache = " · 加密缓存" if record.get("store") == "cipher" else ""
-    line = f"[{_label(record['mime'])}] {record['name']}（{format_size(record['size'])}）{cache} {shown}"
+    shown = ""
+    if record.get("id"):
+        cache = " · 加密缓存"
+    else:
+        shown = record["path"]
+        if db_path is not None and shown:
+            try:
+                shown = str(resolve_rel(db_path, record["path"]))
+            except AttachmentError:
+                shown = record["path"]
+        cache = " · 加密缓存" if record.get("store") == "cipher" else ""
+    line = f"[{_label(record['mime'])}] {record['name']}（{format_size(record['size'])}）{cache}"
+    if shown:
+        line += f" {shown}"
     caption = record["caption"].strip()
     if caption:
         return f"{caption}\n{line}"

@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListView,
+    QMenu,
     QPushButton,
     QStyledItemDelegate,
     QVBoxLayout,
@@ -236,6 +237,10 @@ class _DirectoryDelegate(QStyledItemDelegate):
 
 class _DirectoryList(QListView):
     activated_entry = Signal(object)
+    messageRequested = Signal(str)
+    secretRequested = Signal(str)
+    removeRequested = Signal(str)
+    blockRequested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -291,6 +296,27 @@ class _DirectoryList(QListView):
         item = index.data(Qt.ItemDataRole.UserRole)
         if isinstance(item, DirectoryEntry) and item.kind != "header":
             self.activated_entry.emit(item)
+
+    def contextMenuEvent(self, event) -> None:
+        index = self.indexAt(event.pos())
+        item = index.data(Qt.ItemDataRole.UserRole) if index.isValid() else None
+        if not isinstance(item, DirectoryEntry) or item.kind != "person" or self.multi:
+            return
+        name = item.title
+        menu = QMenu(self)
+        message = menu.addAction("发消息")
+        secret = menu.addAction("新建私密聊天")
+        remove = menu.addAction("删除好友")
+        block = menu.addAction("拉黑")
+        chosen = menu.exec(event.globalPos())
+        if chosen is message:
+            self.messageRequested.emit(name)
+        elif chosen is secret:
+            self.secretRequested.emit(name)
+        elif chosen is remove:
+            self.removeRequested.emit(name)
+        elif chosen is block:
+            self.blockRequested.emit(name)
 
 
 class LetterRail(QWidget):
@@ -354,6 +380,10 @@ class ContactBook(QWidget):
     activated_key = Signal(str)
     toggled = Signal(str, bool)
     limitReached = Signal()
+    messageRequested = Signal(str)
+    secretRequested = Signal(str)
+    removeRequested = Signal(str)
+    blockRequested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -379,6 +409,10 @@ class ContactBook(QWidget):
         layout.addWidget(self.empty, 1)
         layout.addWidget(self.rail)
         self.list.activated_entry.connect(self._activate)
+        self.list.messageRequested.connect(self.messageRequested)
+        self.list.secretRequested.connect(self.secretRequested)
+        self.list.removeRequested.connect(self.removeRequested)
+        self.list.blockRequested.connect(self.blockRequested)
         self.rail.jumped.connect(self._jump)
         self._limit = MAX_GROUP_MEMBERS - 1
 
@@ -394,7 +428,7 @@ class ContactBook(QWidget):
         self.rail.set_letters(letters)
         has_rows = any(entry.kind != "header" for entry in items)
         self.list.setVisible(has_rows)
-        self.rail.setVisible(has_rows)
+        self.rail.setVisible(has_rows and len(letters) >= 4)
         self.empty.setVisible(not has_rows)
 
     def entries(self) -> list[DirectoryEntry]:
@@ -522,6 +556,7 @@ class PeoplePicker(QDialog):
         self.mode = mode
         self._people = list(people)
         self._palette = palette
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(stylesheet(palette))
         self.setMinimumSize(420, 560)
         self.setWindowTitle("新建群组" if mode == "group" else "新建消息")

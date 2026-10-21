@@ -312,6 +312,7 @@ class MainWindow(QMainWindow):
         self._search_mode = False
         self._opening_video = False
         self._group_hits: list[dict[str, Any]] = []
+        self._friend_results: list[dict[str, Any]] = []
         self._history_hits: list[dict[str, Any]] = []
         self._typing = False
         self._pending_new = 0
@@ -414,6 +415,14 @@ class MainWindow(QMainWindow):
         contacts_layout.setContentsMargins(0, 0, 0, 0)
         self.contacts = ContactBook()
         self.contacts.activated_key.connect(self._activate_contact)
+        self.contacts.messageRequested.connect(self._open_friend_chat)
+        self.contacts.secretRequested.connect(self._open_secret_chat)
+        self.contacts.removeRequested.connect(
+            lambda name: self.worker.submit("friend_remove", username=name)
+        )
+        self.contacts.blockRequested.connect(
+            lambda name: self.worker.submit("friend_block", username=name)
+        )
         self.people_panel = PeoplePanel()
         self.people_panel.acceptClicked.connect(
             lambda name: self.worker.submit("friend_respond", username=name, accept=True)
@@ -433,9 +442,7 @@ class MainWindow(QMainWindow):
         self.people_panel.unblockClicked.connect(
             lambda name: self.worker.submit("friend_remove", username=name)
         )
-        self.people_panel.messageClicked.connect(
-            lambda name: self.worker.submit("open_chat", username=name)
-        )
+        self.people_panel.messageClicked.connect(self._open_friend_chat)
         self.people_panel.addClicked.connect(
             lambda name: self.worker.submit("friend_request", username=name, greeting="")
         )
@@ -566,6 +573,7 @@ class MainWindow(QMainWindow):
         self.messages.deleteRequested.connect(self._delete_item)
         self.messages.openRequested.connect(self._open_attachment)
         self.messages.downloadRequested.connect(self._download_attachment)
+        self.messages.saveRequested.connect(self._save_attachment_item)
         self.messages.filesDropped.connect(self._on_files_dropped)
         self.new_button = NewMessageButton(self.chat_body)
         self.new_button.clicked.connect(self._jump_bottom)
@@ -923,7 +931,7 @@ class MainWindow(QMainWindow):
             self.side_stack.setCurrentWidget(self.pages)
         self.search.blockSignals(True)
         self.search.clear()
-        self.search.setPlaceholderText("搜索")
+        self.search.setPlaceholderText("搜索用户名，添加好友" if index == 1 else "搜索")
         self.search.blockSignals(False)
         if self._palette:
             self._set_palette(self._palette)
@@ -971,7 +979,16 @@ class MainWindow(QMainWindow):
         keys = set(recent)
         groups = self.snapshot_data.get("groups", {})
         keys.update(f"group:{name}" for name in groups)
-        keys.update(f"dm:{name}" for name in self.snapshot_data.get("sessions", {}))
+        threads = self.snapshot_data.get("threads") or {}
+        keys.update(threads)
+        threaded_peers = {
+            str(info.get("peer")) for info in threads.values() if isinstance(info, dict) and info.get("peer")
+        }
+        keys.update(
+            f"dm:{name}"
+            for name in self.snapshot_data.get("sessions", {})
+            if name not in threaded_peers
+        )
         for item in self.snapshot_data.get("group_incoming") or []:
             name = str(item.get("group") or "")
             if name and name not in groups:
@@ -1001,7 +1018,7 @@ class MainWindow(QMainWindow):
         for conv in ordered:
             row = recent.get(conv, {})
             kind = "dm" if str(conv).startswith("dm:") else "group"
-            peer = conv[3:] if kind == "dm" else ""
+            peer = conv[3:].split("#", 1)[0] if kind == "dm" else ""
             preview = str(row.get("body", "") or "")
             if str(conv).startswith("invite:"):
                 preview = preview or self._invite_preview(conv[7:])
@@ -1029,9 +1046,20 @@ class MainWindow(QMainWindow):
         self.conversations.set_items(items, self.current_conv)
 
     def known_people(self) -> list[dict]:
-        data = dict(self.snapshot_data)
-        data["directory"] = list(self.directory)
-        return people_from_snapshot(data, self.username)
+        """联系人页只列好友。没有好友快照时，退回原来的通讯录。"""
+        friends = self.snapshot_data.get("friends")
+        if friends is None:
+            data = dict(self.snapshot_data)
+            data["directory"] = list(self.directory)
+            return people_from_snapshot(data, self.username)
+        online = set(self.snapshot_data.get("online", []))
+        rows = []
+        for item in friends:
+            name = str(item.get("username") or "")
+            if not name or name == self.username:
+                continue
+            rows.append({"name": name, "online": name in online})
+        return sorted(rows, key=lambda row: row["name"].lower())
 
     def rebuild_contacts(self) -> None:
         query = self.search.text().strip() if self.page_contacts.isVisible() else ""
@@ -1040,13 +1068,12 @@ class MainWindow(QMainWindow):
         if query:
             self.contacts.empty.setText("没有匹配的联系人")
         else:
-            self.contacts.empty.setText("没有联系人")
+            self.contacts.empty.setText("还没有好友。在上面搜索用户名，发送好友申请。")
 
     def _fill_people(self) -> None:
         if "friends" not in self.snapshot_data:
             self.people_panel.hide()
             return
-        self.people_panel.show()
         query = self.search.text().strip().lower() if self.page_contacts.isVisible() else ""
         invites = list(self.snapshot_data.get("group_incoming") or [])
         outgoing = list(self.snapshot_data.get("group_outgoing") or [])
@@ -1070,12 +1097,25 @@ class MainWindow(QMainWindow):
                 if query in str(item.get("group") or "").lower()
                 or query in str(item.get("username") or "").lower()
             ]
+        results = list(self._friend_results) if query else []
+        incoming = list(self.snapshot_data.get("incoming") or [])
+        friend_outgoing = list(self.snapshot_data.get("outgoing") or [])
+        blocked = list(self.snapshot_data.get("blocked") or [])
+        rejected = list(self.snapshot_data.get("rejected") or [])
+        has_content = bool(
+            results or incoming or friend_outgoing or blocked or rejected or invites or outgoing or requests
+        )
+        self.people_panel.setVisible(has_content)
+        if not has_content:
+            return
         self.people_panel.set_model(
-            friends=list(self.snapshot_data.get("friends") or []),
-            incoming=list(self.snapshot_data.get("incoming") or []),
-            outgoing=list(self.snapshot_data.get("outgoing") or []),
-            blocked=list(self.snapshot_data.get("blocked") or []),
-            rejected=list(self.snapshot_data.get("rejected") or []),
+            friends=[],
+            show_friends=False,
+            incoming=incoming,
+            outgoing=friend_outgoing,
+            blocked=blocked,
+            rejected=rejected,
+            results=results,
             group_invites=invites,
             group_outgoing=outgoing,
             group_requests=requests,
@@ -1099,8 +1139,7 @@ class MainWindow(QMainWindow):
             pending += len(self.snapshot_data.get("group_requests") or [])
             self.nav_contacts.set_badge(pending)
 
-    @staticmethod
-    def conv_title(conv: str) -> str:
+    def conv_title(self, conv: str) -> str:
         if conv.startswith("invite:"):
             return conv[7:]
         if conv.startswith("joining:"):
@@ -1114,7 +1153,11 @@ class MainWindow(QMainWindow):
         if conv.startswith("group:"):
             return conv[6:]
         if conv.startswith("dm:"):
-            return conv[3:]
+            peer, _, tid = conv[3:].partition("#")
+            if tid:
+                info = (self.snapshot_data.get("threads") or {}).get(conv) or {}
+                return str(info.get("title") or peer)
+            return peer
         return conv
 
     @staticmethod
@@ -1146,10 +1189,43 @@ class MainWindow(QMainWindow):
 
     def _activate_contact(self, key: str) -> None:
         if key.startswith("dm:"):
-            self.worker.submit("open_chat", username=key[3:])
+            self._open_friend_chat(key[3:])
         elif key.startswith("group:"):
             self._show_page(0)
             self.open_conversation(key)
+
+    def _dm_peer(self, conv: str) -> str:
+        return conv[3:].split("#", 1)[0] if conv.startswith("dm:") else conv
+
+    def _latest_thread(self, name: str) -> str | None:
+        threads = self.snapshot_data.get("threads") or {}
+        convs = [
+            conv
+            for conv, info in threads.items()
+            if isinstance(info, dict) and info.get("peer") == name
+        ]
+        if not convs:
+            return None
+        convs.sort(key=lambda conv: float((threads.get(conv) or {}).get("created") or 0))
+        return convs[-1]
+
+    def _open_friend_chat(self, name: str) -> None:
+        """点好友打开最近的一条聊天；还没有聊天就开一条普通聊天。"""
+        name = name.split("#", 1)[0]
+        latest = self._latest_thread(name)
+        self._show_page(0)
+        if latest:
+            self.open_conversation(latest)
+            return
+        recent = {str(row.get("conv")) for row in self.snapshot_data.get("recent") or []}
+        if f"dm:{name}" in recent or name in self.snapshot_data.get("sessions", {}):
+            self.open_conversation(f"dm:{name}")
+            return
+        self.worker.submit("create_thread", username=name, level="low")
+
+    def _open_secret_chat(self, name: str) -> None:
+        name = name.split("#", 1)[0]
+        self.worker.submit("create_thread", username=name, level="high")
 
     def open_conversation(self, conv: str) -> None:
         if self._in_open:
@@ -1201,13 +1277,17 @@ class MainWindow(QMainWindow):
         self.info_button.setEnabled(conv.startswith("dm:"))
         self.info_button.hide()
         if conv.startswith("dm:"):
-            peer = conv[3:]
+            peer = self._dm_peer(conv)
             online = peer in set(self.snapshot_data.get("online", []))
             generation = self.snapshot_data.get("sessions", {}).get(peer, 0)
             short_fp = self.snapshot_data.get("fingerprints", {}).get(peer, "")
             fp_text = f" · 指纹 {short_fp}" if short_fp else ""
-            self.chat_title.setText(peer)
-            self.chat_subtitle.setText(f"{'在线' if online else '离线'} · 双棘轮代数 {generation}{fp_text}")
+            level = (self.snapshot_data.get("conversation_privacy") or {}).get(conv, "low")
+            privacy = " · 私密" if level == "high" else ""
+            self.chat_title.setText(self.conv_title(conv))
+            self.chat_subtitle.setText(
+                f"{'在线' if online else '离线'} · 双棘轮代数 {generation}{privacy}{fp_text}"
+            )
             self.header_avatar.set_person(peer, online=online)
         elif conv.startswith("invite:"):
             name = conv[7:]
@@ -1492,7 +1572,7 @@ class MainWindow(QMainWindow):
         if not self.current_conv.startswith(("dm:", "group:")):
             self.show_toast("先同意加入，才能在群里发消息", error=True)
             return
-        if self.current_conv.startswith("dm:") and not self._dm_allowed(self.current_conv[3:]):
+        if self.current_conv.startswith("dm:") and not self._dm_allowed(self._dm_peer(self.current_conv)):
             self.show_toast("需要对方同意好友申请后才能发消息", error=True)
             return
         if self.reply_bar.author:
@@ -1530,8 +1610,6 @@ class MainWindow(QMainWindow):
             self.messages.notify_row(row)
 
     def on_incoming(self, item: dict[str, Any]) -> None:
-        if item.get("kind") == "presence":
-            return
         if item.get("kind") == "typing":
             self.set_peer_typing(True, str(item.get("sender") or ""))
             return
@@ -1539,9 +1617,16 @@ class MainWindow(QMainWindow):
         if item.get("kind") == "file_abort":
             self._drop_live_file(local_id)
             return
+        if item.get("kind") == "presence":
+            note = str(item.get("text") or "")
+            if note:
+                self.show_toast(note)
+            return
         group = item.get("group")
         sender = str(item.get("sender") or "")
-        conv = f"group:{group}" if group else (f"dm:{sender}" if sender and sender != "系统" else "")
+        conv = str(item.get("conv") or "")
+        if not conv:
+            conv = f"group:{group}" if group else (f"dm:{sender}" if sender and sender != "系统" else "")
         attachment = item.get("attachment") if isinstance(item.get("attachment"), dict) else None
         if item.get("error"):
             attachment = None
@@ -1622,7 +1707,11 @@ class MainWindow(QMainWindow):
             self.rebuild_contacts()
             self._fill_people()
             if query:
+                self._friend_results = []
+                self.worker.submit("search_users", query=query)
                 self.worker.submit("search_groups", query=query)
+            else:
+                self._friend_results = []
             return
         if not query:
             self._search_mode = False
@@ -1732,8 +1821,12 @@ class MainWindow(QMainWindow):
 
     def new_chat(self) -> None:
         picked = self._pick_people("chat")
-        if picked:
-            self.worker.submit("open_chat", username=picked[0])
+        if not picked:
+            return
+        level = self._ask_privacy_level(picked[0])
+        if level is None:
+            return
+        self.worker.submit("create_thread", username=picked[0], level=level)
 
     def new_group(self) -> None:
         picked = self._pick_people("group")
@@ -1863,6 +1956,24 @@ class MainWindow(QMainWindow):
         if action == "open_chat":
             self._show_page(0)
             self.open_conversation(f"dm:{data}")
+        elif action == "create_thread" and isinstance(data, dict):
+            conv = str(data.get("conv") or "")
+            if conv:
+                self._show_page(0)
+                self.open_conversation(conv)
+            self.show_toast(str(data.get("note") or "新聊天已创建"))
+        elif action == "save_attachment" and isinstance(data, str):
+            self.show_toast("已另存到你选的位置")
+        elif action == "open_image" and isinstance(data, dict):
+            raw = data.get("data")
+            if isinstance(raw, (bytes, bytearray)) and raw:
+                self._show_image_bytes(bytes(raw), str(data.get("title") or "图片"))
+            else:
+                self.show_toast("图片还在加密缓存里，暂时打不开", error=True)
+        elif action == "search_users" and isinstance(data, dict):
+            self._friend_results = list(data.get("users") or [])
+            if self.page_contacts.isVisible():
+                self._fill_people()
         elif action == "create_group":
             self._show_page(0)
             self.open_conversation(f"group:{data}")
@@ -2074,8 +2185,66 @@ class MainWindow(QMainWindow):
         )
         self._refresh_send()
 
+    def _ask_privacy_level(self, name: str) -> str | None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("新聊天")
+        dialog.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        dialog.setStyleSheet(stylesheet(self._palette))
+        dialog.setMinimumWidth(420)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(10)
+        heading = QLabel(f"和 {name} 的新聊天")
+        heading.setObjectName("title")
+        hint = QLabel("两种都是端到端加密。区别只在图片和视频能不能另存成明文。")
+        hint.setObjectName("secondary")
+        hint.setWordWrap(True)
+        normal = QPushButton("普通聊天")
+        normal.setObjectName("primary")
+        normal_hint = QLabel("可以观看，也可以把图片和视频另存到电脑。")
+        normal_hint.setObjectName("caption")
+        normal_hint.setWordWrap(True)
+        secret = QPushButton("私密聊天")
+        secret_hint = QLabel("可以观看。图片和视频不能另存成明文，加密副本仍然可以下载。")
+        secret_hint.setObjectName("caption")
+        secret_hint.setWordWrap(True)
+        cancel = QPushButton("取消")
+        chosen = {"level": ""}
+
+        def pick(level: str) -> None:
+            chosen["level"] = level
+            dialog.accept()
+
+        normal.clicked.connect(lambda: pick("low"))
+        secret.clicked.connect(lambda: pick("high"))
+        cancel.clicked.connect(dialog.reject)
+        layout.addWidget(heading)
+        layout.addWidget(hint)
+        layout.addWidget(normal)
+        layout.addWidget(normal_hint)
+        layout.addWidget(secret)
+        layout.addWidget(secret_hint)
+        layout.addWidget(cancel)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return chosen["level"] or None
+
     def _open_attachment(self, item: ChatItem) -> None:
         attachment = item.attachment or {}
+        kind = str(attachment.get("media") or "file")
+        if kind == "image" and (attachment.get("id") or attachment.get("data")):
+            raw = attachment.get("data")
+            title = str(attachment.get("name") or "图片")
+            if isinstance(raw, (bytes, bytearray)) and raw:
+                self._show_image_bytes(bytes(raw), title)
+                return
+            file_id = str(attachment.get("id") or "")
+            if not file_id:
+                self.show_toast("图片不在本机", error=True)
+                return
+            self.worker.submit("open_image", id=file_id, title=title)
+            self.show_toast("正在从加密缓存打开")
+            return
         if attachment.get("encrypted"):
             file_id = str(attachment.get("file_id") or "")
             if item.state == "sending" or not file_id:
@@ -2102,6 +2271,24 @@ class MainWindow(QMainWindow):
             self._show_video(path, str(attachment.get("name") or "视频"))
         else:
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _save_attachment_item(self, item: ChatItem) -> None:
+        attachment = item.attachment or {}
+        if not attachment.get("can_save"):
+            self.show_toast("这个聊天是私密的，不能把图片或视频另存成明文", error=True)
+            return
+        name = str(attachment.get("name") or "媒体")
+        dest, _selected = QFileDialog.getSaveFileName(self, "另存为", name)
+        if not dest:
+            return
+        self.worker.submit(
+            "save_attachment",
+            conv=self.current_conv or "",
+            body=item.raw,
+            dest=dest,
+            id=str(attachment.get("id") or attachment.get("file_id") or ""),
+            mime=str(attachment.get("mime") or ""),
+        )
 
     def _download_attachment(self, item: ChatItem) -> None:
         attachment = item.attachment or {}
@@ -2139,6 +2326,31 @@ class MainWindow(QMainWindow):
         row = self._row_of(bubble.item)
         if row >= 0:
             self.messages.notify_row(row)
+
+    def _show_image_bytes(self, raw: bytes, title: str) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(720, 540)
+        layout = QVBoxLayout(dialog)
+        label = QLabel()
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pixmap = QPixmap()
+        pixmap.loadFromData(raw)
+        if not pixmap.isNull():
+            screen = self.screen()
+            limit = 960
+            if screen is not None:
+                limit = int(screen.availableGeometry().width() * 0.7)
+            label.setPixmap(
+                pixmap.scaled(
+                    limit,
+                    int(limit * 0.75),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+        layout.addWidget(label)
+        dialog.exec()
 
     def _show_image(self, path: str, title: str) -> None:
         dialog = QDialog(self)

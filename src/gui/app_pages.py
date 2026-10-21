@@ -137,6 +137,7 @@ class PeoplePanel(QWidget):
         group_outgoing: list[dict[str, Any]] | None = None,
         group_requests: list[dict[str, Any]] | None = None,
         group_results: list[dict[str, Any]] | None = None,
+        show_friends: bool = True,
     ) -> None:
         incoming = list(incoming or [])
         outgoing = list(outgoing or [])
@@ -149,6 +150,7 @@ class PeoplePanel(QWidget):
         group_requests = list(group_requests or [])
         group_results = list(group_results or [])
         payload = (
+            show_friends,
             friends,
             incoming,
             outgoing,
@@ -199,11 +201,11 @@ class PeoplePanel(QWidget):
             self._body.addWidget(_section("未通过"))
             for item in rejected:
                 self._body.addWidget(self._rejected_card(item))
-        if friends:
+        if show_friends and friends:
             self._body.addWidget(_section("好友"))
             for item in friends:
                 self._body.addWidget(self._friend_card(item))
-        elif not incoming and not results and not group_invites and not group_requests and not group_results:
+        elif show_friends and not incoming and not results and not group_invites and not group_requests and not group_results:
             empty = QLabel("还没有好友")
             empty.setObjectName("secondary")
             empty.setContentsMargins(12, 8, 12, 8)

@@ -11,7 +11,7 @@ from typing import Any
 from PySide6.QtCore import QThread, Signal
 
 from src.attachments import attachment_view, preview_text
-from src.client import ChatEngine
+from src.client import IMAGE_PREVIEW_LIMIT, ChatEngine, split_dm_conv
 from src.protocol import fingerprint
 
 
@@ -109,7 +109,7 @@ class EngineWorker(QThread):
         for local_id, conv, _body, state, _ts in engine.store.pending_message_statuses():
             if state != "sending":
                 continue
-            peer = conv[3:] if conv.startswith("dm:") else None
+            peer = split_dm_conv(conv)[0] if conv.startswith("dm:") else None
             recovered = (
                 peer in outbox_before and peer not in outbox_after
             ) or (
@@ -144,7 +144,9 @@ class EngineWorker(QThread):
             "connected": engine.connected,
             "online": sorted(engine.online_users),
             "groups": dict(engine.groups),
+            "conversation_privacy": engine.store.load_conversation_privacy(),
             "sessions": sessions,
+            "threads": dict(engine.threads),
             "fingerprints": fingerprints,
             "recent": recent,
             "unread": engine.store.load_unread(),
@@ -239,7 +241,7 @@ class EngineWorker(QThread):
                 row: dict[str, Any] = {"sender": sender, "body": body, "ts": ts}
                 view = attachment_view(engine.store.path, body)
                 if view is not None:
-                    row["attachment"] = view
+                    row["attachment"] = self._decorate_attachment(conv, view)
                 rows.append(row)
             self.historyReady.emit(conv, rows)
         elif action == "search":
@@ -267,6 +269,37 @@ class EngineWorker(QThread):
             await engine.fetch_user(username)
             self.actionResult.emit(action, True, username)
             self.snapshot.emit(self._snapshot())
+        elif action == "create_thread":
+            username = str(payload["username"])
+            level = str(payload.get("level") or "low")
+            if level not in {"low", "high"}:
+                level = "low"
+            await engine.fetch_user(username)
+            conv = engine.create_thread(username, level)
+            note = "新聊天已创建，对方也会在列表里看到"
+            try:
+                await engine.announce_thread(conv)
+            except Exception:
+                engine.last_error = "聊天已创建，通知将在下次连接重试"
+                note = "聊天已在本机创建。通知对方会在下次连上时重试"
+            self.actionResult.emit(action, True, {"conv": conv, "note": note})
+            self.snapshot.emit(self._snapshot())
+        elif action == "save_attachment":
+            saved_path = engine.save_attachment(
+                str(payload.get("conv") or ""),
+                str(payload.get("body") or ""),
+                str(payload.get("dest") or ""),
+                blob_id=str(payload.get("id") or "") or None,
+                mime=str(payload.get("mime") or "") or None,
+            )
+            self.actionResult.emit(action, True, saved_path)
+        elif action == "open_image":
+            raw = engine.media_plaintext(str(payload.get("id") or ""))
+            self.actionResult.emit(
+                action,
+                True,
+                {"title": str(payload.get("title") or "图片"), "data": raw},
+            )
         elif action == "fingerprint":
             username = str(payload["username"])
             if username == engine.username:
@@ -399,6 +432,21 @@ class EngineWorker(QThread):
         else:
             raise ValueError(f"未知 GUI 操作：{action}")
 
+    def _decorate_attachment(self, conv: str, view: dict[str, Any]) -> dict[str, Any]:
+        assert self.engine is not None
+        view["can_save"] = self.engine._media_save_allowed(conv, str(view.get("mime") or ""))
+        if (
+            view.get("media") == "image"
+            and view.get("id")
+            and not view.get("saved", True)
+            and int(view.get("size") or 0) <= IMAGE_PREVIEW_LIMIT
+        ):
+            try:
+                view["data"] = self.engine.media_plaintext(str(view["id"]))
+            except Exception:
+                view["data"] = b""
+        return view
+
     async def _send(self, payload: dict[str, Any]) -> None:
         assert self.engine is not None
         engine = self.engine
@@ -407,7 +455,8 @@ class EngineWorker(QThread):
         text = str(payload["text"])
         engine.store.save_message_status(local_id, conv, text, "sending")
         if conv.startswith("dm:"):
-            await engine.send_text(text, peer=conv[3:])
+            peer, _tid = split_dm_conv(conv)
+            await engine.send_text(text, peer=peer, conv=conv)
         elif conv.startswith("group:"):
             await engine.send_text(text, group=conv[6:])
         else:
@@ -431,7 +480,9 @@ class EngineWorker(QThread):
             "mime": payload.get("mime") or None,
         }
         if conv.startswith("dm:"):
-            kwargs["peer"] = conv[3:]
+            peer, _tid = split_dm_conv(conv)
+            kwargs["peer"] = peer
+            kwargs["conv"] = conv
         elif conv.startswith("group:"):
             kwargs["group"] = conv[6:]
         else:
@@ -440,6 +491,8 @@ class EngineWorker(QThread):
         engine.store.update_message_status(local_id, "accepted")
         self.messageState.emit(local_id, "accepted", "")
         view = attachment_view(engine.store.path, history) if isinstance(history, str) else None
+        if isinstance(view, dict):
+            view = self._decorate_attachment(conv, view)
         self.actionResult.emit("send_file", True, {"local_id": local_id, "attachment": view})
         self.snapshot.emit(self._snapshot())
 

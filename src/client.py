@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import shutil
+import time
 import uuid
 import sys
 from dataclasses import dataclass, field
@@ -33,7 +34,6 @@ from src.attachments import (
     AttachmentError,
     attachment_root,
     attachment_view,
-    cache_rel,
     cipher_len,
     clear_playback_files,
     decrypt_chunk,
@@ -49,6 +49,8 @@ from src.attachments import (
     meta_from_dict,
     meta_to_dict,
     new_file_meta,
+    open_bytes,
+    parse_history_body,
     place_local_copy,
     read_plain_chunk,
     resolve_rel,
@@ -113,6 +115,27 @@ from src.x3dh import (
 console = Console()
 CHUNK_WINDOW = 8
 BLOB_TIMEOUT = 120.0
+IMAGE_PREVIEW_LIMIT = 12 * 1024 * 1024
+
+
+def split_dm_conv(conv: str) -> tuple[str, str | None]:
+    """拆分 `dm:名字#线程`。旧格式 `dm:名字` 的线程为 None。"""
+    body = conv[3:] if conv.startswith("dm:") else conv
+    if "#" in body:
+        peer, tid = body.split("#", 1)
+        return peer, tid or None
+    return body, None
+
+
+def _thread_token(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or len(value) > 32:
+        raise ValueError
+    for ch in value:
+        if not (ch.isalnum() or ch in "_-"):
+            raise ValueError
+    return value
 
 
 @dataclass
@@ -124,6 +147,7 @@ class Incoming:
     error: str | None = None
     attachment: dict[str, Any] | None = None
     local_id: str | None = None
+    conv: str | None = None
 
 
 @dataclass
@@ -140,6 +164,7 @@ class ChatEngine:
     identity: Any
     sessions: dict[str, RatchetState] = field(default_factory=dict)
     groups: dict[str, list[str]] = field(default_factory=dict)
+    threads: dict[str, dict[str, Any]] = field(default_factory=dict)
     group_chain: dict[str, list] = field(default_factory=dict)
     peer_keys: dict[str, tuple[bytes, bytes, bytes | None]] = field(default_factory=dict)
     current_peer: str | None = None
@@ -193,6 +218,7 @@ class ChatEngine:
             identity=identity,
         )
         engine.groups = store.load_groups()
+        engine.threads = store.load_threads()
         engine._sign_queue = engine._load_sign_queue()
         clear_playback_files(store.path)
         for name in engine.groups:
@@ -740,7 +766,14 @@ class ChatEngine:
         self.peer_keys[peer] = (ik_sign, b64d(bundle["ik_dh_pub"]) or b"", pq_pub)
         return pq_pub
 
-    async def send_text(self, text: str, *, peer: str | None = None, group: str | None = None) -> None:
+    async def send_text(
+        self,
+        text: str,
+        *,
+        peer: str | None = None,
+        group: str | None = None,
+        conv: str | None = None,
+    ) -> None:
         """发送一条聊天正文。群消息按成员扇出，每人一封双棘轮信封。
 
         对每个其他成员调用一次 `_send_one`，走已经建立的那一对双棘轮。
@@ -781,10 +814,24 @@ class ChatEngine:
                 raise
             return
         dest = peer or self.current_peer
+        thread: str | None = None
+        thread_title: str | None = None
+        if conv and conv.startswith("dm:"):
+            dest, thread = split_dm_conv(conv)
+            thread_title = (self.threads.get(conv) or {}).get("title")
         if not dest:
             raise ProtocolError("先用 /chat 名字 选择对端")
-        await self._send_one(dest, text, group=None, kind="chat", gstate=None)
-        self.store.add_history(f"dm:{dest}", self.username, text)
+        conv_key = conv or f"dm:{dest}"
+        await self._send_one(
+            dest,
+            text,
+            group=None,
+            kind="chat",
+            gstate=None,
+            thread=thread,
+            thread_title=str(thread_title) if thread_title else None,
+        )
+        self.store.add_history(conv_key, self.username, text)
 
     async def send_file(
         self,
@@ -792,6 +839,7 @@ class ChatEngine:
         *,
         peer: str | None = None,
         group: str | None = None,
+        conv: str | None = None,
         caption: str = "",
         local_id: str | None = None,
         data: bytes | None = None,
@@ -803,30 +851,35 @@ class ChatEngine:
             raise ProtocolError("附件说明过长")
         local_id = local_id or uuid.uuid4().hex
         gstate = None
+        thread: str | None = None
+        thread_title: str | None = None
         if group:
             state = self._verified_group_state(group)
             members = list(state.members)
             recipients = sorted(member for member in members if member != self.username)
             if not recipients:
                 raise ProtocolError("群里没有其他成员")
-            conv = f"group:{group}"
+            conv_key = f"group:{group}"
             target_group: str | None = group
             gstate = state.state_hash().hex()
         else:
             dest = peer or self.current_peer
+            if conv and conv.startswith("dm:"):
+                dest, thread = split_dm_conv(conv)
+                thread_title = (self.threads.get(conv) or {}).get("title")
             if not dest:
                 raise ProtocolError("先用 /chat 名字 选择对端")
             if dest == self.username:
                 raise ProtocolError("不能给自己发文件")
             recipients = [dest]
-            conv = f"dm:{dest}"
+            conv_key = conv or f"dm:{dest}"
             target_group = None
         record = self.store.load_file_job(local_id)
         if record is None:
             record = await asyncio.to_thread(
                 self._new_file_job,
                 local_id=local_id,
-                conv=conv,
+                conv=conv_key,
                 group=target_group,
                 recipients=recipients,
                 caption=caption,
@@ -834,14 +887,20 @@ class ChatEngine:
                 data=data,
                 filename=filename,
                 mime=mime,
+                save_allowed=self._media_save_allowed(conv_key, mime or ""),
             )
             record["gstate"] = gstate
+            record["thread"] = thread
+            record["thread_title"] = thread_title
+            record["privacy"] = self._privacy_level(conv_key)
         else:
             recipients = list(record["recipients"])
-            conv = str(record["conv"])
+            conv_key = str(record["conv"])
             target_group = record.get("group")
-        if record.get("sealed"):
-            self.store.save_file_cache(str(record["meta"]["id"]), dict(record["meta"]))
+        if record.get("media") or record.get("sealed"):
+            blob = str(record["meta"]["id"])
+            self.store.save_media_meta(blob, dict(record["meta"]))
+            self.store.save_file_cache(blob, dict(record["meta"]))
         if not record.get("uploaded"):
             self.store.save_file_job(local_id, record)
             await self._upload_file(record)
@@ -850,9 +909,9 @@ class ChatEngine:
         elif not record.get("history"):
             record["history"] = self._file_history_body(record)
         self.store.save_file_job(local_id, record)
-        self.store.save_message_status(local_id, conv, str(record["history"]), "sending")
+        self.store.save_message_status(local_id, conv_key, str(record["history"]), "sending")
         if not record.get("logged"):
-            self.store.add_history(conv, self.username, str(record["history"]))
+            self.store.add_history(conv_key, self.username, str(record["history"]))
             record["logged"] = True
             self.store.save_file_job(local_id, record)
         delivered = 0
@@ -863,7 +922,7 @@ class ChatEngine:
         except Exception:
             if target_group:
                 self.store.add_history(
-                    conv,
+                    conv_key,
                     "系统",
                     f"文件仅送达 {delivered}/{len(recipients)} 人，可稍后重试",
                 )
@@ -884,9 +943,12 @@ class ChatEngine:
         data: bytes | None,
         filename: str | None,
         mime: str | None,
+        save_allowed: bool = True,
     ) -> dict[str, Any]:
+        del save_allowed
         root = attachment_root(self.store.path)
         sealed = False
+        media = False
         if data is None:
             if not path:
                 raise ProtocolError("没有要发送的文件")
@@ -898,13 +960,14 @@ class ChatEngine:
                 raise ProtocolError("文件超过 8GiB")
             filename = filename or file_path.name
             chosen_mime = mime or guess_mime(filename)
-            if media_kind(chosen_mime) == "video":
+            if media_kind(chosen_mime) in {"image", "video"}:
                 try:
-                    meta = seal_path(file_path, root / "cache", filename, chosen_mime)
+                    meta = seal_path(file_path, root / "cipher", filename, chosen_mime)
                 except AttachmentError as exc:
                     raise ProtocolError(exc.message) from exc
-                rel = cache_rel(meta.file_id)
+                rel = f"cipher/{meta.file_id.hex()}"
                 sealed = True
+                media = True
             else:
                 try:
                     meta = new_file_meta(size, filename, mime)
@@ -918,19 +981,20 @@ class ChatEngine:
             payload = bytes(data)
             filename = filename or "file"
             chosen_mime = mime or guess_mime(filename)
-            if media_kind(chosen_mime) == "video":
+            if media_kind(chosen_mime) in {"image", "video"}:
                 staging = root / "staging"
                 staging.mkdir(parents=True, exist_ok=True)
                 temporary = staging / f"{uuid.uuid4().hex}.bin"
                 temporary.write_bytes(payload)
                 try:
-                    meta = seal_path(temporary, root / "cache", filename, chosen_mime)
+                    meta = seal_path(temporary, root / "cipher", filename, chosen_mime)
                 except AttachmentError as exc:
                     raise ProtocolError(exc.message) from exc
                 finally:
                     temporary.unlink(missing_ok=True)
-                rel = cache_rel(meta.file_id)
+                rel = f"cipher/{meta.file_id.hex()}"
                 sealed = True
+                media = True
             else:
                 try:
                     meta = new_file_meta(len(payload), filename, mime)
@@ -949,6 +1013,7 @@ class ChatEngine:
             "meta": meta_to_dict(meta),
             "rel": rel,
             "sealed": sealed,
+            "media": media,
             "enveloped": [],
             "uploaded": False,
             "logged": False,
@@ -957,6 +1022,17 @@ class ChatEngine:
 
     def _file_history_body(self, record: dict[str, Any]) -> str:
         meta = meta_from_dict(record["meta"])
+        if record.get("media"):
+            return history_body(
+                name=meta.name,
+                mime=meta.mime,
+                size=meta.size,
+                sha256=meta.sha256,
+                rel_path="",
+                caption=str(record.get("caption") or ""),
+                blob_id=meta.file_id.hex(),
+                saved=False,
+            )
         return history_body(
             name=meta.name,
             mime=meta.mime,
@@ -1088,23 +1164,31 @@ class ChatEngine:
         await self._run_indexed(meta.chunks, one)
         await self.request({"type": "blob_finish", "id": blob_id}, "blob_finish_ok")
 
-    async def materialize_video(self, file_id: str) -> str:
-        raw = self.store.load_file_cache(file_id)
+    def _load_media_record(self, file_id: str) -> Any:
+        raw = self.store.load_media_meta(file_id) or self.store.load_file_cache(file_id)
         if raw is None:
             raise ProtocolError("没有这支视频的加密缓存")
-        meta = meta_from_dict(raw)
-        cache_dir = resolve_rel(self.store.path, cache_rel(meta.file_id))
+        return meta_from_dict(raw)
+
+    def _media_folder(self, meta: Any) -> Path:
+        root = attachment_root(self.store.path)
+        cipher = root / "cipher" / meta.file_id.hex()
+        legacy = root / "cache" / meta.file_id.hex()
+        if cipher.is_dir():
+            return cipher
+        if legacy.is_dir():
+            return legacy
+        return cipher
+
+    async def materialize_video(self, file_id: str) -> str:
+        meta = self._load_media_record(file_id)
         dest = attachment_root(self.store.path) / "play" / f"{file_id}.mp4"
-        await asyncio.to_thread(materialize_plain, meta, cache_dir, dest)
+        await asyncio.to_thread(materialize_plain, meta, self._media_folder(meta), dest)
         return str(dest)
 
     async def export_video(self, file_id: str, dest: str) -> None:
-        raw = self.store.load_file_cache(file_id)
-        if raw is None:
-            raise ProtocolError("没有这支视频的加密缓存")
-        meta = meta_from_dict(raw)
-        cache_dir = resolve_rel(self.store.path, cache_rel(meta.file_id))
-        await asyncio.to_thread(export_cipher_pack, cache_dir, meta, Path(dest))
+        meta = self._load_media_record(file_id)
+        await asyncio.to_thread(export_cipher_pack, self._media_folder(meta), meta, Path(dest))
 
     async def _deliver_file_envelope(self, peer: str, record: dict[str, Any]) -> None:
         lock = self._peer_locks.setdefault(peer, asyncio.Lock())
@@ -1123,6 +1207,9 @@ class ChatEngine:
                     "kind": "file",
                     "gstate": record.get("gstate"),
                     "file": record["meta"],
+                    "thread": record.get("thread"),
+                    "thread_title": record.get("thread_title"),
+                    "privacy": record.get("privacy") or "low",
                 },
                 ensure_ascii=False,
                 separators=(",", ":"),
@@ -1174,14 +1261,30 @@ class ChatEngine:
         group: str | None,
         kind: str,
         gstate: str | None = None,
+        thread: str | None = None,
+        thread_title: str | None = None,
     ) -> dict[str, Any]:
         lock = self._peer_locks.setdefault(peer, asyncio.Lock())
         async with lock:
             await self._flush_outbox(peer)
             state = await self._ensure_session_for_send(peer)
             x3dh = self.pending_x3dh.get(peer)
+            conv = (
+                f"group:{group}"
+                if group
+                else (f"dm:{peer}#{thread}" if thread else f"dm:{peer}")
+            )
             inner = json.dumps(
-                {"v": 1, "text": text, "group": group, "kind": kind, "gstate": gstate},
+                {
+                    "v": 1,
+                    "text": text,
+                    "group": group,
+                    "kind": kind,
+                    "gstate": gstate,
+                    "thread": thread,
+                    "thread_title": thread_title,
+                    "privacy": self._privacy_level(conv),
+                },
                 ensure_ascii=False,
                 separators=(",", ":"),
             ).encode("utf-8")
@@ -1212,7 +1315,7 @@ class ChatEngine:
         payload = env["payload"]
         group = payload.get("group")
         try:
-            text, verified_group, verified_kind, file_meta = await self._decrypt_envelope(
+            text, verified_group, verified_kind, file_meta, extra = await self._decrypt_envelope(
                 sender, payload
             )
             group = verified_group
@@ -1232,11 +1335,20 @@ class ChatEngine:
             self._fail(sender, group, str(exc))
             return
         self.last_error = None
+        conv, new_thread = self._accept_thread(sender, verified_group, extra)
+        if verified_kind == "thread_init":
+            if new_thread:
+                self.store.add_history(conv, "系统", "对方创建了这个聊天")
+            await self.inbox.put(
+                Incoming(sender, f"{sender} 开了一个新聊天", None, "presence", conv=conv)
+            )
+            return
         if verified_kind == "file" and file_meta is not None:
             record = {
                 "meta": meta_to_dict(file_meta),
                 "sender": sender,
                 "group": verified_group,
+                "conv": conv,
                 "caption": text,
                 "logged": False,
             }
@@ -1247,10 +1359,9 @@ class ChatEngine:
             except Exception:
                 self._fail(sender, verified_group, "文件下载失败")
             return
-        conv = f"group:{group}" if group else f"dm:{sender}"
         who = "系统" if verified_kind == "group_meta" else sender
         self.store.add_history(conv, who, text)
-        await self.inbox.put(Incoming(who, text, group, verified_kind))
+        await self.inbox.put(Incoming(who, text, group, verified_kind, conv=conv))
 
     def _fail(self, sender: str, group: str | None, phrase: str) -> None:
         self.last_error = phrase
@@ -1289,21 +1400,33 @@ class ChatEngine:
         blob_id = meta.file_id.hex()
         local_id = f"in:{blob_id}"
         self.store.save_incoming_file(blob_id, record)
-        video = media_kind(meta.mime) == "video"
-        rel = cache_rel(meta.file_id) if video else f"files/{blob_id}/{meta.name}"
-        dest = attachment_root(self.store.path) / rel
-        partial = dest.with_name(dest.name + ".part") if not video else dest
+        media = media_kind(meta.mime) in {"image", "video"}
+        rel = f"files/{blob_id}/{meta.name}"
+        root = attachment_root(self.store.path)
+        dest = root / "cipher" / blob_id if media else root / rel
+        partial = dest if media else dest.with_name(dest.name + ".part")
         caption = str(record.get("caption") or "")
+        conv = str(
+            record.get("conv")
+            or (
+                f"group:{record['group']}"
+                if record.get("group")
+                else f"dm:{record['sender']}"
+            )
+        )
         progress_view = {
             "name": meta.name,
             "mime": meta.mime,
             "size": meta.size,
             "sha256": meta.sha256.hex(),
             "path": "",
+            "id": blob_id if media else "",
             "media": media_kind(meta.mime),
             "caption": caption,
-            "encrypted": video,
-            "file_id": blob_id if video else "",
+            "encrypted": media,
+            "file_id": blob_id if media_kind(meta.mime) == "video" else "",
+            "saved": not media,
+            "can_save": self._media_save_allowed(conv, meta.mime),
         }
         await self.inbox.put(
             Incoming(
@@ -1313,16 +1436,19 @@ class ChatEngine:
                 "file_progress",
                 local_id=local_id,
                 attachment=progress_view,
+                conv=conv,
             )
         )
         try:
-            if video:
-                await self._download_cipher(meta, dest, local_id)
-                self.store.save_file_cache(blob_id, meta_to_dict(meta))
+            if media:
+                await self._download_to_cache(meta, local_id)
+                packed = meta_to_dict(meta)
+                self.store.save_media_meta(blob_id, packed)
+                self.store.save_file_cache(blob_id, packed)
             else:
                 await self._download_file(meta, partial, local_id)
         except AttachmentError:
-            if video:
+            if media:
                 shutil.rmtree(dest, ignore_errors=True)
             else:
                 partial.unlink(missing_ok=True)
@@ -1334,11 +1460,12 @@ class ChatEngine:
                     record.get("group"),
                     "file_abort",
                     local_id=local_id,
+                    conv=conv,
                 )
             )
             raise
         except Exception:
-            if video:
+            if media:
                 shutil.rmtree(dest, ignore_errors=True)
             else:
                 partial.unlink(missing_ok=True)
@@ -1349,26 +1476,33 @@ class ChatEngine:
                     record.get("group"),
                     "file_abort",
                     local_id=local_id,
+                    conv=conv,
                 )
             )
             raise
-        if not video:
+        if media:
+            body = history_body(
+                name=meta.name,
+                mime=meta.mime,
+                size=meta.size,
+                sha256=meta.sha256,
+                rel_path="",
+                caption=caption,
+                blob_id=blob_id,
+                saved=False,
+            )
+        else:
             partial.replace(dest)
-        body = history_body(
-            name=meta.name,
-            mime=meta.mime,
-            size=meta.size,
-            sha256=meta.sha256,
-            rel_path=rel,
-            caption=caption,
-            store="cipher" if video else "plain",
-        )
+            body = history_body(
+                name=meta.name,
+                mime=meta.mime,
+                size=meta.size,
+                sha256=meta.sha256,
+                rel_path=rel,
+                caption=caption,
+                saved=True,
+            )
         fresh = not record.get("logged")
-        conv = (
-            f"group:{record['group']}"
-            if record.get("group")
-            else f"dm:{record['sender']}"
-        )
         if fresh:
             self.store.add_history(conv, str(record["sender"]), body)
             record["logged"] = True
@@ -1383,6 +1517,18 @@ class ChatEngine:
         except Exception:
             self.last_error = "文件已收下，服务器清理将在下次重试"
         if fresh:
+            view = attachment_view(self.store.path, body)
+            if isinstance(view, dict):
+                view["can_save"] = self._media_save_allowed(conv, str(view.get("mime") or ""))
+                if (
+                    view.get("media") == "image"
+                    and view.get("id")
+                    and int(view.get("size") or 0) <= IMAGE_PREVIEW_LIMIT
+                ):
+                    try:
+                        view["data"] = self.media_plaintext(str(view["id"]))
+                    except Exception:
+                        view["data"] = b""
             await self.inbox.put(
                 Incoming(
                     str(record["sender"]),
@@ -1390,9 +1536,15 @@ class ChatEngine:
                     record.get("group"),
                     "file",
                     local_id=local_id,
-                    attachment=attachment_view(self.store.path, body),
+                    attachment=view,
+                    conv=conv,
                 )
             )
+
+    async def _download_to_cache(self, meta: Any, local_id: str) -> None:
+        """图片和视频只把密文分片留在 cipher/。摘要在内存里按顺序核对。"""
+        folder = attachment_root(self.store.path) / "cipher" / meta.file_id.hex()
+        await self._download_cipher(meta, folder, local_id)
 
     async def _download_cipher(self, meta: Any, cache_dir: Path, local_id: str) -> None:
         """收下视频密文分片。明文只在校验摘要时在内存里走一块，不落盘。"""
@@ -1517,7 +1669,7 @@ class ChatEngine:
 
     async def _decrypt_envelope(
         self, sender: str, payload: dict[str, Any]
-    ) -> tuple[str, str | None, str, Any]:
+    ) -> tuple[str, str | None, str, Any, dict[str, Any]]:
         ratchet_msg, init = decode_ratchet_payload(payload)
         new_identity = False
         consumed_opk: bytes | None = None
@@ -1637,8 +1789,19 @@ class ChatEngine:
             verified_group = inner.get("group")
             verified_kind = inner.get("kind", "chat")
             verified_gstate = inner.get("gstate")
-            if verified_kind not in {"chat", "group_meta", "file"}:
+            if verified_kind not in {"chat", "group_meta", "file", "thread_init"}:
                 raise ValueError
+            if verified_kind == "thread_init" and verified_group:
+                raise ValueError
+            thread = _thread_token(inner.get("thread"))
+            thread_title = inner.get("thread_title")
+            if thread_title is not None and not isinstance(thread_title, str):
+                raise ValueError
+            if isinstance(thread_title, str):
+                thread_title = thread_title[:80]
+            privacy = inner.get("privacy")
+            if privacy not in {None, "low", "high"}:
+                privacy = None
             if not isinstance(text, str) or verified_group != payload.get("group"):
                 raise ValueError
             if verified_kind != (payload.get("kind") or "chat"):
@@ -1689,7 +1852,11 @@ class ChatEngine:
                 except Exception:
                     # 明文已经认证成功且状态已提交；补池失败不能把消息伪装成解密失败。
                     self.last_error = "预密钥补充将在下次登录重试"
-        return text, verified_group, verified_kind, file_meta
+        return text, verified_group, verified_kind, file_meta, {
+            "thread": thread,
+            "thread_title": thread_title,
+            "privacy": privacy,
+        }
 
     def _apply_social(self, msg: dict[str, Any]) -> None:
         self.friends = list(msg.get("friends") or [])
@@ -1919,6 +2086,121 @@ class ChatEngine:
                 return
             self._sign_queue.discard((group, username))
             self._save_sign_queue()
+
+    def _accept_thread(
+        self, sender: str, group: str | None, extra: dict[str, Any]
+    ) -> tuple[str, bool]:
+        thread = extra.get("thread") if not group else None
+        privacy = extra.get("privacy")
+        new_thread = False
+        if isinstance(thread, str) and thread:
+            conv = f"dm:{sender}#{thread}"
+            if conv not in self.threads:
+                new_thread = True
+                count = sum(1 for item in self.threads.values() if item.get("peer") == sender)
+                title = sender if count == 0 else f"{sender} · {count + 1}"
+                self.threads[conv] = {
+                    "peer": sender,
+                    "tid": thread,
+                    "title": title,
+                    "created": time.time(),
+                }
+                self.store.save_thread(conv, sender, thread, title)
+        else:
+            conv = f"group:{group}" if group else f"dm:{sender}"
+        if privacy in {"low", "high"}:
+            self.store.set_conversation_privacy(conv, privacy)
+        return conv, new_thread
+
+    def _privacy_level(self, conv: str) -> str:
+        """会话私密等级：low 是普通，high 是私密。"""
+        return self.store.get_conversation_privacy(conv) or "low"
+
+    def create_thread(self, peer: str, level: str = "low", title: str = "") -> str:
+        """同一个好友可以有多条聊天，每条聊天自己的私密等级。"""
+        count = sum(1 for item in self.threads.values() if item.get("peer") == peer)
+        tid = uuid.uuid4().hex[:8]
+        conv = f"dm:{peer}#{tid}"
+        name = (title or "").strip() or (peer if count == 0 else f"{peer} · {count + 1}")
+        self.threads[conv] = {
+            "peer": peer,
+            "tid": tid,
+            "title": name,
+            "created": time.time(),
+        }
+        self.store.save_thread(conv, peer, tid, name)
+        self.store.set_conversation_privacy(conv, level if level in {"low", "high"} else "low")
+        self.store.add_history(conv, "系统", "聊天已创建")
+        return conv
+
+    async def announce_thread(self, conv: str) -> None:
+        """新聊天用棘轮通知对方，对方不发言也能在列表里看到。"""
+        peer, tid = split_dm_conv(conv)
+        info = self.threads.get(conv) or {}
+        if not peer or not tid or not info:
+            raise ProtocolError("聊天线程无效")
+        await self._send_one(
+            peer,
+            "",
+            group=None,
+            kind="thread_init",
+            gstate=None,
+            thread=tid,
+            thread_title=str(info.get("title") or peer),
+        )
+
+    def _media_save_allowed(self, conv: str, mime: str) -> bool:
+        """私密聊天不把图片和视频另存成明文。普通文件不受影响。"""
+        if self._privacy_level(conv) == "high" and media_kind(mime or "") in {"image", "video"}:
+            return False
+        return True
+
+    def _media_meta(self, blob_id: str):
+        raw = self.store.load_media_meta(blob_id) or self.store.load_file_cache(blob_id)
+        if raw is None:
+            raise ProtocolError("媒体元数据缺失")
+        return meta_from_dict(raw)
+
+    def media_plaintext(self, blob_id: str) -> bytes:
+        """从加密缓存解出明文，只放在内存里。"""
+        meta = self._media_meta(blob_id)
+        folder = self._media_folder(meta)
+        chunks: list[bytes] = []
+        for index in range(meta.chunks):
+            path = folder / str(index)
+            if not path.is_file():
+                raise ProtocolError("媒体密文缺失")
+            chunks.append(path.read_bytes())
+        return open_bytes(meta, chunks)
+
+    def save_attachment(
+        self,
+        conv: str,
+        body: str,
+        dest_path: str,
+        blob_id: str | None = None,
+        mime: str | None = None,
+    ) -> str:
+        """另存到用户选的位置。不改历史，所以同一份媒体可以反复保存。"""
+        record = parse_history_body(body) if body else None
+        chosen_mime = mime or (str(record["mime"]) if record else "")
+        chosen_id = blob_id or (str(record["id"]) if record and record.get("id") else "")
+        if not self._media_save_allowed(conv, chosen_mime):
+            raise ProtocolError("私密会话不允许保存媒体")
+        dest = Path(dest_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if chosen_id:
+            meta = self._media_meta(chosen_id)
+            materialize_plain(meta, self._media_folder(meta), dest)
+        elif record and record.get("path"):
+            src = resolve_rel(self.store.path, record["path"])
+            if not src.is_file():
+                raise ProtocolError("文件不在本机")
+            if src.resolve() != dest.resolve():
+                shutil.copyfile(src, dest)
+        else:
+            raise ProtocolError("这条消息没有可保存的媒体")
+        return str(dest)
 
     async def create_group(self, name: str, members: list[str]) -> None:
         invites = [member for member in dict.fromkeys(members) if member and member != self.username]
