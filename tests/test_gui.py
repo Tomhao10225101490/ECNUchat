@@ -583,6 +583,61 @@ def test_large_video_preview_and_receive_progress(tmp_path) -> None:
     window.hide()
 
 
+def test_encrypted_video_requests_cache_playback() -> None:
+    from src.gui.logic import ChatItem
+
+    qt = app()
+    worker = FakeWorker()
+    window = MainWindow(worker, snapshot())
+    window.resize(980, 720)
+    window.show()
+    window.open_conversation("dm:bob")
+    file_id = "ab" * 16
+    window.show_history(
+        "dm:bob",
+        [
+            {
+                "sender": "bob",
+                "body": "视频",
+                "ts": time.time(),
+                "attachment": {
+                    "name": "clip.mp4",
+                    "mime": "video/mp4",
+                    "size": 120,
+                    "sha256": "cd" * 32,
+                    "path": "",
+                    "media": "video",
+                    "caption": "",
+                    "encrypted": True,
+                    "file_id": file_id,
+                },
+            }
+        ],
+    )
+    qt.processEvents()
+    window.messages.viewport().repaint()
+    qt.processEvents()
+    assert window.messages.delegate.download_rects
+    item = next(row for row in window.messages.items() if row.attachment)
+    window._open_attachment(item)
+    action, payload = worker.commands[-1]
+    assert action == "materialize_video"
+    assert payload["file_id"] == file_id
+    assert window._opening_video is True
+    window.on_action_result(action, False, "没有这支视频的加密缓存")
+    assert window._opening_video is False
+    assert "加密缓存" in window.toast.text()
+    sending = ChatItem(
+        sender="bob",
+        state="sending",
+        attachment={"media": "video", "encrypted": True, "file_id": file_id, "name": "clip.mp4"},
+    )
+    window._download_attachment(sending)
+    assert not any(command == "export_video" for command, _item in worker.commands)
+    window.hide()
+    qt.processEvents()
+
+
 def _jpeg_b64() -> str:
     import base64
 

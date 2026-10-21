@@ -53,6 +53,7 @@ async def _all(tmp_path: Path) -> None:
             await _roundtrip_and_blind(server, alice, bob, log_buffer)
             await _group_isolation(server, alice, bob, carol)
             await _retry_does_not_ratchet_twice(alice, bob)
+            bob = await _video_cache(alice, bob, tmp_path)
             await alice.close()
             await bob.close()
             await carol.close()
@@ -204,6 +205,57 @@ async def _retry_does_not_ratchet_twice(alice, bob) -> None:
         and incoming.attachment.get("name") == "retry.txt",
     )
     assert Path(item.attachment["path"]).read_bytes() == b"retry-me"
+
+
+async def _video_cache(alice, bob, tmp_path: Path):
+    plain = b"VIDEO" + MARKER + b"\x00" * 80
+    await alice.send_file(
+        data=plain,
+        filename="clip.mp4",
+        mime="video/mp4",
+        peer="bob",
+        local_id="clip-job",
+    )
+    item = await wait_pred(
+        bob,
+        lambda incoming: incoming.kind == "file"
+        and bool(incoming.attachment)
+        and incoming.attachment.get("name") == "clip.mp4",
+    )
+    assert item.attachment["encrypted"] is True
+    cache = Path(item.attachment["path"])
+    assert cache.is_dir()
+    stored = b"".join(
+        (cache / str(index)).read_bytes() for index in range(len(list(cache.iterdir())))
+    )
+    assert MARKER not in stored
+    file_id = str(item.attachment["file_id"])
+    opened = Path(await bob.materialize_video(file_id))
+    assert opened.read_bytes() == plain
+    packed = tmp_path / "clip.evideo"
+    await bob.export_video(file_id, str(packed))
+    raw = packed.read_bytes()
+    assert raw.startswith(b"ECV1")
+    assert MARKER not in raw
+    saved = bob.store.load_file_cache(file_id)
+    assert saved is not None
+    assert saved["key"] not in raw.decode("ascii", "ignore")
+    history = [
+        body
+        for _sender, body, _ts in bob.store.get_history("dm:alice")
+        if "clip.mp4" in body
+    ]
+    assert history and saved["key"] not in history[0]
+    sender_id = alice.store.load_file_job("clip-job")["meta"]["id"]
+    sender_cache = attachment_root(alice.store.path) / "cache" / sender_id
+    sender_bytes = b"".join(path.read_bytes() for path in sender_cache.iterdir())
+    assert MARKER not in sender_bytes
+    db = bob.store.path
+    await bob.close()
+    reopened = ChatEngine.open("bob", "password123", str(db))
+    again = Path(await reopened.materialize_video(file_id))
+    assert again.read_bytes() == plain
+    return reopened
 
 
 async def _offline_tamper_and_delivery(tmp_path: Path, store: ServerStore, uri: str) -> None:

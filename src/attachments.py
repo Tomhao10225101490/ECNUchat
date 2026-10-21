@@ -199,6 +199,63 @@ def seal_path(
     )
 
 
+def cache_rel(file_id: bytes) -> str:
+    return f"cache/{file_id.hex()}"
+
+
+def materialize_plain(meta: FileMeta, cache_dir: Path, dest: Path) -> None:
+    """把加密缓存解开成临时明文，供播放器读取。摘要不对就删掉临时文件。"""
+    digest = hashlib.sha256()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = dest.with_name(dest.name + ".part")
+    try:
+        with partial.open("wb") as handle:
+            for index in range(meta.chunks):
+                ciphertext = (cache_dir / str(index)).read_bytes()
+                piece = decrypt_chunk(meta, index, ciphertext)
+                digest.update(piece)
+                handle.write(piece)
+        if digest.digest() != meta.sha256 or partial.stat().st_size != meta.size:
+            raise AttachmentError("摘要不一致")
+        os.chmod(partial, 0o600)
+        partial.replace(dest)
+    except Exception:
+        partial.unlink(missing_ok=True)
+        dest.unlink(missing_ok=True)
+        raise
+
+
+def export_cipher_pack(cache_dir: Path, meta: FileMeta, dest: Path) -> None:
+    """另存一份加密副本。文件里没有钥匙，只有分片密文。"""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = dest.with_name(dest.name + ".part")
+    try:
+        with partial.open("wb") as handle:
+            handle.write(b"ECV1")
+            handle.write(meta.file_id)
+            handle.write(meta.chunks.to_bytes(4, "big"))
+            for index in range(meta.chunks):
+                blob = (cache_dir / str(index)).read_bytes()
+                if len(blob) != cipher_len(meta.size, meta.chunks, index):
+                    raise AttachmentError("加密缓存损坏")
+                handle.write(len(blob).to_bytes(8, "big"))
+                handle.write(blob)
+        os.chmod(partial, 0o600)
+        partial.replace(dest)
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
+
+
+def clear_playback_files(db_path: str | Path) -> None:
+    play = attachment_root(db_path) / "play"
+    if not play.is_dir():
+        return
+    for child in play.iterdir():
+        if child.is_file():
+            child.unlink(missing_ok=True)
+
+
 def place_local_copy(src: Path, dest: Path) -> None:
     """发送方留下一份明文。同一文件系统上用硬链接，避免再读一遍大视频。"""
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -379,21 +436,21 @@ def history_body(
     sha256: bytes,
     rel_path: str,
     caption: str,
+    store: str = "plain",
 ) -> str:
-    return json.dumps(
-        {
-            "v": 1,
-            "kind": "file",
-            "name": name,
-            "mime": mime,
-            "size": size,
-            "sha256": sha256.hex(),
-            "path": rel_path,
-            "caption": caption,
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+    payload: dict[str, Any] = {
+        "v": 1,
+        "kind": "file",
+        "name": name,
+        "mime": mime,
+        "size": size,
+        "sha256": sha256.hex(),
+        "path": rel_path,
+        "caption": caption,
+    }
+    if store != "plain":
+        payload["store"] = store
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def parse_history_body(body: str) -> dict | None:
@@ -411,6 +468,7 @@ def parse_history_body(body: str) -> dict | None:
     digest = data.get("sha256")
     rel = data.get("path")
     caption = data.get("caption", "")
+    store = data.get("store", "plain")
     if (
         not isinstance(name, str)
         or not isinstance(mime, str)
@@ -422,8 +480,13 @@ def parse_history_body(body: str) -> dict | None:
         or rel.startswith("/")
         or ".." in Path(rel).parts
         or not isinstance(caption, str)
+        or store not in {"plain", "cipher"}
     ):
         return None
+    if store == "cipher":
+        parts = Path(rel).parts
+        if len(parts) != 2 or parts[0] != "cache" or not re.fullmatch(r"[0-9a-f]{32}", parts[1]):
+            return None
     return {
         "name": name,
         "mime": mime,
@@ -431,6 +494,7 @@ def parse_history_body(body: str) -> dict | None:
         "sha256": digest,
         "path": rel,
         "caption": caption,
+        "store": store,
     }
 
 
@@ -450,6 +514,8 @@ def attachment_view(db_path: str | Path, body: str) -> dict | None:
         path = resolve_rel(db_path, record["path"])
     except AttachmentError:
         return None
+    encrypted = record.get("store") == "cipher"
+    file_id = Path(record["path"]).name if encrypted else ""
     return {
         "name": record["name"],
         "mime": record["mime"],
@@ -459,6 +525,8 @@ def attachment_view(db_path: str | Path, body: str) -> dict | None:
         "rel": record["path"],
         "media": media_kind(record["mime"]),
         "caption": record["caption"],
+        "encrypted": encrypted,
+        "file_id": file_id,
     }
 
 
@@ -476,7 +544,8 @@ def display_text(body: str, db_path: str | Path | None = None) -> str:
             shown = str(resolve_rel(db_path, record["path"]))
         except AttachmentError:
             shown = record["path"]
-    line = f"[{_label(record['mime'])}] {record['name']}（{format_size(record['size'])}） {shown}"
+    cache = " · 加密缓存" if record.get("store") == "cipher" else ""
+    line = f"[{_label(record['mime'])}] {record['name']}（{format_size(record['size'])}）{cache} {shown}"
     caption = record["caption"].strip()
     if caption:
         return f"{caption}\n{line}"

@@ -382,8 +382,20 @@ class EngineWorker(QThread):
             await engine.moment_comment(str(payload["id"]), str(payload.get("body") or ""))
             self.actionResult.emit(action, True, str(payload["id"]))
             self.snapshot.emit(self._snapshot())
-        elif action == "send_file":
-            await self._send_file(payload)
+        elif action == "materialize_video":
+            path = await engine.materialize_video(str(payload.get("file_id") or ""))
+            self.actionResult.emit(
+                action,
+                True,
+                {
+                    "path": path,
+                    "file_id": str(payload.get("file_id") or ""),
+                    "title": str(payload.get("title") or "视频"),
+                },
+            )
+        elif action == "export_video":
+            await engine.export_video(str(payload.get("file_id") or ""), str(payload.get("dest") or ""))
+            self.actionResult.emit(action, True, "加密副本已保存")
         else:
             raise ValueError(f"未知 GUI 操作：{action}")
 
@@ -424,8 +436,10 @@ class EngineWorker(QThread):
             kwargs["group"] = conv[6:]
         else:
             raise ValueError("会话 ID 无效")
-        await engine.send_file(payload.get("path") or None, **kwargs)
+        history = await engine.send_file(payload.get("path") or None, **kwargs)
         engine.store.update_message_status(local_id, "accepted")
         self.messageState.emit(local_id, "accepted", "")
+        view = attachment_view(engine.store.path, history) if isinstance(history, str) else None
+        self.actionResult.emit("send_file", True, {"local_id": local_id, "attachment": view})
         self.snapshot.emit(self._snapshot())
 

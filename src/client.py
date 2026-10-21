@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import uuid
 import sys
 from dataclasses import dataclass, field
@@ -32,17 +33,26 @@ from src.attachments import (
     AttachmentError,
     attachment_root,
     attachment_view,
+    cache_rel,
+    cipher_len,
+    clear_playback_files,
     decrypt_chunk,
     display_text,
     encrypt_chunk,
+    export_cipher_pack,
+    guess_mime,
     hash_file,
     history_body,
+    materialize_plain,
     media_kind,
+    plaintext_len,
     meta_from_dict,
     meta_to_dict,
     new_file_meta,
     place_local_copy,
     read_plain_chunk,
+    resolve_rel,
+    seal_path,
 )
 from src.double_ratchet import (
     GCMError,
@@ -184,6 +194,7 @@ class ChatEngine:
         )
         engine.groups = store.load_groups()
         engine._sign_queue = engine._load_sign_queue()
+        clear_playback_files(store.path)
         for name in engine.groups:
             engine.group_chain[name] = store.load_group_chain(name)
         for peer in store.list_sessions():
@@ -829,6 +840,8 @@ class ChatEngine:
             recipients = list(record["recipients"])
             conv = str(record["conv"])
             target_group = record.get("group")
+        if record.get("sealed"):
+            self.store.save_file_cache(str(record["meta"]["id"]), dict(record["meta"]))
         if not record.get("uploaded"):
             self.store.save_file_job(local_id, record)
             await self._upload_file(record)
@@ -873,6 +886,7 @@ class ChatEngine:
         mime: str | None,
     ) -> dict[str, Any]:
         root = attachment_root(self.store.path)
+        sealed = False
         if data is None:
             if not path:
                 raise ProtocolError("没有要发送的文件")
@@ -883,25 +897,49 @@ class ChatEngine:
             if size > MAX_FILE_BYTES:
                 raise ProtocolError("文件超过 8GiB")
             filename = filename or file_path.name
-            try:
-                meta = new_file_meta(size, filename, mime)
-            except AttachmentError as exc:
-                raise ProtocolError(exc.message) from exc
-            rel = f"files/{meta.file_id.hex()}/{meta.name}"
-            place_local_copy(file_path, root / rel)
+            chosen_mime = mime or guess_mime(filename)
+            if media_kind(chosen_mime) == "video":
+                try:
+                    meta = seal_path(file_path, root / "cache", filename, chosen_mime)
+                except AttachmentError as exc:
+                    raise ProtocolError(exc.message) from exc
+                rel = cache_rel(meta.file_id)
+                sealed = True
+            else:
+                try:
+                    meta = new_file_meta(size, filename, mime)
+                except AttachmentError as exc:
+                    raise ProtocolError(exc.message) from exc
+                rel = f"files/{meta.file_id.hex()}/{meta.name}"
+                place_local_copy(file_path, root / rel)
         else:
             if len(data) > MAX_FILE_BYTES:
                 raise ProtocolError("文件超过 8GiB")
             payload = bytes(data)
             filename = filename or "file"
-            try:
-                meta = new_file_meta(len(payload), filename, mime)
-            except AttachmentError as exc:
-                raise ProtocolError(exc.message) from exc
-            rel = f"files/{meta.file_id.hex()}/{meta.name}"
-            dest = root / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(payload)
+            chosen_mime = mime or guess_mime(filename)
+            if media_kind(chosen_mime) == "video":
+                staging = root / "staging"
+                staging.mkdir(parents=True, exist_ok=True)
+                temporary = staging / f"{uuid.uuid4().hex}.bin"
+                temporary.write_bytes(payload)
+                try:
+                    meta = seal_path(temporary, root / "cache", filename, chosen_mime)
+                except AttachmentError as exc:
+                    raise ProtocolError(exc.message) from exc
+                finally:
+                    temporary.unlink(missing_ok=True)
+                rel = cache_rel(meta.file_id)
+                sealed = True
+            else:
+                try:
+                    meta = new_file_meta(len(payload), filename, mime)
+                except AttachmentError as exc:
+                    raise ProtocolError(exc.message) from exc
+                rel = f"files/{meta.file_id.hex()}/{meta.name}"
+                dest = root / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(payload)
         return {
             "local_id": local_id,
             "conv": conv,
@@ -910,6 +948,7 @@ class ChatEngine:
             "caption": caption,
             "meta": meta_to_dict(meta),
             "rel": rel,
+            "sealed": sealed,
             "enveloped": [],
             "uploaded": False,
             "logged": False,
@@ -925,9 +964,13 @@ class ChatEngine:
             sha256=meta.sha256,
             rel_path=str(record["rel"]),
             caption=str(record.get("caption") or ""),
+            store="cipher" if record.get("sealed") else "plain",
         )
 
     async def _upload_file(self, record: dict[str, Any]) -> None:
+        if record.get("sealed"):
+            await self._upload_sealed(record)
+            return
         meta = meta_from_dict(record["meta"])
         blob_id = meta.file_id.hex()
         await self.request(
@@ -1006,6 +1049,62 @@ class ChatEngine:
             raise ProtocolError(result.get("message") or "服务器错误")
         if result.get("type") != "blob_chunk_ok" or result.get("idx") != index:
             raise ProtocolError("分片编号对不上")
+
+    async def _upload_sealed(self, record: dict[str, Any]) -> None:
+        """视频缓存已经是分片密文，上传时直接发送这些分片。"""
+        meta = meta_from_dict(record["meta"])
+        folder = resolve_rel(self.store.path, str(record["rel"]))
+        blob_id = meta.file_id.hex()
+        await self.request(
+            {
+                "type": "blob_begin",
+                "id": blob_id,
+                "size": meta.size,
+                "chunks": meta.chunks,
+                "recipients": list(record["recipients"]),
+            },
+            "blob_begin_ok",
+        )
+        total = max(meta.size, 1)
+        sent = 0
+        lock = asyncio.Lock()
+
+        async def one(index: int) -> None:
+            nonlocal sent
+
+            def read() -> bytes:
+                blob = (folder / str(index)).read_bytes()
+                if len(blob) != cipher_len(meta.size, meta.chunks, index):
+                    raise ProtocolError("加密缓存损坏")
+                return blob
+
+            ciphertext = await asyncio.to_thread(read)
+            await self._send_blob_chunk(blob_id, index, ciphertext)
+            async with lock:
+                sent += plaintext_len(meta.size, meta.chunks, index)
+                done = sent
+            self._progress(str(record["local_id"]), done, total)
+
+        await self._run_indexed(meta.chunks, one)
+        await self.request({"type": "blob_finish", "id": blob_id}, "blob_finish_ok")
+
+    async def materialize_video(self, file_id: str) -> str:
+        raw = self.store.load_file_cache(file_id)
+        if raw is None:
+            raise ProtocolError("没有这支视频的加密缓存")
+        meta = meta_from_dict(raw)
+        cache_dir = resolve_rel(self.store.path, cache_rel(meta.file_id))
+        dest = attachment_root(self.store.path) / "play" / f"{file_id}.mp4"
+        await asyncio.to_thread(materialize_plain, meta, cache_dir, dest)
+        return str(dest)
+
+    async def export_video(self, file_id: str, dest: str) -> None:
+        raw = self.store.load_file_cache(file_id)
+        if raw is None:
+            raise ProtocolError("没有这支视频的加密缓存")
+        meta = meta_from_dict(raw)
+        cache_dir = resolve_rel(self.store.path, cache_rel(meta.file_id))
+        await asyncio.to_thread(export_cipher_pack, cache_dir, meta, Path(dest))
 
     async def _deliver_file_envelope(self, peer: str, record: dict[str, Any]) -> None:
         lock = self._peer_locks.setdefault(peer, asyncio.Lock())
@@ -1190,10 +1289,22 @@ class ChatEngine:
         blob_id = meta.file_id.hex()
         local_id = f"in:{blob_id}"
         self.store.save_incoming_file(blob_id, record)
-        rel = f"files/{blob_id}/{meta.name}"
+        video = media_kind(meta.mime) == "video"
+        rel = cache_rel(meta.file_id) if video else f"files/{blob_id}/{meta.name}"
         dest = attachment_root(self.store.path) / rel
-        partial = dest.with_name(dest.name + ".part")
+        partial = dest.with_name(dest.name + ".part") if not video else dest
         caption = str(record.get("caption") or "")
+        progress_view = {
+            "name": meta.name,
+            "mime": meta.mime,
+            "size": meta.size,
+            "sha256": meta.sha256.hex(),
+            "path": "",
+            "media": media_kind(meta.mime),
+            "caption": caption,
+            "encrypted": video,
+            "file_id": blob_id if video else "",
+        }
         await self.inbox.put(
             Incoming(
                 str(record["sender"]),
@@ -1201,21 +1312,20 @@ class ChatEngine:
                 record.get("group"),
                 "file_progress",
                 local_id=local_id,
-                attachment={
-                    "name": meta.name,
-                    "mime": meta.mime,
-                    "size": meta.size,
-                    "sha256": meta.sha256.hex(),
-                    "path": "",
-                    "media": media_kind(meta.mime),
-                    "caption": caption,
-                },
+                attachment=progress_view,
             )
         )
         try:
-            await self._download_file(meta, partial, local_id)
+            if video:
+                await self._download_cipher(meta, dest, local_id)
+                self.store.save_file_cache(blob_id, meta_to_dict(meta))
+            else:
+                await self._download_file(meta, partial, local_id)
         except AttachmentError:
-            partial.unlink(missing_ok=True)
+            if video:
+                shutil.rmtree(dest, ignore_errors=True)
+            else:
+                partial.unlink(missing_ok=True)
             self.store.delete_incoming_file(blob_id)
             await self.inbox.put(
                 Incoming(
@@ -1228,7 +1338,10 @@ class ChatEngine:
             )
             raise
         except Exception:
-            partial.unlink(missing_ok=True)
+            if video:
+                shutil.rmtree(dest, ignore_errors=True)
+            else:
+                partial.unlink(missing_ok=True)
             await self.inbox.put(
                 Incoming(
                     str(record["sender"]),
@@ -1239,7 +1352,8 @@ class ChatEngine:
                 )
             )
             raise
-        partial.replace(dest)
+        if not video:
+            partial.replace(dest)
         body = history_body(
             name=meta.name,
             mime=meta.mime,
@@ -1247,6 +1361,7 @@ class ChatEngine:
             sha256=meta.sha256,
             rel_path=rel,
             caption=caption,
+            store="cipher" if video else "plain",
         )
         fresh = not record.get("logged")
         conv = (
@@ -1278,6 +1393,55 @@ class ChatEngine:
                     attachment=attachment_view(self.store.path, body),
                 )
             )
+
+    async def _download_cipher(self, meta: Any, cache_dir: Path, local_id: str) -> None:
+        """收下视频密文分片。明文只在校验摘要时在内存里走一块，不落盘。"""
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        got = 0
+        lock = asyncio.Lock()
+        blob_id = meta.file_id.hex()
+
+        def store_chunk(index: int, ciphertext: bytes) -> int:
+            piece = decrypt_chunk(meta, index, ciphertext)
+            (cache_dir / str(index)).write_bytes(bytes(ciphertext))
+            return len(piece)
+
+        async def one(index: int) -> None:
+            nonlocal got
+            resp = await self.request(
+                {"type": "blob_fetch", "id": blob_id, "idx": index},
+                "blob_fetch_ok",
+            )
+            if resp.get("id") != blob_id or resp.get("idx") != index:
+                raise ProtocolError("分片编号对不上")
+            data = resp.get("_bin")
+            if not isinstance(data, (bytes, bytearray)):
+                encoded = resp.get("data")
+                data = b64d(encoded) if isinstance(encoded, str) else None
+            if data is None:
+                raise ProtocolError("分片缺失")
+            written = await asyncio.to_thread(store_chunk, index, bytes(data))
+            async with lock:
+                got += written
+                done = got
+            self._progress(local_id, done, max(meta.size, 1))
+
+        await self._run_indexed(meta.chunks, one)
+
+        def verify() -> None:
+            digest = hashlib.sha256()
+            total = 0
+            for index in range(meta.chunks):
+                ciphertext = (cache_dir / str(index)).read_bytes()
+                piece = decrypt_chunk(meta, index, ciphertext)
+                digest.update(piece)
+                total += len(piece)
+            if digest.digest() != meta.sha256 or total != meta.size:
+                raise AttachmentError("摘要不一致")
+
+        await asyncio.to_thread(verify)
 
     async def _download_file(self, meta: Any, dest: Path, local_id: str) -> None:
         blob_id = meta.file_id.hex()

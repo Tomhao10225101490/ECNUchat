@@ -229,6 +229,10 @@ class ClientStore:
                 blob_id TEXT PRIMARY KEY,
                 blob BLOB NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS file_cache (
+                file_id TEXT PRIMARY KEY,
+                blob BLOB NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS dropbox (
                 id TEXT PRIMARY KEY,
                 peer TEXT NOT NULL,
@@ -404,6 +408,21 @@ class ClientStore:
     def list_file_jobs(self) -> list[dict[str, Any]]:
         rows = self.conn.execute("SELECT blob FROM file_jobs").fetchall()
         return [self._open_json(row[0]) for row in rows]
+
+    def save_file_cache(self, file_id: str, meta: dict[str, Any]) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO file_cache(file_id, blob) VALUES(?, ?)",
+                (file_id, self._seal_json(meta)),
+            )
+
+    def load_file_cache(self, file_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT blob FROM file_cache WHERE file_id=?", (file_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return self._open_json(row[0])
 
     def save_incoming_file(self, blob_id: str, record: dict[str, Any]) -> None:
         with self.conn:

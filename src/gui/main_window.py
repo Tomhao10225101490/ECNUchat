@@ -310,6 +310,7 @@ class MainWindow(QMainWindow):
         self._compact = False
         self._in_open = False
         self._search_mode = False
+        self._opening_video = False
         self._group_hits: list[dict[str, Any]] = []
         self._history_hits: list[dict[str, Any]] = []
         self._typing = False
@@ -564,6 +565,7 @@ class MainWindow(QMainWindow):
         self.messages.replyRequested.connect(self._reply_to)
         self.messages.deleteRequested.connect(self._delete_item)
         self.messages.openRequested.connect(self._open_attachment)
+        self.messages.downloadRequested.connect(self._download_attachment)
         self.messages.filesDropped.connect(self._on_files_dropped)
         self.new_button = NewMessageButton(self.chat_body)
         self.new_button.clicked.connect(self._jump_bottom)
@@ -1841,8 +1843,23 @@ class MainWindow(QMainWindow):
 
     def on_action_result(self, action: str, ok: bool, data: object) -> None:
         if not ok:
+            if action == "materialize_video":
+                self._opening_video = False
             self.show_toast(str(data), error=True)
             return
+        if action == "materialize_video" and isinstance(data, dict):
+            self._opening_video = False
+            self._show_video(
+                str(data.get("path") or ""),
+                str(data.get("title") or "视频"),
+                file_id=str(data.get("file_id") or ""),
+            )
+            return
+        if action == "export_video" and isinstance(data, str):
+            self.show_toast(data)
+            return
+        if action == "send_file" and isinstance(data, dict):
+            self._bind_sent_attachment(str(data.get("local_id") or ""), data.get("attachment"))
         if action == "open_chat":
             self._show_page(0)
             self.open_conversation(f"dm:{data}")
@@ -2059,6 +2076,21 @@ class MainWindow(QMainWindow):
 
     def _open_attachment(self, item: ChatItem) -> None:
         attachment = item.attachment or {}
+        if attachment.get("encrypted"):
+            file_id = str(attachment.get("file_id") or "")
+            if item.state == "sending" or not file_id:
+                self.show_toast("视频还在接收")
+                return
+            if self._opening_video:
+                return
+            self._opening_video = True
+            self.worker.submit(
+                "materialize_video",
+                file_id=file_id,
+                title=str(attachment.get("name") or "视频"),
+            )
+            self.show_toast("正在从加密缓存打开")
+            return
         path = str(attachment.get("path") or "")
         if not path or not Path(path).is_file():
             self.show_toast("文件不在本机", error=True)
@@ -2070,6 +2102,43 @@ class MainWindow(QMainWindow):
             self._show_video(path, str(attachment.get("name") or "视频"))
         else:
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _download_attachment(self, item: ChatItem) -> None:
+        attachment = item.attachment or {}
+        self._save_encrypted_copy(
+            str(attachment.get("file_id") or ""),
+            str(attachment.get("name") or "视频"),
+            ready=bool(attachment.get("encrypted")) and item.state != "sending",
+        )
+
+    def _save_encrypted_copy(self, file_id: str, name: str, *, ready: bool = True) -> None:
+        if not ready or not file_id:
+            self.show_toast("这支视频没有加密缓存", error=True)
+            return
+        stem = Path(name).stem or "视频"
+        dest, _selected = QFileDialog.getSaveFileName(
+            self,
+            "下载加密副本",
+            f"{stem}.evideo",
+            "加密视频 (*.evideo)",
+        )
+        if not dest:
+            return
+        if not dest.endswith(".evideo"):
+            dest = dest + ".evideo"
+        self.worker.submit("export_video", file_id=file_id, dest=dest)
+
+    def _bind_sent_attachment(self, local_id: str, attachment: object) -> None:
+        if not local_id or not isinstance(attachment, dict):
+            return
+        bubble = self.bubbles.get(local_id)
+        if bubble is None:
+            return
+        bubble.item.attachment = attachment
+        self.messages.delegate.invalidate()
+        row = self._row_of(bubble.item)
+        if row >= 0:
+            self.messages.notify_row(row)
 
     def _show_image(self, path: str, title: str) -> None:
         dialog = QDialog(self)
@@ -2095,7 +2164,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(label)
         dialog.exec()
 
-    def _show_video(self, path: str, title: str) -> None:
+    def _show_video(self, path: str, title: str, file_id: str = "") -> None:
         try:
             from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
             from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -2107,10 +2176,24 @@ class MainWindow(QMainWindow):
         dialog.resize(960, 540)
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         screen = QVideoWidget(dialog)
         screen.setStyleSheet("background:#111111;")
         screen.setMinimumSize(640, 360)
-        layout.addWidget(screen)
+        layout.addWidget(screen, 1)
+        if file_id:
+            bar = QWidget(dialog)
+            bar.setObjectName("composer")
+            bar_layout = QHBoxLayout(bar)
+            bar_layout.setContentsMargins(12, 8, 12, 8)
+            note = QLabel("本机缓存已加密。关闭播放器后，临时明文会删掉。")
+            note.setObjectName("caption")
+            save = QPushButton("下载加密副本")
+            save.setObjectName("saveEncrypted")
+            save.clicked.connect(lambda: self._save_encrypted_copy(file_id, title))
+            bar_layout.addWidget(note, 1)
+            bar_layout.addWidget(save)
+            layout.addWidget(bar)
         player = QMediaPlayer(dialog)
         audio = QAudioOutput(dialog)
         player.setAudioOutput(audio)
@@ -2119,6 +2202,10 @@ class MainWindow(QMainWindow):
         def on_error(_code, text: str) -> None:
             player.stop()
             dialog.close()
+            if file_id:
+                if text:
+                    self.show_toast(text, error=True)
+                return
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
             if text:
                 self.show_toast(text, error=True)
@@ -2126,7 +2213,14 @@ class MainWindow(QMainWindow):
         player.errorOccurred.connect(on_error)
         player.setSource(QUrl.fromLocalFile(path))
         player.play()
-        dialog.finished.connect(player.stop)
+        play_path = Path(path)
+
+        def finish(_code: int = 0) -> None:
+            player.stop()
+            if file_id and play_path.parent.name == "play":
+                play_path.unlink(missing_ok=True)
+
+        dialog.finished.connect(finish)
         dialog.exec()
 
     def _find_file_item(self, local_id: str, attachment: dict[str, Any]) -> ChatItem | None:

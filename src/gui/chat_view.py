@@ -411,6 +411,7 @@ class MessageDelegate(QStyledItemDelegate):
         self._pix: dict[tuple, QPixmap] = {}
         self.fail_rects: dict[int, QRect] = {}
         self.open_rects: dict[int, QRect] = {}
+        self.download_rects: dict[int, QRect] = {}
 
     def apply_palette(self, palette: Palette) -> None:
         self.palette = palette
@@ -710,9 +711,24 @@ class MessageDelegate(QStyledItemDelegate):
             self._paint_attachment(painter, item, media, text_color)
             absolute = media.translated(option_rect.topLeft()).toRect()
             self.open_rects[row] = absolute
+            if (
+                str((item.attachment or {}).get("media") or "") == "video"
+                and (item.attachment or {}).get("encrypted")
+                and item.state != "sending"
+            ):
+                download = QRect(
+                    absolute.right() - 48,
+                    absolute.bottom() - 22,
+                    44,
+                    18,
+                )
+                self.download_rects[row] = download
+            else:
+                self.download_rects.pop(row, None)
             cursor_y += media_h + int(layout.get("text_gap") or 0)
         else:
             self.open_rects.pop(row, None)
+            self.download_rects.pop(row, None)
         painter.setPen(QColor(text_color))
         painter.setFont(self.font_body)
         text_rect = QRectF(
@@ -798,15 +814,28 @@ class MessageDelegate(QStyledItemDelegate):
             painter.setPen(QColor("white"))
             painter.setFont(self.font_meta)
             size = format_size(int(attachment.get("size") or 0))
-            name = elide(
-                f"{attachment.get('name') or '视频'} · {size}",
-                self.font_meta,
-                int(rect.width() - 16),
-            )
+            encrypted = bool(attachment.get("encrypted"))
+            download = "下载" if encrypted and item.state != "sending" else ""
+            suffix = f" · {size}" + (" · 加密" if encrypted else "")
+            metrics = painter.fontMetrics()
+            suffix_w = metrics.horizontalAdvance(suffix)
+            download_w = 44 if download else 0
+            gap = 6 if download else 0
+            name_budget = int(rect.width() - 16 - suffix_w - download_w - gap)
+            name = elide(str(attachment.get("name") or "视频"), self.font_meta, max(8, name_budget))
+            line_w = int(rect.width() - 16 - download_w - gap)
             painter.drawText(
-                QRectF(rect.left() + 8, rect.bottom() - 22, rect.width() - 16, 16),
-                name,
+                QRectF(rect.left() + 8, rect.bottom() - 22, max(24, line_w), 16),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextSingleLine,
+                name + suffix,
             )
+            if download:
+                painter.setPen(QColor("#8ECAFF"))
+                painter.drawText(
+                    QRectF(rect.right() - 48, rect.bottom() - 22, 40, 16),
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                    download,
+                )
             if item.state == "sending" and item.progress >= 0:
                 painter.drawText(
                     QRectF(rect.left(), rect.center().y() + 18, rect.width(), 16),
@@ -892,6 +921,7 @@ class MessageList(QListView):
     replyRequested = Signal(object)
     deleteRequested = Signal(object)
     openRequested = Signal(object)
+    downloadRequested = Signal(object)
     filesDropped = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -969,6 +999,12 @@ class MessageList(QListView):
                     item = self._model.items[row] if row < len(self._model.items) else None
                     if item and item.local_id:
                         self.retryRequested.emit(item.local_id)
+                        return
+            for row, rect in list(self.delegate.download_rects.items()):
+                if rect.contains(event.pos()):
+                    item = self._model.items[row] if row < len(self._model.items) else None
+                    if item and item.attachment:
+                        self.downloadRequested.emit(item)
                         return
             for row, rect in list(self.delegate.open_rects.items()):
                 if rect.contains(event.pos()):

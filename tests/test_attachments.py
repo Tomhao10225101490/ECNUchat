@@ -8,8 +8,10 @@ from src.attachments import (
     AttachmentError,
     decrypt_chunk,
     expected_chunks,
+    export_cipher_pack,
     hash_file,
     history_body,
+    materialize_plain,
     meta_from_dict,
     meta_to_dict,
     open_bytes,
@@ -93,6 +95,48 @@ def test_over_8gib_is_rejected(tmp_path: Path) -> None:
     else:
         raise AssertionError("超过 8GiB 仍被加密")
     assert not (tmp_path / "cipher").exists()
+
+
+def test_video_cache_roundtrip_hides_plaintext(tmp_path: Path) -> None:
+    marker = "明文标记-视频缓存".encode()
+    plain = marker + b"V" * 40
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(plain)
+    meta = seal_path(src, tmp_path / "cache", "clip.mp4", "video/mp4")
+    folder = tmp_path / "cache" / meta.file_id.hex()
+    stored = b"".join((folder / str(index)).read_bytes() for index in range(meta.chunks))
+    assert marker not in stored
+    assert meta.key not in stored
+    opened = tmp_path / "play.mp4"
+    materialize_plain(meta, folder, opened)
+    assert opened.read_bytes() == plain
+    packed = tmp_path / "clip.evideo"
+    export_cipher_pack(folder, meta, packed)
+    raw = packed.read_bytes()
+    assert raw.startswith(b"ECV1")
+    assert marker not in raw
+    assert meta.key not in raw
+    body = history_body(
+        name=meta.name,
+        mime=meta.mime,
+        size=meta.size,
+        sha256=meta.sha256,
+        rel_path=f"cache/{meta.file_id.hex()}",
+        caption="",
+        store="cipher",
+    )
+    record = parse_history_body(body)
+    assert record is not None and record["store"] == "cipher"
+    assert meta.key not in body.encode()
+    flipped = bytearray((folder / "0").read_bytes())
+    flipped[0] ^= 0x5A
+    (folder / "0").write_bytes(bytes(flipped))
+    try:
+        materialize_plain(meta, folder, tmp_path / "bad.mp4")
+    except AttachmentError as exc:
+        assert "GCM" in str(exc)
+    else:
+        raise AssertionError("改一个密文字节后仍解开了缓存")
 
 
 def test_stream_roundtrip_and_blob_frame_fits(tmp_path: Path) -> None:
