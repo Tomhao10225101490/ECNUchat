@@ -1,0 +1,1 @@
+{"description":"ECNUchat v2 desktop wrapper scaffold (Electron) reusing the PWA. Scaffold only: not built or run in the Track C environment (no Electron binary available there).","devDependencies":{},"license":"UNLICENSED","main":"main.js","name":"ecnu-chat-v2-desktop","private":true,"scripts":{"start":"electron ."},"version":"0.1.0"}
