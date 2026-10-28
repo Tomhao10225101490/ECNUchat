@@ -1,0 +1,18 @@
+# ECNUchat v2 production relay — Cloudflare Workers configuration.
+# NOT DEPLOYED by Track C (no Cloudflare account/token available here).
+# On a machine with wrangler + an account: fill in database_id after
+# `wrangler d1 create ecnu-chat-v2-relay`, then run the commands in README.md.
+name = "ecnu-chat-v2-relay"
+main = "worker.mjs"
+compatibility_date = "2026-10-28"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "ecnu-chat-v2-relay"
+database_id = "REPLACE-WITH-REAL-D1-ID"
+
+[vars]
+# No secrets here. There is deliberately no auth token, password, or
+# private key in this file: the relay holds no user secrets at all.
+RELAY_PROTOCOL_VERSION = "v1"
