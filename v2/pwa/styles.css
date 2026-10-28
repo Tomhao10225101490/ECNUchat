@@ -1,0 +1,18 @@
+:root{color-scheme:light}
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:860px;margin:0 auto;padding:1rem;line-height:1.5;color:#102a43;background:#f7fafc}
+h1{margin-bottom:.25rem}h2{margin-top:2rem}
+.tag{background:#38bdf8;color:#fff;border-radius:999px;padding:.1rem .6rem;font-size:.7em;vertical-align:middle}
+.banner{background:#fff3cd;border:2px solid #d97706;padding:.75rem;border-radius:8px}
+.card{border:1px solid #cbd5e1;background:#fff;border-radius:8px;padding:.75rem;margin:.5rem 0;overflow-wrap:anywhere}
+form{display:grid;gap:.5rem;margin:.5rem 0}
+input,textarea,select{width:100%;padding:.5rem;border:1px solid #94a3b8;border-radius:6px;box-sizing:border-box}
+button{padding:.5rem .9rem;border:0;border-radius:6px;background:#0f766e;color:#fff;cursor:pointer;width:fit-content}
+button:hover{background:#115e59}
+.row{display:flex;gap:.5rem;flex-wrap:wrap;margin:.5rem 0}
+#messages{min-height:120px}
+.msg{border-bottom:1px solid #e2e8f0;padding:.4rem 0}
+.msg:last-child{border-bottom:0}
+.meta{color:#64748b;font-size:.85em}
+.demo-tag{color:#b45309;font-weight:700}
+li{margin:.3rem 0}
+code{background:#e2e8f0;padding:.05rem .3rem;border-radius:4px}

@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ECNUchat v2 — PWA (real crypto in relay mode)</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#102a43">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header>
+  <h1>ECNUchat v2 <span class="tag">PWA</span></h1>
+  <p class="banner" role="alert"><strong>Relay mode uses real X3DH + double ratchet
+  (tweetnacl + WebCrypto), hybrid PQXDH + hybrid ratchet (ML-KEM-768) when both sides
+  hold PQ keys — keys live in localStorage
+  (not production-grade secure storage), and this is NOT a production messenger.</strong>
+  Local demo mode is a separate stand-in and every demo message is tagged
+  <code>DEMO-NOT-E2EE-REAL</code>. Do not use either mode for real private messages.
+  See <a href="README.md">README.md</a> and the “Not implemented” section at the bottom.</p>
+  <p id="status">Status: starting…</p>
+</header>
+
+<main>
+<section aria-labelledby="profile-h">
+  <h2 id="profile-h">1 · Identity — register locally</h2>
+  <p>Username rule (same as v1): 3–20 characters, letters, digits, underscore only.
+  Identity is <code>username:device</code>. A lost device means a lost identity — there is
+  no recovery in this scaffold (see README).</p>
+  <form id="register-form">
+    <label>Username <input id="username" autocomplete="off" placeholder="e.g. alice_01" maxlength="20"></label>
+    <label>Relay base URL <input id="relay-url" placeholder="http://127.0.0.1:8765" inputmode="url"></label>
+    <label>Mode
+      <select id="mode">
+        <option value="relay">Relay (real crypto, hybrid when both sides hold PQ keys, configurable base URL above)</option>
+        <option value="demo">Local demo (offline, two-tab / echo, NOT real E2EE)</option>
+      </select>
+    </label>
+    <button type="submit">Register / regenerate local keys</button>
+  </form>
+  <div id="profile" class="card">No identity yet. Register above.</div>
+  <div class="row">
+    <button id="copy-invite" type="button">Copy my invite</button>
+    <button id="fetch-inbox" type="button">Fetch inbox now</button>
+    <button id="clear-demo" type="button">Clear all DEMO data on this device</button>
+  </div>
+  <p><small>Key store: keys/fingerprint are kept in <code>localStorage</code> under a
+  key starting <code>ecnu-chat-v2</code>. This is explicitly <strong>not</strong> production-grade
+  secure storage (no hardware keystore, no OS keychain, readable by any script on this origin).
+  Production must move keys to a proper secure store. Note: an older demo store under
+  <code>ecnu-chat-v2-demo</code> is NOT migrated; re-registering here creates a new identity.</small></p>
+</section>
+
+<section aria-labelledby="friends-h">
+  <h2 id="friends-h">2 · Friends — add by invite</h2>
+  <p>Paste an invite: either JSON
+  <code>{"username":"bob","device":"phone","relay":"http://127.0.0.1:8765","fingerprint":"…"}</code>,
+  or lines: username, relay URL, fingerprint, [device]. Fingerprint is shown for out-of-band
+  comparison; this client does <strong>not</strong> verify it cryptographically (stub).
+  In relay mode, friend devices are then fetched from the relay's device directory.</p>
+  <form id="add-friend-form">
+    <label>Invite <textarea id="invite" rows="4" placeholder='{"username":"bob","relay":"http://127.0.0.1:8000","fingerprint":"…"}'></textarea></label>
+    <button type="submit">Add friend</button>
+  </form>
+  <ul id="friend-list"></ul>
+  <p><small>Device fan-out: sending delivers one envelope per registered device of the friend
+  (see fan-out log in chat). In relay mode, devices come from the relay directory; a friend
+  with no registered devices cannot receive until they register.</small></p>
+</section>
+
+<section aria-labelledby="chat-h">
+  <h2 id="chat-h">3 · Chat — 1-to-1 text only</h2>
+  <label>Chat with
+    <select id="chat-friend"><option value="">— pick a friend —</option></select>
+  </label>
+  <div id="fanout" class="card"></div>
+  <div id="messages" class="card" aria-live="polite"></div>
+  <form id="send-form">
+    <label>Message <input id="message-text" autocomplete="off" placeholder="Type a demo message…"></label>
+    <button type="submit">Send to all devices</button>
+  </form>
+  <div class="row">
+    <button id="simulate-reply" type="button">Simulate friend reply (demo only)</button>
+    <button id="open-peer-tab" type="button">Open demo peer tab (second identity)</button>
+  </div>
+  <p><small>Demo peer tab opens this page with <code>?profile=peer</code>, which uses a separate
+  localStorage namespace so two tabs can act as two users and exchange envelopes over
+  <code>BroadcastChannel</code>. Without a second tab, use “Simulate friend reply” (local echo).</small></p>
+</section>
+
+<section aria-labelledby="notimpl-h">
+  <h2 id="notimpl-h">Not implemented — stubs / absent, not claimed as done</h2>
+  <ul>
+    <li><strong>Real X3DH + double ratchet (classical):</strong> IMPLEMENTED in relay mode
+      (<code>crypto.js</code>, tweetnacl + WebCrypto, x3dh-v1 / dr-v1). Demo mode still uses a
+      stand-in and is tagged as such.</li>
+    <li><strong>ML-KEM-768 (post-quantum hybrid):</strong> IMPLEMENTED in relay mode
+      (<code>crypto-pq.js</code>, vendored noble ML-KEM-768, PQXDH + hybrid ratchet).
+      A session is hybrid iff both sides hold a PQ key; a PQ peer refuses a classical
+      initial (no silent downgrade) and a no-PQ peer stays classical (never upgraded
+      to hybrid). Sessions with a no-PQ peer are classical, not post-quantum.</li>
+    <li><strong>Interop with the original Python v1 client:</strong> NOT TESTED and NOT CLAIMED.
+      Crypto primitives, KDF labels and ratchet payload field names match v1, but v1's
+      transport is WebSocket (not this HTTP relay) and its bundle store format differs;
+      a bridge/adapter would be needed and has not been built.</li>
+    <li><strong>Groups, voice, push notifications, backup/restore, device endorsement:</strong>
+      absent (no UI, no protocol in this client). Device revocation is relay-side only
+      (see relay README); this client has no revoke button yet.</li>
+    <li><strong>Fingerprint verification, sealed sender, WebSocket transport, TLS:</strong>
+      stub/absent. Fingerprint is displayed only; the relay sees sender/recipient metadata;
+      the local relay is plain HTTP on loopback only.</li>
+  </ul>
+</section>
+</main>
+
+<footer><p>ECNUchat v2 PWA · plain HTML/CSS/JS, no build step · open <code>index.html</code> directly
+(serve over http://localhost for SubtleCrypto + service worker).
+Relay is a dumb mailbox only: it must never see plaintext. Demo traffic is public by design.</p></footer>
+<!-- Load order (see vendor/mlkem/README.md): nacl, then the ML-KEM
+     bundle, then crypto.js, then crypto-pq.js, then app.js.
+     crypto-pq.js throws instead of silently falling back to classical
+     if the bundle is missing; app.js degrades to classical-only only
+     if crypto-pq.js itself is absent. -->
+<script src="vendor/nacl-fast.min.js"></script>
+<script src="vendor/mlkem/mlkem-bundle.js"></script>
+<script src="crypto.js"></script>
+<script src="crypto-pq.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
